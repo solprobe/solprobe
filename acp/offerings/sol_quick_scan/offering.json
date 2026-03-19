@@ -1,0 +1,16 @@
+{
+  "name": "sol_quick_scan",
+  "description": "Instant Solana token safety check. Returns risk grade, mint/freeze authority status, holder concentration, and liquidity in under 5 seconds. Essential pre-trade check for any Solana trading agent. $0.01 per call.",
+  "price": "0.01",
+  "currency": "USDC",
+  "requirements": {
+    "type": "object",
+    "properties": {
+      "token_address": {
+        "type": "string",
+        "description": "Solana token mint address (base58, 32–44 characters)"
+      }
+    },
+    "required": ["token_address"]
+  }
+}

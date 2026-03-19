@@ -1,0 +1,16 @@
+{
+  "name": "sol_deep_dive",
+  "description": "Comprehensive Solana token analysis. Returns dev wallet profile, LP lock status, wash trading score, pump.fun detection, momentum score, and a BUY/AVOID/WATCH/DYOR recommendation. Up to 30 seconds. $0.50 per call.",
+  "price": "0.50",
+  "currency": "USDC",
+  "requirements": {
+    "type": "object",
+    "properties": {
+      "token_address": {
+        "type": "string",
+        "description": "Solana token mint address (base58, 32–44 characters)"
+      }
+    },
+    "required": ["token_address"]
+  }
+}

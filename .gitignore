@@ -1,0 +1,35 @@
+
+.env
+.env.local
+.env.production
+
+
+node_modules/
+
+
+dist/
+
+logs/
+*.log
+
+.pm2/
+
+.DS_Store
+Thumbs.db
+
+
+.vscode/
+.idea/
+
+
+acp/config.json
+config.json
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# Test coverage output
+coverage/
+
+# npm debug logs
+npm-debug.log*

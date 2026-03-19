@@ -1,0 +1,16 @@
+{
+  "name": "sol_wallet_risk",
+  "description": "Solana wallet counterparty risk assessment. Returns wallet age, transaction count, bot detection, whale status, trading style (sniper/hodler/flipper/bot), and a 0–100 risk score. Under 10 seconds. $0.02 per call.",
+  "price": "0.02",
+  "currency": "USDC",
+  "requirements": {
+    "type": "object",
+    "properties": {
+      "wallet_address": {
+        "type": "string",
+        "description": "Solana wallet address (base58, 32–44 characters)"
+      }
+    },
+    "required": ["wallet_address"]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "sol_market_intel",
+  "description": "Real-time Solana token market signals. Returns current price, 1h/24h price change, volume, liquidity, buy/sell pressure levels, estimated large transactions (>$10k), and a BULLISH/BEARISH/NEUTRAL signal. Under 10 seconds. $0.05 per call.",
+  "price": "0.05",
+  "currency": "USDC",
+  "requirements": {
+    "type": "object",
+    "properties": {
+      "token_address": {
+        "type": "string",
+        "description": "Solana token mint address (base58, 32–44 characters)"
+      }
+    },
+    "required": ["token_address"]
+  }
+}
