@@ -7,8 +7,11 @@ import { walletRisk } from "../scanner/walletRisk.js";
 import { marketIntel } from "../scanner/marketIntel.js";
 import { getBreakerStates } from "../circuitBreaker.js";
 import { getCacheStats } from "../cache.js";
+import { revenueMiddleware, getRevenueSummary } from "../revenueTracker.js";
 
 const app = new Hono();
+
+app.use(revenueMiddleware);
 const startTime = Date.now();
 
 app.post("/scan/quick", async (c) => {
@@ -77,6 +80,10 @@ app.post("/market/intel", async (c) => {
 
   const result = await marketIntel(address);
   return c.json(result);
+});
+
+app.get("/revenue/summary", (c) => {
+  return c.json(getRevenueSummary());
 });
 
 app.get("/health", (c) => {

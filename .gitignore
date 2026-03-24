@@ -17,6 +17,10 @@ logs/
 .DS_Store
 Thumbs.db
 
+CLAUDE.md
+
+GRADUATION.md
+
 
 .vscode/
 .idea/

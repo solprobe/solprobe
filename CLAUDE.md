@@ -785,3 +785,581 @@ npm install -g pm2
 pm2 start ecosystem.config.js
 pm2 save && pm2 startup
 ```
+
+# Tokenization Step
+
+# CLAUDE.md — SolProbe Tokenization Step
+
+> This file is the working brief for Claude Code.
+> Scope: **Token launch preparation only** — no changes to the scanner API or ACP handlers.
+
+---
+
+## Who You Are Working With
+
+**SolProbe** is a live Solana token scanner agent on the Virtuals Protocol ACP marketplace.
+- Agent ID: #24456
+- Chain: Base (Ethereum L2)
+- Agent wallet: `0xbCcc9...e7193E`
+- All 4 services are registered and operational
+- 10 sandbox jobs completed — graduation is gated on tokenization
+
+The scanner backend (`/root/solprobe`) and ACP seller runtime (`/root/virtuals-acp`) are **already running in production**. Do not touch them unless explicitly asked.
+
+---
+
+## What We Are Building Now
+
+**Goal:** Prepare everything needed to tokenize SolProbe on Virtuals Protocol and graduate to the public A2A marketplace.
+
+This is a **preparation and tooling task**, not a smart contract task. The actual token launch happens via the Virtuals Protocol UI at `app.virtuals.io/acp`. Our job is to get all the surrounding infrastructure ready so the launch goes smoothly and the token flywheel starts working immediately after graduation.
+
+### Deliverables for This Step
+
+1. **Token metadata package** — name, ticker, description, image assets, socials, in the format Virtuals Protocol expects for the tokenization form
+2. **Buyback script** (`/root/solprobe/scripts/buyback.ts`) — monitors the agent wallet for incoming USDC revenue and auto-buys + burns agent token on a configurable schedule
+3. **Revenue tracker** (`/root/solprobe/scripts/revenueTracker.ts`) — logs per-service revenue to a local SQLite DB so we can measure flywheel health
+4. **Graduation checklist** (`/root/solprobe/GRADUATION.md`) — step-by-step human-readable launch checklist
+
+---
+
+## Token Details
+
+| Field | Value |
+|---|---|
+| Name | SolProbe |
+| Ticker | SPROBE |
+| Tagline | The first Solana scanner agent on ACP — scan tokens, not vibes |
+| Description (short) | SolProbe scans Solana tokens and wallets for other AI agents. Risk grading, market signals, deep dives — all via A2A calls on Virtuals Protocol. |
+| Website | https://solprobe.xyz |
+| Twitter | @solprobe |
+| Chain | Base |
+
+The description should emphasise: utility-first, not speculative; A2A revenue-generating; first-mover on Solana within ACP.
+
+---
+
+## Token Economics (Do Not Change These)
+
+These are fixed by Virtuals Protocol:
+- 100 VIRTUAL to mint (non-refundable)
+- 42,425 VIRTUAL bonding curve target
+- 30% of trading fees → buyback & burn of SPROBE
+- 60% of trading fees → agent wallet (`0xbCcc9...e7193E`)
+- 10% → protocol treasury
+
+The buyback script should handle the 30% buyback/burn portion that flows to the agent wallet.
+
+---
+
+## Buyback Script Requirements
+
+File: `/root/solprobe/scripts/buyback.ts`
+
+Behaviour:
+- Polls agent wallet balance on Base every `BUYBACK_INTERVAL_MINUTES` (default: 60)
+- When balance exceeds `BUYBACK_THRESHOLD_USDC` (default: 5.0), triggers a buy
+- Buys SPROBE token using the agent wallet private key (loaded from `.env`)
+- Burns purchased tokens by sending to the dead address (`0x000...dEaD`)
+- Logs every buyback event to stdout and to `/root/solprobe/logs/buyback.log`
+- Dry-run mode via `DRY_RUN=true` env var — logs what it would do without transacting
+
+Environment variables to add to `.env`:
+```
+AGENT_WALLET_PRIVATE_KEY=    # DO NOT COMMIT — Base wallet key
+SPROBE_TOKEN_ADDRESS=        # Fill in after token launch
+BUYBACK_INTERVAL_MINUTES=60
+BUYBACK_THRESHOLD_USDC=5.0
+DRY_RUN=true                 # Set to false after token is live
+```
+
+Use `viem` for Base chain interactions (already in the ecosystem, preferred over ethers).
+
+---
+
+## Revenue Tracker Requirements
+
+File: `/root/solprobe/scripts/revenueTracker.ts`
+
+Behaviour:
+- Hooks into the existing Hono server via a lightweight middleware (do not modify scanner logic)
+- Increments per-service counters in a SQLite DB (`/root/solprobe/data/revenue.db`) on every successful job delivery
+- Exposes a `GET /revenue/summary` endpoint returning:
+
+```json
+{
+  "total_usdc": 1.23,
+  "by_service": {
+    "sol_quick_scan": { "calls": 100, "revenue_usdc": 1.00 },
+    "sol_wallet_risk": { "calls": 5,   "revenue_usdc": 0.10 },
+    "sol_market_intel": { "calls": 2,  "revenue_usdc": 0.10 },
+    "sol_deep_dive":    { "calls": 0,  "revenue_usdc": 0.00 }
+  },
+  "since": "2025-01-01T00:00:00Z"
+}
+```
+
+Use `better-sqlite3` for the DB (synchronous, no async complexity).
+
+---
+
+## Stack Constraints
+
+- **Language:** TypeScript (ESM, Node 22+)
+- **No new frameworks** — Hono is already the HTTP layer, use it
+- **Viem** for any Base chain interactions
+- **Better-sqlite3** for local DB
+- **PM2** for process management — add any new long-running scripts to `ecosystem.config.cjs`
+- All scripts go in `/root/solprobe/scripts/`
+- All logs go in `/root/solprobe/logs/` (create if not exists)
+- All data files go in `/root/solprobe/data/` (create if not exists)
+
+---
+
+## What NOT to Do
+
+- Do not modify `src/scanner/`, `src/sources/`, or `src/api/server.ts` directly (revenue tracker hooks in via middleware)
+- Do not modify any files in `/root/virtuals-acp/`
+- Do not generate or commit private keys or wallet secrets
+- Do not write Solidity or deploy smart contracts — the token launch is done through the Virtuals UI
+- Do not change existing PM2 process names (`solprobe`, `acp-seller`)
+
+---
+
+## Key Files for Context
+
+| File | Purpose |
+|---|---|
+| `/root/solprobe/src/api/server.ts` | Hono server — middleware goes here |
+| `/root/solprobe/ecosystem.config.cjs` | PM2 config — add new processes here |
+| `/root/solprobe/.env` | Add new env vars here |
+
+---
+
+## Definition of Done
+
+- [ ] Token metadata document ready to copy-paste into Virtuals Protocol tokenization form
+- [ ] `buyback.ts` script written, typed, dry-run tested locally
+- [ ] `revenueTracker.ts` middleware written, `GET /revenue/summary` returns valid JSON
+- [ ] Both scripts registered in `ecosystem.config.cjs` (buyback as a cron-style process)
+- [ ] `GRADUATION.md` checklist complete
+- [ ] No existing tests broken, health endpoint still returns `"status": "ok"`
+
+---
+
+# Reliability & Success Rate Improvements
+
+> Scope: Improve ACP job completion rate, SLA compliance, and data quality.
+> Do not modify tokenization scripts, buyback.ts, or revenueTracker.ts.
+> All changes are confined to `src/` unless explicitly stated.
+
+---
+
+## Overview of Changes
+
+| # | Change | Files Affected | Priority |
+|---|---|---|---|
+| 1 | Retry logic — 3 attempts before failing | `acp/offerings/*/handlers.ts` | 🔴 First |
+| 2 | SLA-aware timeout budgets per service | `src/api/server.ts`, handlers | 🔴 First |
+| 3 | Weighted source resolver with rolling stats | `src/sources/resolver.ts` (new) | 🟡 Second |
+| 4 | Honest `data_confidence` scoring | `src/scanner/riskScorer.ts` | 🟡 Second |
+| 5 | Per-service cache TTLs | `src/cache.ts` | 🟡 Second |
+| 6 | Degraded health status on critical source failure | `src/api/server.ts` | 🟢 Third |
+
+---
+
+## 1. Retry Logic in ACP Handlers
+
+**File to create:** `src/utils/retry.ts`
+
+All four ACP `handlers.ts` files must use this utility. The rule is:
+**retry up to 3 times with exponential backoff before returning any error.**
+Never return a degraded or error response without having genuinely attempted the call at least 3 times.
+
+```typescript
+// src/utils/retry.ts
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    backoff?: "linear" | "exponential";
+    label?: string;
+  } = {}
+): Promise<T> {
+  const {
+    attempts = 3,
+    delayMs = 400,
+    backoff = "exponential",
+    label = "operation",
+  } = options;
+
+  let lastError: unknown;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const wait =
+        backoff === "exponential" ? delayMs * 2 ** (i - 1) : delayMs * i;
+      console.warn(
+        `[retry] ${label} attempt ${i}/${attempts} failed — waiting ${wait}ms`
+      );
+      if (i < attempts) await sleep(wait);
+    }
+  }
+
+  throw lastError;
+}
+
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+```
+
+**All four `handlers.ts` files must adopt this pattern:**
+
+```typescript
+// acp/offerings/sol_quick_scan/handlers.ts (and equivalents for other 3 services)
+import { withRetry } from "../../../src/utils/retry.js";
+import type {
+  ExecuteJobResult,
+  ValidationResult,
+} from "../../../runtime/offeringTypes.js";
+
+export async function executeJob(
+  requirements: any
+): Promise<ExecuteJobResult> {
+  try {
+    const result = await withRetry(
+      () =>
+        fetch("http://localhost:8000/scan/quick", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requirements),
+          signal: AbortSignal.timeout(RETRY_CONFIG.sol_quick_scan.timeoutMs),
+        }).then((r) => r.json()),
+      {
+        attempts: RETRY_CONFIG.sol_quick_scan.attempts,
+        delayMs: RETRY_CONFIG.sol_quick_scan.delayMs,
+        backoff: "exponential",
+        label: "sol_quick_scan",
+      }
+    );
+
+    return { deliverable: JSON.stringify(result) };
+  } catch (err) {
+    // Only reached after all retry attempts genuinely exhausted
+    return {
+      deliverable: JSON.stringify({
+        error: true,
+        message: "Service temporarily unavailable after 3 attempts",
+        retry_suggested: true,
+        data_confidence: "NONE",
+      }),
+    };
+  }
+}
+```
+
+---
+
+## 2. Per-Service Retry & Timeout Config
+
+**Add to `src/utils/retry.ts`** (or a shared constants file if one already exists):
+
+```typescript
+// Per-attempt timeout — not total budget. Resets each retry.
+// Total worst-case time = (timeoutMs × attempts) + sum of backoff delays.
+// All values leave headroom within the advertised SLA.
+export const RETRY_CONFIG = {
+  sol_quick_scan: {
+    attempts: 3,
+    delayMs: 300,
+    timeoutMs: 4_000, // SLA 5s — 3 × 4s + 300+600ms ≈ 13s worst case, capped by ACP timeout
+  },
+  sol_wallet_risk: {
+    attempts: 3,
+    delayMs: 500,
+    timeoutMs: 6_000, // SLA 10s
+  },
+  sol_market_intel: {
+    attempts: 3,
+    delayMs: 400,
+    timeoutMs: 5_000, // SLA 10s
+  },
+  sol_deep_dive: {
+    attempts: 3,
+    delayMs: 800,
+    timeoutMs: 8_000, // SLA 30s
+  },
+} as const;
+```
+
+**SLA timeout enforcement in `src/api/server.ts`:**
+
+Each Hono endpoint must enforce a hard SLA deadline using `AbortSignal.timeout()` at the
+**endpoint level** (not just per-source fetch). If the deadline is blown, return a structured
+error immediately — a timeout is worse than a low-confidence response in ACP's eyes.
+
+```typescript
+// src/api/server.ts — example for /scan/quick
+app.post("/scan/quick", async (c) => {
+  const SLA_DEADLINE_MS = 4_500; // 500ms below the 5s advertised SLA
+  const body = await c.req.json();
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SLA_DEADLINE_MS);
+
+  try {
+    const result = await quickScan(body.token_address, controller.signal);
+    clearTimeout(timer);
+    return c.json(result);
+  } catch (err) {
+    clearTimeout(timer);
+    if (controller.signal.aborted) {
+      return c.json(
+        {
+          error: true,
+          message: "SLA deadline exceeded",
+          retry_suggested: true,
+          data_confidence: "NONE",
+        },
+        503
+      );
+    }
+    throw err;
+  }
+});
+```
+
+---
+
+## 3. Weighted Source Resolver
+
+**File to create:** `src/sources/resolver.ts`
+
+The existing fallback chain is static. This module tracks rolling success rates and
+re-ranks sources automatically every 100 requests so degraded sources are deprioritised
+**before** they cause failures, not after.
+
+```typescript
+// src/sources/resolver.ts
+type SourceName = "dexscreener" | "rugcheck" | "helius" | "birdeye" | "solscan";
+
+interface SourceStats {
+  priority: number;
+  successRate: number;   // rolling — updated every call
+  avgLatencyMs: number;  // rolling average
+  totalCalls: number;
+  failures: number;
+}
+
+const SOURCE_STATS: Record<SourceName, SourceStats> = {
+  dexscreener: { priority: 1, successRate: 0.97, avgLatencyMs: 800,  totalCalls: 0, failures: 0 },
+  rugcheck:    { priority: 2, successRate: 0.94, avgLatencyMs: 1200, totalCalls: 0, failures: 0 },
+  helius:      { priority: 3, successRate: 0.91, avgLatencyMs: 400,  totalCalls: 0, failures: 0 },
+  birdeye:     { priority: 4, successRate: 0.88, avgLatencyMs: 1100, totalCalls: 0, failures: 0 },
+  solscan:     { priority: 5, successRate: 0.85, avgLatencyMs: 900,  totalCalls: 0, failures: 0 },
+};
+
+/** Call after every source fetch — pass success=false on any thrown error or non-200. */
+export function recordSourceResult(
+  source: SourceName,
+  success: boolean,
+  latencyMs: number
+): void {
+  const s = SOURCE_STATS[source];
+  s.totalCalls++;
+  if (!success) s.failures++;
+
+  // Recalculate rolling average latency (exponential moving average, α=0.1)
+  s.avgLatencyMs = s.avgLatencyMs * 0.9 + latencyMs * 0.1;
+
+  // Recalculate rolling success rate every 100 calls
+  if (s.totalCalls % 100 === 0) {
+    s.successRate = 1 - s.failures / s.totalCalls;
+  }
+}
+
+/** Returns sources ranked by current success rate (best first). */
+export function rankSources(candidates?: SourceName[]): SourceName[] {
+  const pool = candidates ?? (Object.keys(SOURCE_STATS) as SourceName[]);
+  return [...pool].sort(
+    (a, b) => SOURCE_STATS[b].successRate - SOURCE_STATS[a].successRate
+  );
+}
+
+/** Snapshot of current stats — exposed via /health for observability. */
+export function getSourceStats(): Record<SourceName, SourceStats> {
+  return { ...SOURCE_STATS };
+}
+```
+
+**Usage in source clients** (e.g. `dexscreener.ts`):
+
+```typescript
+import { recordSourceResult } from "./resolver.js";
+
+export async function fetchDexScreener(address: string) {
+  const start = Date.now();
+  try {
+    const data = await fetch(`https://api.dexscreener.com/...`).then(r => r.json());
+    recordSourceResult("dexscreener", true, Date.now() - start);
+    return data;
+  } catch (err) {
+    recordSourceResult("dexscreener", false, Date.now() - start);
+    throw err;
+  }
+}
+```
+
+---
+
+## 4. Honest `data_confidence` Scoring
+
+**File:** `src/scanner/riskScorer.ts`
+
+The `data_confidence` field must reflect real data quality. Buyer agents will notice
+if confidence scores are inflated — this drives churn. Rules:
+
+- `HIGH` requires **at least 2 sources corroborating** AND data **under 60 seconds old**
+- `MEDIUM` if only one condition is met
+- `LOW` if neither condition is met or only one source returned data
+- Never return `HIGH` from a single source, regardless of how clean the data looks
+
+```typescript
+// Add to src/scanner/riskScorer.ts
+export function scoreConfidence(
+  sources: string[],      // names of sources that returned valid data
+  dataAgeMs: number       // milliseconds since data was fetched
+): "HIGH" | "MEDIUM" | "LOW" {
+  const corroborated = sources.length >= 2;
+  const fresh = dataAgeMs < 60_000; // under 60 seconds
+
+  if (corroborated && fresh) return "HIGH";
+  if (corroborated || fresh) return "MEDIUM";
+  return "LOW";
+}
+```
+
+All four scanner modules (`quickScan.ts`, `deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`)
+must call `scoreConfidence()` with the actual list of sources that contributed data to the
+response. Do not hardcode confidence values.
+
+---
+
+## 5. Per-Service Cache TTLs
+
+**File:** `src/cache.ts`
+
+Replace any single global TTL with service-specific values. Wallet history changes slowly;
+market signals go stale in seconds. Correct TTLs protect free API rate limits as volume
+scales and dramatically improve p95 latency.
+
+```typescript
+// src/cache.ts — TTL constants
+export const CACHE_TTL: Record<string, number> = {
+  sol_quick_scan:   30_000,   // 30s — authority flags + liquidity don't change quickly
+  sol_market_intel: 15_000,   // 15s — this is a signals product, tighter staleness budget
+  sol_wallet_risk:  300_000,  // 5 min — wallet history is slow-moving
+  sol_deep_dive:    60_000,   // 1 min — expensive to recompute, acceptable staleness
+};
+```
+
+Cache key format: `{service}:{address}` — e.g. `sol_quick_scan:DezXAZ8z...`
+
+Do not share cache entries across services. A `sol_quick_scan` result and a
+`sol_deep_dive` result for the same address have different TTLs and different shapes.
+
+---
+
+## 6. Degraded Health Status
+
+**File:** `src/api/server.ts`
+
+The `/health` endpoint must distinguish between `ok` and `degraded`. PM2 or an
+external monitor can poll this to alert before ACP sees failures.
+
+DexScreener and RugCheck are **critical** — if both circuit breakers are OPEN
+simultaneously, no meaningful scan can be completed. Surface this explicitly.
+
+```typescript
+app.get("/health", async (c) => {
+  const breakers = circuitBreaker.getAll(); // existing call
+  const sourceStats = getSourceStats();     // from resolver.ts (new)
+
+  const criticalDown = ["dexscreener", "rugcheck"].filter(
+    (s) => breakers[s] === "OPEN"
+  );
+
+  return c.json({
+    status: criticalDown.length > 0 ? "degraded" : "ok",
+    uptime_seconds: Math.floor(process.uptime()),
+    cache_hits: cache.getHits(),           // existing
+    total_requests: cache.getTotal(),      // existing
+    degraded_sources: criticalDown,
+    circuit_breakers: breakers,
+    source_success_rates: Object.fromEntries(
+      Object.entries(sourceStats).map(([k, v]) => [k, v.successRate])
+    ),
+  });
+});
+```
+
+**PM2 health watchdog — add to `ecosystem.config.cjs`:**
+
+```javascript
+// ecosystem.config.cjs — add alongside existing solprobe and acp-seller entries
+{
+  name: "health-watchdog",
+  script: "scripts/healthWatchdog.ts",
+  interpreter: "npx",
+  interpreter_args: "tsx",
+  cron_restart: "*/5 * * * *",   // every 5 minutes
+  autorestart: false,
+}
+```
+
+**File to create:** `scripts/healthWatchdog.ts`
+
+```typescript
+// scripts/healthWatchdog.ts
+const res = await fetch("http://localhost:8000/health");
+const health = await res.json();
+
+if (health.status !== "ok") {
+  console.error(
+    `[watchdog] DEGRADED — down sources: ${health.degraded_sources.join(", ")}`
+  );
+  // Extend here: send a webhook, write to a log file, or trigger PM2 restart
+  process.exit(1); // non-zero exit triggers PM2 alert
+}
+
+console.log(`[watchdog] ok — uptime ${health.uptime_seconds}s`);
+```
+
+---
+
+## Build Order for These Changes
+
+Work in this sequence to avoid breaking existing functionality:
+
+1. `src/utils/retry.ts` — no dependencies, safe to build first
+2. Update all four `acp/offerings/*/handlers.ts` to use `withRetry` + `RETRY_CONFIG`
+3. `src/sources/resolver.ts` — add `recordSourceResult()` calls to each source client
+4. Update `src/scanner/riskScorer.ts` — add `scoreConfidence()`, wire into all 4 scanners
+5. Update `src/cache.ts` — swap global TTL for `CACHE_TTL` map
+6. Update `src/api/server.ts` — SLA deadline enforcement + degraded health status
+7. `scripts/healthWatchdog.ts` + `ecosystem.config.cjs` entry
+
+**Do not skip straight to step 6** — the health endpoint's `source_success_rates` field
+depends on `resolver.ts` being in place first.
+
+---
+
+## What NOT to Do
+
+- Do not fabricate or inflate `data_confidence` to improve perceived quality — buyer agents cross-check and will churn
+- Do not suppress `error: true` in the final catch block — after 3 genuine retries, an honest error is correct
+- Do not share cache TTLs across services — each service has a different staleness budget
+- Do not add these PM2 watchdog entries under the existing `solprobe` or `acp-seller` process names
