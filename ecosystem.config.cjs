@@ -30,5 +30,17 @@ module.exports = {
       error_file: "logs/buyback-error.log",
       time: true,
     },
+    {
+      name: "health-watchdog",
+      script: "./scripts/healthWatchdog.ts",
+      interpreter: "npx",
+      interpreter_args: "tsx",
+      cron_restart: "*/5 * * * *",
+      autorestart: false,
+      watch: false,
+      log_file: "logs/watchdog-combined.log",
+      error_file: "logs/watchdog-error.log",
+      time: true,
+    },
   ],
 };
