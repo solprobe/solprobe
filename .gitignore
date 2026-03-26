@@ -40,5 +40,7 @@ npm-debug.log*
 
 .claude/
 
-.DS_Store 
+.DS_Store
 src/.DS_Store
+
+scripts/health-check.sh
