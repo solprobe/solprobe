@@ -37,3 +37,8 @@ coverage/
 
 # npm debug logs
 npm-debug.log*
+
+.claude/
+
+.DS_Store 
+src/.DS_Store
