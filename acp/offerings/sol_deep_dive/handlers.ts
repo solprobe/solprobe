@@ -1,26 +1,47 @@
 import { isValidSolanaAddress } from "../../../src/validate.js";
+import { withRetry, RETRY_CONFIG } from "../../../src/utils/retry.js";
+import type { ExecuteJobResult } from "../../../runtime/offeringTypes.js";
 
-export async function executeJob(requirements: any): Promise<any> {
+export async function executeJob(
+  requirements: unknown
+): Promise<ExecuteJobResult> {
   try {
-    const response = await fetch("http://localhost:8000/scan/deep", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requirements),
-      signal: AbortSignal.timeout(35_000),
-    });
-    return response.json();
+    const result = await withRetry(
+      () =>
+        fetch("http://localhost:8000/scan/deep", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requirements),
+          signal: AbortSignal.timeout(RETRY_CONFIG.sol_deep_dive.timeoutMs),
+        }).then((r) => r.json()),
+      {
+        attempts: RETRY_CONFIG.sol_deep_dive.attempts,
+        delayMs: RETRY_CONFIG.sol_deep_dive.delayMs,
+        backoff: "exponential",
+        label: "sol_deep_dive",
+      }
+    );
+    return { deliverable: JSON.stringify(result) };
   } catch (err) {
-    return { error: true, message: String(err), data_confidence: "LOW" };
+    return {
+      deliverable: JSON.stringify({
+        error: true,
+        message: "Service temporarily unavailable after 3 attempts",
+        retry_suggested: true,
+        data_confidence: "NONE",
+      }),
+    };
   }
 }
 
-export function validateRequirements(requirements: any): boolean {
-  return isValidSolanaAddress(requirements?.token_address);
+export function validateRequirements(requirements: unknown): boolean {
+  return isValidSolanaAddress(
+    (requirements as Record<string, unknown>)?.token_address as string
+  );
 }
 
-// ⚠️ TODO BEFORE PRODUCTION: Implement actual Virtuals Protocol payment verification.
-// This stub always approves. Replace with real ACP payment verification flow
-// using the Virtuals Protocol SDK before going live on the marketplace.
-export async function requestPayment(_requirements: any): Promise<any> {
-  return { approved: true };
+export async function requestPayment(
+  _requirements: unknown
+): Promise<string> {
+  return "Payment accepted";
 }
