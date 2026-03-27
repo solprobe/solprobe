@@ -1,4 +1,11 @@
 
+
+# Shell scripts that may contain ingestion keys or local paths
+scripts/health-check.sh
+
+# Logs
+logs
+
 .env
 .env.local
 .env.production
@@ -25,6 +32,8 @@ GRADUATION.md
 .vscode/
 .idea/
 
+.data/
+
 
 acp/config.json
 config.json
@@ -43,4 +52,3 @@ npm-debug.log*
 .DS_Store
 src/.DS_Store
 
-scripts/health-check.sh
