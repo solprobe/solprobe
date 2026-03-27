@@ -3,7 +3,7 @@ import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenInfo } from "../sources/helius.js";
 import { getBirdeyeToken } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
-import { calculateRiskGrade, type RiskFactors } from "./riskScorer.js";
+import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 
 // ---------------------------------------------------------------------------
@@ -252,11 +252,12 @@ function logError(source: string, reason: unknown, address: string): void {
 // ---------------------------------------------------------------------------
 
 export async function deepDive(address: string): Promise<DeepDiveResult> {
-  const cacheKey = `deep:${address}`;
+  const cacheKey = `sol_deep_dive:${address}`;
   return deduplicate(cacheKey, () => getOrFetch(cacheKey, () => _fetchDeepDive(address)));
 }
 
 async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
+  const fetchStart = Date.now();
   // Parallel fetch all sources + dev wallet RPC calls
   const [dexResult, rugResult, rpcResult, birdResult, scanResult, mintAuthResult] =
     await Promise.allSettled([
@@ -361,10 +362,14 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // Momentum score (0–100, on-chain signals only)
   const momentum_score = deriveMomentumScore(volume_1h_usd, volume_24h || null, price_change_1h_pct, buy_sell_ratio_1h);
 
-  // Data confidence (5 primary sources: dex, rug, rpc, bird, scan)
-  const failCount = [dexData, rugData, rpcData].filter((d) => d === null).length;
-  const data_confidence: "HIGH" | "MEDIUM" | "LOW" =
-    failCount === 0 ? "HIGH" : failCount === 1 ? "MEDIUM" : "LOW";
+  // Data confidence — based on source corroboration and data freshness
+  const sources = [
+    dexData !== null ? "dexscreener" : null,
+    rugData !== null ? "rugcheck" : null,
+    rpcData !== null ? "helius" : null,
+    birdData !== null ? "birdeye" : null,
+  ].filter((s): s is string => s !== null);
+  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
   const recommendation = deriveRecommendation(risk_grade, is_honeypot, has_rug_history, momentum_score, data_confidence);
 

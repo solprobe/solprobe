@@ -1,3 +1,4 @@
+import { scoreConfidence } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 
 // ---------------------------------------------------------------------------
@@ -116,11 +117,12 @@ function logError(context: string, err: unknown): void {
 // ---------------------------------------------------------------------------
 
 export async function walletRisk(address: string): Promise<WalletRiskResult> {
-  const cacheKey = `wallet:${address}`;
+  const cacheKey = `sol_wallet_risk:${address}`;
   return deduplicate(cacheKey, () => getOrFetch(cacheKey, () => _fetchWalletRisk(address)));
 }
 
 async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
+  const fetchStart = Date.now();
   // Parallel fetch: balance + recent signatures
   const [balanceResult, sigsResult] = await Promise.allSettled([
     rpcWithFallback("getBalance", [address], 5000),
@@ -174,12 +176,12 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     isBot = true;
   }
 
-  // Data confidence
-  const gotBalance  = solBalance !== null;
-  const gotSigs     = signatures !== null;
-  const successCount = [gotBalance, gotSigs].filter(Boolean).length;
-  const data_confidence: "HIGH" | "MEDIUM" | "LOW" =
-    successCount === 2 ? "HIGH" : successCount === 1 ? "MEDIUM" : "LOW";
+  // Data confidence — based on source corroboration and data freshness
+  const sources = [
+    solBalance !== null ? "helius" : null,
+    signatures !== null ? "helius" : null,
+  ].filter((s, i, arr): s is string => s !== null && arr.indexOf(s) === i);
+  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
   const risk_score = deriveRiskScore(walletAgeDays, totalTx, isBot, whaleStatus);
   const trading_style = deriveTradingStyle(walletAgeDays, totalTx, isBot);

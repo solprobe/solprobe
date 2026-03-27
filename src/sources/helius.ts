@@ -1,4 +1,5 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
+import { recordSourceResult } from "./resolver.js";
 
 export interface HeliusTokenData {
   mint_authority_revoked: boolean | null;
@@ -134,6 +135,7 @@ export async function getTokenInfo(
   // to the batch causes rate-limit failures on high-traffic tokens with public RPCs.
   type SingleResponse = { id: number; result?: any; error?: { code: number; message: string } };
 
+  const start = Date.now();
   const accountResult = await rpcWithRetry<SingleResponse>(
     (endpoint) => rpcPost<SingleResponse>(endpoint, {
       jsonrpc: "2.0",
@@ -144,6 +146,7 @@ export async function getTokenInfo(
   );
 
   if (!accountResult) {
+    recordSourceResult("helius", false, Date.now() - start);
     recordFailure("helius_rpc");
     return null;
   }
@@ -166,8 +169,10 @@ export async function getTokenInfo(
   // Only record success if we actually got useful data back
   const gotSomething = mint_authority_revoked !== null || freeze_authority_revoked !== null;
   if (gotSomething) {
+    recordSourceResult("helius", true, Date.now() - start);
     recordSuccess("helius_rpc");
   } else {
+    recordSourceResult("helius", false, Date.now() - start);
     recordFailure("helius_rpc");
     return null;
   }

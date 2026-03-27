@@ -1,4 +1,5 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
+import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://public-api.birdeye.so/defi/token_overview";
 
@@ -33,6 +34,7 @@ export async function getBirdeyeToken(
 
   const timeout = options.timeout ?? 4000;
   const url = `${BASE_URL}?address=${encodeURIComponent(address)}`;
+  const start = Date.now();
 
   const headers: Record<string, string> = {
     Accept: "application/json",
@@ -46,6 +48,7 @@ export async function getBirdeyeToken(
   try {
     res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
   } catch (err) {
+    recordSourceResult("birdeye", false, Date.now() - start);
     recordFailure("birdeye");
     throw err;
   }
@@ -53,6 +56,7 @@ export async function getBirdeyeToken(
   if (res.status === 400 || res.status === 404) return null;
 
   if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
     recordFailure("birdeye");
     const err = new Error(`Birdeye HTTP ${res.status}`) as any;
     err.status = res.status;
@@ -62,10 +66,12 @@ export async function getBirdeyeToken(
   const json = (await res.json()) as RawBirdeyeResponse;
 
   if (!json.success || !json.data) {
+    recordSourceResult("birdeye", false, Date.now() - start);
     recordFailure("birdeye");
     throw new Error("Birdeye returned success=false");
   }
 
+  recordSourceResult("birdeye", true, Date.now() - start);
   recordSuccess("birdeye");
   const d = json.data;
 

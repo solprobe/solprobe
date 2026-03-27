@@ -1,7 +1,7 @@
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenInfo } from "../sources/helius.js";
-import { calculateRiskGrade, type RiskFactors } from "./riskScorer.js";
+import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 
 export interface QuickScanResult {
@@ -22,11 +22,12 @@ function logError(source: string, reason: unknown, address: string): void {
 }
 
 export async function quickScan(address: string): Promise<QuickScanResult> {
-  const cacheKey = `quick:${address}`;
+  const cacheKey = `sol_quick_scan:${address}`;
   return deduplicate(cacheKey, () => getOrFetch(cacheKey, () => _fetchQuickScan(address)));
 }
 
 async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
+  const fetchStart = Date.now();
   const [dexResult, rugResult, rpcResult] = await Promise.allSettled([
     getDexScreenerToken(address, { timeout: 4000 }),
     getRugCheckSummary(address, { timeout: 3000 }),
@@ -79,10 +80,13 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   const risk_grade = calculateRiskGrade(factors);
 
-  // data_confidence: count sources that returned null
-  const failCount = [dexData, rugData, rpcData].filter((d) => d === null).length;
-  const data_confidence: "HIGH" | "MEDIUM" | "LOW" =
-    failCount === 0 ? "HIGH" : failCount === 1 ? "MEDIUM" : "LOW";
+  // data_confidence: based on source corroboration and data freshness
+  const sources = [
+    dexData !== null ? "dexscreener" : null,
+    rugData !== null ? "rugcheck" : null,
+    rpcData !== null ? "helius" : null,
+  ].filter((s): s is string => s !== null);
+  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
   const summary = buildSummary({
     is_honeypot,

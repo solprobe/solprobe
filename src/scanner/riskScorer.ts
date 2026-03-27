@@ -58,3 +58,15 @@ export function calculateRiskGrade(factors: RiskFactors): RiskGrade {
   if (score >= 20) return "D";
   return "F";
 }
+
+export function scoreConfidence(
+  sources: string[],
+  dataAgeMs: number
+): "HIGH" | "MEDIUM" | "LOW" {
+  const corroborated = sources.length >= 2;
+  const fresh = dataAgeMs < 60_000;
+
+  if (corroborated && fresh) return "HIGH";
+  if (corroborated || fresh) return "MEDIUM";
+  return "LOW";
+}

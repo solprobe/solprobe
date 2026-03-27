@@ -1,5 +1,6 @@
 import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
 import { getBirdeyeToken, type BirdeyeTokenData } from "../sources/birdeye.js";
+import { scoreConfidence } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 
 // ---------------------------------------------------------------------------
@@ -85,11 +86,12 @@ function logError(source: string, reason: unknown, address: string): void {
 // ---------------------------------------------------------------------------
 
 export async function marketIntel(address: string): Promise<MarketIntelResult> {
-  const cacheKey = `intel:${address}`;
+  const cacheKey = `sol_market_intel:${address}`;
   return deduplicate(cacheKey, () => getOrFetch(cacheKey, () => _fetchMarketIntel(address)));
 }
 
 async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
+  const fetchStart = Date.now();
   // Parallel fetch: DexScreener primary, Birdeye fallback
   const [dexResult, birdResult] = await Promise.allSettled([
     getDexScreenerToken(address, { timeout: 4000 }),
@@ -126,11 +128,11 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   );
 
   // Data confidence
-  const gotDex  = dexData !== null;
-  const gotBird = birdData !== null;
-  const data_confidence: "HIGH" | "MEDIUM" | "LOW" =
-    gotDex && gotBird ? "HIGH" :
-    gotDex || gotBird ? "MEDIUM" : "LOW";
+  const sources = [
+    dexData !== null ? "dexscreener" : null,
+    birdData !== null ? "birdeye" : null,
+  ].filter((s): s is string => s !== null);
+  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
   return {
     current_price_usd,

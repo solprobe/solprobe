@@ -2,17 +2,17 @@
 // TTL cache
 // ---------------------------------------------------------------------------
 
-const SERVICE_TTL_MS: Record<string, number> = {
-  quick:  60_000,
-  intel:  30_000,
-  deep:   300_000,
-  wallet: 120_000,
+export const CACHE_TTL: Record<string, number> = {
+  sol_quick_scan:   30_000,   // 30s
+  sol_market_intel: 15_000,   // 15s
+  sol_wallet_risk:  300_000,  // 5 min
+  sol_deep_dive:    60_000,   // 1 min
 };
 
 /** Derive TTL from cache key prefix (e.g. "quick:EPj...") */
 function ttlForKey(key: string): number {
   const prefix = key.split(":")[0];
-  return SERVICE_TTL_MS[prefix] ?? 60_000;
+  return CACHE_TTL[prefix] ?? 60_000;
 }
 
 interface CacheEntry<T> {

@@ -1,5 +1,6 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
 import { tryAcquire } from "../cache.js";
+import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://api.rugcheck.xyz/v1/tokens";
 
@@ -49,6 +50,7 @@ export async function getRugCheckSummary(
 
   const timeout = options.timeout ?? 3000;
   const url = `${BASE_URL}/${address}/report`;
+  const start = Date.now();
 
   let res: Response;
   try {
@@ -57,6 +59,7 @@ export async function getRugCheckSummary(
       headers: { Accept: "application/json" },
     });
   } catch (err) {
+    recordSourceResult("rugcheck", false, Date.now() - start);
     recordFailure("rugcheck");
     throw err;
   }
@@ -67,6 +70,7 @@ export async function getRugCheckSummary(
   }
 
   if (!res.ok) {
+    recordSourceResult("rugcheck", false, Date.now() - start);
     recordFailure("rugcheck");
     const err = new Error(`RugCheck HTTP ${res.status}`) as any;
     err.status = res.status;
@@ -74,6 +78,7 @@ export async function getRugCheckSummary(
   }
 
   const raw = (await res.json()) as RawReport;
+  recordSourceResult("rugcheck", true, Date.now() - start);
   recordSuccess("rugcheck");
 
   // mint/freeze authority: null field means revoked (no authority set)

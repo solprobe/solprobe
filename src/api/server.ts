@@ -9,6 +9,29 @@ import { getBreakerStates } from "../circuitBreaker.js";
 import { getCacheStats } from "../cache.js";
 import { revenueMiddleware, getRevenueSummary } from "../revenueTracker.js";
 import { checkRateLimit } from "./rateLimiter.js";
+import { getSourceStats } from "../sources/resolver.js";
+
+// ---------------------------------------------------------------------------
+// SLA enforcement helper
+// ---------------------------------------------------------------------------
+
+class SlaExceededError extends Error {}
+
+async function withSlaDeadline<T>(fn: () => Promise<T>, deadlineMs: number): Promise<T> {
+  return Promise.race([
+    fn(),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new SlaExceededError()), deadlineMs)
+    ),
+  ]);
+}
+
+const SLA_DEADLINE_MS = {
+  quick:  4_500,
+  deep:  28_000,
+  wallet: 9_000,
+  intel:  9_000,
+} as const;
 
 const app = new Hono();
 
@@ -78,8 +101,15 @@ app.post("/scan/quick", async (c) => {
     );
   }
 
-  const result = await quickScan(address);
-  return c.json(result);
+  try {
+    const result = await withSlaDeadline(() => quickScan(address), SLA_DEADLINE_MS.quick);
+    return c.json(result);
+  } catch (err) {
+    if (err instanceof SlaExceededError) {
+      return c.json({ error: true, message: "SLA deadline exceeded", retry_suggested: true, data_confidence: "NONE" }, 503);
+    }
+    throw err;
+  }
 });
 
 app.post("/scan/deep", async (c) => {
@@ -107,8 +137,15 @@ app.post("/scan/deep", async (c) => {
     );
   }
 
-  const result = await deepDive(address);
-  return c.json(result);
+  try {
+    const result = await withSlaDeadline(() => deepDive(address), SLA_DEADLINE_MS.deep);
+    return c.json(result);
+  } catch (err) {
+    if (err instanceof SlaExceededError) {
+      return c.json({ error: true, message: "SLA deadline exceeded", retry_suggested: true, data_confidence: "NONE" }, 503);
+    }
+    throw err;
+  }
 });
 
 app.post("/wallet/risk", async (c) => {
@@ -136,8 +173,15 @@ app.post("/wallet/risk", async (c) => {
     );
   }
 
-  const result = await walletRisk(address);
-  return c.json(result);
+  try {
+    const result = await withSlaDeadline(() => walletRisk(address), SLA_DEADLINE_MS.wallet);
+    return c.json(result);
+  } catch (err) {
+    if (err instanceof SlaExceededError) {
+      return c.json({ error: true, message: "SLA deadline exceeded", retry_suggested: true, data_confidence: "NONE" }, 503);
+    }
+    throw err;
+  }
 });
 
 app.post("/market/intel", async (c) => {
@@ -165,8 +209,15 @@ app.post("/market/intel", async (c) => {
     );
   }
 
-  const result = await marketIntel(address);
-  return c.json(result);
+  try {
+    const result = await withSlaDeadline(() => marketIntel(address), SLA_DEADLINE_MS.intel);
+    return c.json(result);
+  } catch (err) {
+    if (err instanceof SlaExceededError) {
+      return c.json({ error: true, message: "SLA deadline exceeded", retry_suggested: true, data_confidence: "NONE" }, 503);
+    }
+    throw err;
+  }
 });
 
 app.get("/revenue/summary", (c) => {
@@ -175,12 +226,19 @@ app.get("/revenue/summary", (c) => {
 
 app.get("/health", (c) => {
   const breakers = getBreakerStates();
-  const anyOpen = Object.values(breakers).some((s) => s === "OPEN");
+  const sourceStats = getSourceStats();
+  const criticalDown = (["dexscreener", "rugcheck"] as const).filter(
+    (s) => breakers[s] === "OPEN"
+  );
   return c.json({
-    status: anyOpen ? "degraded" : "ok",
+    status: criticalDown.length > 0 ? "degraded" : "ok",
     uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
     ...getCacheStats(),
+    degraded_sources: criticalDown,
     circuit_breakers: breakers,
+    source_success_rates: Object.fromEntries(
+      Object.entries(sourceStats).map(([k, v]) => [k, v.successRate])
+    ),
   });
 });
 

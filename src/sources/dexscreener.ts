@@ -1,5 +1,6 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
 import { tryAcquire } from "../cache.js";
+import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://api.dexscreener.com/latest/dex/tokens";
 
@@ -81,6 +82,7 @@ export async function getDexScreenerToken(
 
   const timeout = options.timeout ?? 4000;
   const url = `${BASE_URL}/${address}`;
+  const start = Date.now();
 
   let res: Response;
   try {
@@ -89,11 +91,13 @@ export async function getDexScreenerToken(
       headers: { Accept: "application/json" },
     });
   } catch (err) {
+    recordSourceResult("dexscreener", false, Date.now() - start);
     recordFailure("dexscreener");
     throw err;
   }
 
   if (!res.ok) {
+    recordSourceResult("dexscreener", false, Date.now() - start);
     recordFailure("dexscreener");
     const err = new Error(`DexScreener HTTP ${res.status}`) as any;
     err.status = res.status;
@@ -102,6 +106,7 @@ export async function getDexScreenerToken(
   }
 
   const json = (await res.json()) as { pairs: DexScreenerPair[] | null };
+  recordSourceResult("dexscreener", true, Date.now() - start);
   recordSuccess("dexscreener");
   const rawPairs: DexScreenerPair[] = json.pairs ?? [];
 

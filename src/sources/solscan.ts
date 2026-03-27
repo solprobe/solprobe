@@ -1,4 +1,5 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
+import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://public-api.solscan.io/token/meta";
 
@@ -37,6 +38,7 @@ export async function getSolscanMeta(
 
   const timeout = options.timeout ?? 4000;
   const url = `${BASE_URL}?tokenAddress=${encodeURIComponent(address)}`;
+  const start = Date.now();
 
   const headers: Record<string, string> = {
     Accept: "application/json",
@@ -49,6 +51,7 @@ export async function getSolscanMeta(
   try {
     res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
   } catch (err) {
+    recordSourceResult("solscan", false, Date.now() - start);
     recordFailure("solscan");
     throw err;
   }
@@ -56,6 +59,7 @@ export async function getSolscanMeta(
   if (res.status === 400 || res.status === 404) return null;
 
   if (!res.ok) {
+    recordSourceResult("solscan", false, Date.now() - start);
     recordFailure("solscan");
     const err = new Error(`Solscan HTTP ${res.status}`) as any;
     err.status = res.status;
@@ -63,6 +67,7 @@ export async function getSolscanMeta(
   }
 
   const json = (await res.json()) as RawSolscanResponse;
+  recordSourceResult("solscan", true, Date.now() - start);
   recordSuccess("solscan");
 
   // Handle both wrapped ({ success, data }) and flat response shapes
