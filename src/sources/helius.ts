@@ -122,6 +122,65 @@ function parseMintAccount(base64Data: string): {
 // Public API
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetch ONLY the mint and freeze authority flags for a token.
+ *
+ * This is the sole source of truth for these flags — Helius RPC is queried
+ * unconditionally on every scan. RugCheck no longer owns these fields.
+ *
+ * Returns null on any error — never throws.
+ * Retries across RPC endpoints via rpcWithRetry().
+ *
+ * SPL Token MintLayout (byte layout decoded manually — equivalent to
+ * @solana/spl-token MintLayout.decode()):
+ *   bytes 0–3:   COption discriminator for mintAuthority (0 = None/revoked)
+ *   bytes 46–49: COption discriminator for freezeAuthority (0 = None/revoked)
+ */
+export async function getTokenMintInfo(
+  address: string,
+  options: { timeout?: number } = {}
+): Promise<{ mint_authority_revoked: boolean; freeze_authority_revoked: boolean } | null> {
+  if (!isAvailable("helius_rpc")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const start = Date.now();
+
+  type SingleResponse = { id: number; result?: any; error?: { code: number; message: string } };
+
+  const accountResult = await rpcWithRetry<SingleResponse>(
+    (endpoint) => rpcPost<SingleResponse>(endpoint, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getAccountInfo",
+      params: [address, { encoding: "base64" }],
+    }, timeout)
+  );
+
+  if (!accountResult) {
+    recordSourceResult("helius", false, Date.now() - start);
+    recordFailure("helius_rpc");
+    return null;
+  }
+
+  try {
+    const accountData = accountResult?.result?.value?.data;
+    if (!Array.isArray(accountData) || typeof accountData[0] !== "string") {
+      recordSourceResult("helius", false, Date.now() - start);
+      recordFailure("helius_rpc");
+      return null;
+    }
+
+    const parsed = parseMintAccount(accountData[0]);
+    recordSourceResult("helius", true, Date.now() - start);
+    recordSuccess("helius_rpc");
+    return parsed;
+  } catch {
+    recordSourceResult("helius", false, Date.now() - start);
+    recordFailure("helius_rpc");
+    return null;
+  }
+}
+
 export async function getTokenInfo(
   address: string,
   options: { timeout?: number } = {}

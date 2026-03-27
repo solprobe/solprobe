@@ -1,38 +1,52 @@
 # SolProbe — Claude Code Instructions
 
+## Project Status
+
+SolProbe is a **live** Solana token scanner agent on the Virtuals Protocol ACP marketplace.
+- Agent ID: #24456 — Chain: Base (Ethereum L2) — Ticker: SPROBE (Pegasus launch)
+- Agent wallet: `0xbCcc964d5748C1601059853a38a8D3f424e7193E`
+- All 4 services registered and operational
+- Scanner backend: `/root/solprobe` — ACP seller runtime: `/root/virtuals-acp`
+- Both processes managed by PM2. Do not touch production unless explicitly asked.
+
+---
+
 ## Project Vision
 
-**SolProbe** is a Solana token scanner agent that sells 4 tiered intelligence services to other AI agents on the [Virtuals Protocol ACP marketplace](https://github.com/Virtual-Protocol/openclaw-acp). This is a first-mover opportunity on Solana within ACP. Revenue comes from per-call service fees (USDC) and a token flywheel as adoption grows. The agent runs 24/7 on a $5 VPS.
+SolProbe sells 4 tiered Solana token intelligence services to other AI agents on the
+Virtuals Protocol ACP marketplace. Revenue comes from per-call USDC fees and a SPROBE
+token flywheel. First-mover advantage on Solana within ACP is the core opportunity.
 
 ---
 
 ## Language & Stack
 
-**TypeScript throughout.** All scanner logic, data sources, API server, and ACP handlers are written in TypeScript (Node.js 20+).
+TypeScript throughout. Node.js 22+, ESM modules.
 
-- **Hono** for the internal HTTP service layer (lightweight, fast, edge-compatible)
-- **Node.js native `fetch`** for async HTTP calls (no extra deps)
-- **`Promise.allSettled()`** for parallel data fetching with per-source fault isolation
-- **ACP integration** via the OpenClaw ACP skill pack: `npx tsx`
+- **Hono** — HTTP service layer on port 8000
+- **Node.js native `fetch`** — all async HTTP, no extra deps
+- **`Promise.allSettled()`** — parallel source fetching with per-source fault isolation
+- **`@solana/web3.js` + `@solana/spl-token`** — on-chain data
+- **ACP integration** — OpenClaw runtime at `/root/virtuals-acp`
 
 ---
 
 ## Available Skills
-- cost-aware-llm-pipeline: Use for routing scan requests to correct model tier
-- autonomous-loops: Use when building service pipeline chains
-- api-design: Use when defining ACP-facing service endpoints
-- search-first: Use before any on-chain data analysis
+- cost-aware-llm-pipeline: routing scan requests to model tier
+- autonomous-loops: building service pipeline chains
+- api-design: ACP-facing service endpoints
+- search-first: before any on-chain data analysis
 
 ---
 
 ## Services
 
-| Service | Price | SLA | Description |
+| Service | Price | SLA | LLM call |
 |---|---|---|---|
-| `sol_quick_scan` | $0.01 | < 5s | Fast safety check — risk grade, mint/freeze authority, holder concentration, liquidity |
-| `sol_deep_dive` | $0.50 | < 30s | Comprehensive analysis — dev wallet, LP lock, wash trading, pump.fun detection, recommendation |
-| `sol_wallet_risk` | $0.02 | < 10s | Wallet risk profile — age, bot detection, rug involvement, trading style |
-| `sol_market_intel` | $0.05 | < 10s | Real-time signals — price, volume, buy/sell pressure, BULLISH/BEARISH/NEUTRAL signal |
+| `sol_quick_scan` | $0.02 | < 5s | Haiku — `summary` field only |
+| `sol_wallet_risk` | $0.02 | < 10s | None — deterministic output |
+| `sol_market_intel` | $0.05 | < 10s | None — deterministic output |
+| `sol_deep_dive` | $0.50 | < 30s | Sonnet — `full_risk_report` only |
 
 ---
 
@@ -42,36 +56,33 @@
 solprobe/
 ├── src/
 │   ├── scanner/
-│   │   ├── quickScan.ts          # sol_quick_scan logic
-│   │   ├── deepDive.ts           # sol_deep_dive logic
-│   │   ├── walletRisk.ts         # sol_wallet_risk logic
-│   │   ├── marketIntel.ts        # sol_market_intel logic
-│   │   └── riskScorer.ts         # Shared risk grading logic
+│   │   ├── quickScan.ts
+│   │   ├── deepDive.ts
+│   │   ├── walletRisk.ts
+│   │   ├── marketIntel.ts
+│   │   └── riskScorer.ts
 │   ├── sources/
-│   │   ├── dexscreener.ts        # DexScreener API client (primary source)
-│   │   ├── rugcheck.ts           # RugCheck API client
-│   │   ├── helius.ts             # Helius/RPC client with RPC rotation
-│   │   ├── birdeye.ts            # Birdeye public API client
-│   │   └── solscan.ts            # Solscan public API client
+│   │   ├── dexscreener.ts
+│   │   ├── rugcheck.ts
+│   │   ├── helius.ts           # includes getTokenMintInfo()
+│   │   ├── birdeye.ts
+│   │   ├── solscan.ts
+│   │   └── resolver.ts         # weighted source resolver
 │   ├── api/
-│   │   └── server.ts             # Hono server — all 4 endpoints
-│   ├── circuitBreaker.ts         # Per-source circuit breaker
-│   ├── validate.ts               # Input validation (Solana address etc.)
-│   └── cache.ts                  # In-memory cache + token bucket rate limiting
-├── acp/
-│   └── offerings/
-│       ├── sol_quick_scan/
-│       │   ├── offering.json
-│       │   └── handlers.ts
-│       ├── sol_deep_dive/
-│       │   ├── offering.json
-│       │   └── handlers.ts
-│       ├── sol_wallet_risk/
-│       │   ├── offering.json
-│       │   └── handlers.ts
-│       └── sol_market_intel/
-│           ├── offering.json
-│           └── handlers.ts
+│   │   ├── server.ts
+│   │   └── rateLimiter.ts      # inbound per-IP rate limiter
+│   ├── llm/
+│   │   └── narrativeEngine.ts  # Haiku/Sonnet prose generation
+│   ├── utils/
+│   │   └── retry.ts
+│   ├── circuitBreaker.ts
+│   ├── validate.ts
+│   ├── cache.ts
+│   └── constants.ts            # PROGRAMS, Virtuals protocol addresses
+├── scripts/
+│   ├── revenueTracker.ts
+│   ├── buyback.ts
+│   └── healthWatchdog.ts
 ├── tests/
 │   ├── quickScan.test.ts
 │   ├── deepDive.test.ts
@@ -79,50 +90,39 @@ solprobe/
 │   └── circuitBreaker.test.ts
 ├── package.json
 ├── tsconfig.json
-├── .env.example
-├── ecosystem.config.js           # PM2 process config
-├── start.sh
-└── README.md
+├── .env
+├── ecosystem.config.cjs
+└── start.sh
 ```
 
 ---
 
-## Service 1: `sol_quick_scan` — $0.01
+## Response Shapes
 
-Fast safety check. Must complete in **under 5 seconds**.
-
-**Response shape:**
+### `sol_quick_scan`
 ```typescript
 {
   is_honeypot: boolean;
-  mint_authority_revoked: boolean;
-  freeze_authority_revoked: boolean;
-  top_10_holder_pct: number;
+  mint_authority_revoked: boolean;       // Helius only — always live on-chain
+  freeze_authority_revoked: boolean;     // Helius only — always live on-chain
+  top_10_holder_pct: number | null;      // Helius only — always live on-chain
   liquidity_usd: number | null;
   risk_grade: "A" | "B" | "C" | "D" | "F";
-  summary: string;                           // one sentence
+  summary: string;                       // LLM (Haiku) or deterministic fallback
+  rugcheck_report_age_seconds: number | null;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
 
-**Data sources (all free, no API key):**
-- DexScreener: `https://api.dexscreener.com/latest/dex/tokens/{address}` — primary liquidity + price
-- RugCheck: `https://api.rugcheck.xyz/v1/tokens/{address}/report/summary` — authority flags, rug signals
-- Helius/RPC: `https://api.mainnet-beta.solana.com` — on-chain account info (with RPC rotation)
-
----
-
-## Service 2: `sol_deep_dive` — $0.50
-
-Full analysis. Up to **30 seconds** allowed.
-
-**Response shape** (everything in quick_scan, plus):
+### `sol_deep_dive`
 ```typescript
 {
+  // all quick_scan fields, plus:
   dev_wallet_analysis: {
     address: string;
-    sol_balance: number;
-    created_tokens_count: number;
+    is_protocol_address?: boolean;       // true if Virtuals protocol address
+    sol_balance: number | null;
+    created_tokens_count: number | null;
     previous_rugs: boolean;
   };
   liquidity_lock_status: {
@@ -133,36 +133,21 @@ Full analysis. Up to **30 seconds** allowed.
   trading_pattern: {
     buy_sell_ratio_1h: number;
     unique_buyers_24h: number;
-    wash_trading_score: number;   // 0–100, derived from on-chain tx patterns
+    wash_trading_score: number;          // 0–100
   };
   pump_fun_launched: boolean;
-  bundled_launch_detected: boolean;
+  bundled_launch_detected: boolean;      // RugCheck
   volume_24h: number;
   price_change_24h_pct: number;
-  momentum_score: number;        // 0–100, derived from volume + price acceleration (NO external social API)
-  full_risk_report: string;      // 3–5 sentences
+  momentum_score: number;               // 0–100, on-chain signals only — no social API
+  full_risk_report: string;             // LLM (Sonnet) or deterministic fallback
   recommendation: "BUY" | "AVOID" | "WATCH" | "DYOR";
+  rugcheck_report_age_seconds: number | null;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
 
-> **Note on `momentum_score`:** This replaces `social_score`. It is derived entirely from on-chain signals —
-> specifically volume acceleration (volume_1h vs volume_24h average), unique wallet growth rate, and
-> buy/sell ratio trend. No Twitter/X or off-chain social API is used. This keeps the service free and
-> deterministic. The field name reflects what it actually measures.
-
-**Additional sources:**
-- Birdeye public API: `https://public-api.birdeye.so/defi/token_overview?address={address}` — fallback liquidity + volume
-- Solscan public API: `https://public-api.solscan.io/token/meta?tokenAddress={address}` — fallback metadata
-- Pump.fun on-chain detection via RPC (check against program ID below)
-
----
-
-## Service 3: `sol_wallet_risk` — $0.02
-
-Wallet counterparty risk assessment.
-
-**Response shape:**
+### `sol_wallet_risk`
 ```typescript
 {
   wallet_age_days: number;
@@ -170,21 +155,13 @@ Wallet counterparty risk assessment.
   is_bot: boolean;
   rug_involvement_count: number;
   whale_status: boolean;
-  risk_score: number;               // 0–100
+  risk_score: number;                   // 0–100
   trading_style: "sniper" | "hodler" | "flipper" | "bot" | "unknown";
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
 
-**Sources:** Solana mainnet RPC (with rotation), Helius free tier for parsed tx data.
-
----
-
-## Service 4: `sol_market_intel` — $0.05
-
-Real-time signals for trading agents pre-trade.
-
-**Response shape:**
+### `sol_market_intel`
 ```typescript
 {
   current_price_usd: number;
@@ -195,19 +172,17 @@ Real-time signals for trading agents pre-trade.
   liquidity_usd: number;
   buy_pressure: "HIGH" | "MEDIUM" | "LOW";
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
-  large_txs_last_hour: number;      // txs > $10k
+  large_txs_last_hour: number;          // txs > $10k
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
 
-**Source:** DexScreener API (primary, free, no key). Birdeye as fallback for price/volume if DexScreener is down.
-
 ---
 
 ## Input Validation (`src/validate.ts`)
 
-**Always validate before hitting any external API.** Invalid addresses passed to on-chain RPCs waste quota and return confusing errors.
+Always validate before hitting any external API.
 
 ```typescript
 import { PublicKey } from "@solana/web3.js";
@@ -216,7 +191,7 @@ export function isValidSolanaAddress(address: string): boolean {
   if (typeof address !== "string") return false;
   if (address.length < 32 || address.length > 44) return false;
   try {
-    new PublicKey(address);  // deserialises to 32-byte pubkey — throws if invalid
+    new PublicKey(address);
     return true;
   } catch {
     return false;
@@ -228,105 +203,169 @@ export function isValidSolanaWallet(address: string): boolean {
 }
 ```
 
-All four ACP `handlers.ts` files and all four Hono endpoints must call `isValidSolanaAddress()` before
-any downstream work. Return HTTP 400 with `{ error: "INVALID_ADDRESS", data_confidence: "LOW" }` immediately.
+All four ACP handlers and all four Hono endpoints must call `isValidSolanaAddress()`
+before any downstream work. Return HTTP 400 immediately on failure:
+
+```typescript
+app.post("/scan/quick", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || !isValidSolanaAddress(body?.token_address)) {
+    return c.json(
+      { error: "INVALID_ADDRESS", message: "token_address must be a valid Solana base58 address (32–44 chars)", data_confidence: "LOW" },
+      400
+    );
+  }
+  // scanner logic...
+});
+```
+
+For `sol_wallet_risk` the field is `wallet_address` — adjust the message accordingly.
+Never return 500 for a bad address. The review team explicitly tests rejection behaviour.
 
 ---
 
-## Source Priority Fallback Table
+## Source Responsibility Split
 
-For each data field, attempt sources in order. Move to the next only if the previous returns `null`
-or throws. Never wait for a failed source to retry before moving to the fallback — use circuit breaker
-state to skip failed sources immediately (see Circuit Breaker section).
+Each source owns specific fields exclusively. No field is fetched from two sources
+and merged. This eliminates the RugCheck cache staleness problem entirely for
+safety-critical fields.
 
-| Field | Primary | Fallback 1 | Fallback 2 | On total failure |
-|---|---|---|---|---|
-| `liquidity_usd` | DexScreener | Birdeye | — | `null` |
-| `price_usd` | DexScreener | Birdeye | — | `null` |
-| `volume_24h` | DexScreener | Birdeye | — | `null` |
-| `mint_authority_revoked` | RugCheck | Helius RPC | — | `null` (grade penalty) |
-| `freeze_authority_revoked` | RugCheck | Helius RPC | — | `null` (grade penalty) |
-| `top_10_holder_pct` | RugCheck | Helius RPC | — | `null` (grade penalty) |
-| `token_metadata` | Helius RPC | Solscan | — | `{}` empty object |
-| `dev_wallet_balance` | Helius RPC | Public RPC | — | `null` |
-| `trading_patterns` | Birdeye | DexScreener trades | — | defaults + LOW confidence |
-| `rug_history` | RugCheck | — | — | `false` (conservative) |
+```
+┌─────────────────────────────────────────────────────────────┐
+│  HELIUS — live on-chain, always fresh (~400ms)              │
+│                                                             │
+│  mint_authority_revoked     ← getAccountInfo (MintLayout)   │
+│  freeze_authority_revoked   ← getAccountInfo (MintLayout)   │
+│  top_10_holder_pct          ← getTokenLargestAccounts       │
+│  dev_wallet_address         ← getAsset (Metaplex DAS)       │
+│  dev_wallet_sol_balance     ← getBalance                    │
+│  pump_fun_launched          ← creator program ID check      │
+│  token_age_days             ← first tx signature            │
+└─────────────────────────────────────────────────────────────┘
 
-**When applying grade penalties for null fields:** treat a null authority flag as *not revoked* (worst-case assumption). This is conservative and correct — never assume safety when data is missing.
+┌─────────────────────────────────────────────────────────────┐
+│  RUGCHECK — historical pattern data, staleness acceptable   │
+│                                                             │
+│  has_rug_history            ← cross-token flagged DB        │
+│  bundled_launch_detected    ← proprietary launch analysis   │
+│  rugcheck_risk_score        ← their aggregate score         │
+│  insider_flags              ← insider trading detection     │
+│  report_age_seconds         ← tracked for confidence only   │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  DEXSCREENER — market data (Birdeye as fallback)            │
+│                                                             │
+│  liquidity_usd    price_usd    volume_24h                   │
+│  price_change_24h_pct    buy_sell_ratio    large_txs        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+RugCheck staleness is acceptable for its owned fields because rug history,
+bundled launches, and insider flags are historical events — they do not change
+after the fact. The RugCheck paid tier (fresh reports, websocket stream) is
+currently listed as "coming soon" and is not available.
 
 ---
 
-## Parallel Data Fetching — Critical
+## Helius: Authority Flags (`src/sources/helius.ts`)
 
-All sources must be fetched in parallel. **Never make sequential calls.** Use `Promise.allSettled()`
-(not `Promise.all().catch()`) — it gives you per-source fault isolation with explicit fulfilled/rejected
-status, and prevents accidentally swallowing errors you need to log.
+Add `getTokenMintInfo()` if not already present. This is the canonical implementation
+for authority checks — called on every scan, unconditionally.
 
-Every source call **must have its own `AbortSignal.timeout()`**. Without per-call timeouts, a single
-hanging upstream response will blow the SLA regardless of `Promise.allSettled()`.
+```typescript
+import { Connection, PublicKey } from "@solana/web3.js";
+import { MintLayout } from "@solana/spl-token";
 
-### Per-source timeout budget (leave headroom for processing)
+export async function getTokenMintInfo(
+  mintAddress: string,
+  connection: Connection
+): Promise<{ mint_authority_revoked: boolean; freeze_authority_revoked: boolean } | null> {
+  try {
+    const pubkey = new PublicKey(mintAddress);
+    const info = await connection.getAccountInfo(pubkey, { commitment: "confirmed" });
+    if (!info || info.data.length < MintLayout.span) return null;
+    const mint = MintLayout.decode(info.data);
+    return {
+      mint_authority_revoked: !mint.mintAuthorityOption,
+      freeze_authority_revoked: !mint.freezeAuthorityOption,
+    };
+  } catch {
+    return null;
+  }
+}
+```
 
-| Source | Timeout | Rationale |
+Use the Helius RPC URL from `process.env.SOLANA_RPC_URL`. Wrap with the existing
+RPC rotation logic. On null return, default both flags to `false` (conservative —
+not revoked). Never default to `true`.
+
+The `RugCheckResult` interface must NOT contain `mint_authority_revoked` or
+`freeze_authority_revoked`. These fields must never come from RugCheck.
+
+---
+
+## Parallel Data Fetching
+
+All sources must be fetched in parallel. Never make sequential calls.
+Use `Promise.allSettled()` — never `Promise.all()`.
+Every source call must have its own `AbortSignal.timeout()`.
+
+### Per-source timeout budget
+
+| Source | Timeout | Notes |
 |---|---|---|
-| DexScreener | 4000ms | Usually <500ms; 4s leaves 1s processing budget in 5s SLA |
-| RugCheck | 3000ms | Can be slow; 3s is safe |
-| Helius/RPC | 3000ms | Public RPC is unreliable; circuit breaker handles sustained failures |
-| Birdeye | 4000ms | Fallback only — full budget available when primary failed fast |
+| DexScreener | 4000ms | Usually <500ms |
+| RugCheck | 3000ms | Can be slow |
+| Helius/RPC | 3000ms | Wraps RPC rotation |
+| Birdeye | 4000ms | Fallback only |
 | Solscan | 4000ms | Fallback only |
 
-### Pattern to use everywhere
+### Pattern
 
 ```typescript
 async function fetchQuickScanData(address: string) {
   const results = await Promise.allSettled([
     dexscreener.getToken(address, { timeout: 4000 }),
     rugcheck.getSummary(address, { timeout: 3000 }),
-    helius.getTokenInfo(address, { timeout: 3000 }),
+    helius.getTokenMintInfo(address, { timeout: 3000 }),  // always runs
+    helius.getTopHolders(address, { timeout: 3000 }),     // always runs
   ]);
 
-  const [dexResult, rugResult, rpcResult] = results;
-
-  const dexData  = dexResult.status  === "fulfilled" ? dexResult.value  : null;
-  const rugData  = rugResult.status  === "fulfilled" ? rugResult.value  : null;
-  const rpcData  = rpcResult.status  === "fulfilled" ? rpcResult.value  : null;
+  const [dexResult, rugResult, mintResult, holdersResult] = results;
 
   // Log any failures
-  if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason, address);
-  if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason, address);
-  if (rpcResult.status  === "rejected") logError("helius_rpc",  rpcResult.reason, address);
+  if (dexResult.status === "rejected") logError("dexscreener", dexResult.reason, address);
+  if (rugResult.status === "rejected") logError("rugcheck", rugResult.reason, address);
+  if (mintResult.status === "rejected") logError("helius_rpc", mintResult.reason, address);
 
-  // Count failures to set data_confidence
-  const failCount = [dexData, rugData, rpcData].filter(d => d === null).length;
-  const data_confidence = failCount === 0 ? "HIGH" : failCount === 1 ? "MEDIUM" : "LOW";
+  const dexData     = dexResult.status === "fulfilled" ? dexResult.value : null;
+  const rugData     = rugResult.status === "fulfilled" ? rugResult.value : null;
+  const mintData    = mintResult.status === "fulfilled" ? mintResult.value : null;
+  const holdersData = holdersResult.status === "fulfilled" ? holdersResult.value : null;
 
-  // Apply fallback priority for null fields (see Source Priority Fallback Table)
-  // ...
+  // Authority flags — Helius only, conservative default on null
+  const mint_authority_revoked  = mintData?.mint_authority_revoked  ?? false;
+  const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
 }
 ```
 
 ---
 
-## In-Flight Request Deduplication
-
-Without this, 10 agents calling `sol_quick_scan` for the same address in a 200ms burst will fire 10
-full sets of API calls before any result hits the cache. Coalesce them into one.
-
-Implement in `src/cache.ts` alongside the TTL cache:
+## In-Flight Request Deduplication (`src/cache.ts`)
 
 ```typescript
 const inFlight = new Map<string, Promise<any>>();
 
 export async function deduplicate<T>(key: string, fn: () => Promise<T>): Promise<T> {
   if (inFlight.has(key)) return inFlight.get(key)! as Promise<T>;
-
   const promise = fn().finally(() => inFlight.delete(key));
   inFlight.set(key, promise);
   return promise;
 }
 ```
 
-Usage in each scanner module:
+Usage:
 ```typescript
 const cacheKey = `quick:${address}`;
 return deduplicate(cacheKey, () => cache.getOrFetch(cacheKey, () => fetchQuickScanData(address)));
@@ -336,56 +375,22 @@ return deduplicate(cacheKey, () => cache.getOrFetch(cacheKey, () => fetchQuickSc
 
 ## Circuit Breaker (`src/circuitBreaker.ts`)
 
-Prevents burning timeout budgets against sources that are already known-down. After a source fails
-5 consecutive times, fail-fast for 60 seconds before trying again.
+After 5 consecutive failures, fail-fast for 60 seconds before retrying.
 
 ```typescript
 type SourceName = "dexscreener" | "rugcheck" | "helius_rpc" | "birdeye" | "solscan";
 
-interface BreakerState {
-  failures: number;
-  openedAt: number | null;   // timestamp when breaker tripped
-  state: "CLOSED" | "OPEN" | "HALF_OPEN";
-}
-
 const FAILURE_THRESHOLD = 5;
 const COOLDOWN_MS = 60_000;
 
-const breakers = new Map<SourceName, BreakerState>();
-
-export function isAvailable(source: SourceName): boolean {
-  const b = getBreaker(source);
-  if (b.state === "CLOSED") return true;
-  if (b.state === "OPEN") {
-    if (Date.now() - (b.openedAt ?? 0) > COOLDOWN_MS) {
-      b.state = "HALF_OPEN";  // allow one probe request
-      return true;
-    }
-    return false;
-  }
-  return true; // HALF_OPEN: allow the probe
-}
-
-export function recordSuccess(source: SourceName): void {
-  const b = getBreaker(source);
-  b.failures = 0;
-  b.state = "CLOSED";
-  b.openedAt = null;
-}
-
-export function recordFailure(source: SourceName): void {
-  const b = getBreaker(source);
-  b.failures++;
-  if (b.failures >= FAILURE_THRESHOLD) {
-    b.state = "OPEN";
-    b.openedAt = Date.now();
-  }
-}
+export function isAvailable(source: SourceName): boolean { ... }
+export function recordSuccess(source: SourceName): void { ... }
+export function recordFailure(source: SourceName): void { ... }
 ```
 
-**Every source client** must wrap its fetch call:
+Every source client wraps its fetch:
 ```typescript
-if (!isAvailable("dexscreener")) return null;   // fail-fast, ~0ms cost
+if (!isAvailable("dexscreener")) return null;
 try {
   const data = await fetchWithTimeout(url, 4000);
   recordSuccess("dexscreener");
@@ -396,760 +401,136 @@ try {
 }
 ```
 
-Expose breaker state in the `/health` endpoint so you can monitor which sources are degraded.
-
 ---
 
 ## Error Handling Rules
 
-- **Never return an error to the calling agent.** Always return a degraded but valid response.
-- If DexScreener fails → consult fallback table, set `liquidity_usd: null` if no fallback succeeds, note it in `summary`.
-- Set `data_confidence: "LOW"` when 2+ sources fail, `"MEDIUM"` when 1 fails, `"HIGH"` when all succeed.
-- Log all API failures to `errors.log` (timestamp, source, status_code, token_address, error_message).
-- Log every job to `jobs.log` (timestamp, service, address, response_time_ms, data_confidence, sources_used).
-- **Treat null authority flags as not-revoked** (worst-case / most conservative) when data is missing.
-- `recommendation` in `sol_deep_dive` must **never be undefined** — default to `"DYOR"` when confidence is LOW.
+- Never return an error to the calling agent. Always return a degraded but valid response.
+- `recommendation` in `sol_deep_dive` must never be undefined — default to `"DYOR"` on LOW confidence.
+- Log all API failures to `errors.log`: timestamp, source, status_code, token_address, error_message.
+- Log every job to `jobs.log`: timestamp, service, address, response_time_ms, data_confidence, sources_used.
+- Treat null authority flags as not-revoked (worst-case / most conservative).
 
 ---
 
 ## Caching & Rate Limiting (`src/cache.ts`)
 
-### TTL — tiered by service (not flat 60s)
+### Per-service TTLs
 
 | Service | TTL | Rationale |
 |---|---|---|
-| `sol_quick_scan` | 60s | Highest frequency; safety data changes slowly |
-| `sol_market_intel` | 30s | Price/volume data goes stale fast |
-| `sol_deep_dive` | 300s | Expensive; structural data changes slowly |
-| `sol_wallet_risk` | 120s | Wallet history is slow-moving |
+| `sol_quick_scan` | 30s | Memecoin focus — tighter staleness budget |
+| `sol_market_intel` | 15s | Signals product — tightest staleness |
+| `sol_wallet_risk` | 300s | Wallet history is slow-moving |
+| `sol_deep_dive` | 60s | Expensive to recompute |
 
-Cache key format: `{service}:{address}` e.g. `quick:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`
+```typescript
+export const CACHE_TTL: Record<string, number> = {
+  sol_quick_scan:   30_000,
+  sol_market_intel: 15_000,
+  sol_wallet_risk:  300_000,
+  sol_deep_dive:    60_000,
+};
+```
 
-### Token bucket rate limits (per source, self-implemented — no library)
+Cache key: `{service}:{address}`. Never share cache entries across services.
+
+### Outbound token bucket limits (self-implemented)
 
 | Source | Limit |
 |---|---|
 | DexScreener | 300 req/min |
 | RugCheck | 100 req/min |
 
-Token bucket behaviour: if bucket is empty, fail immediately (do not queue/wait). The circuit breaker
-handles sustained unavailability; the token bucket prevents thundering-herd bursts.
+Fail immediately when bucket is empty — do not queue or wait.
 
 ---
 
-## RPC Rotation & Retry Logic
+## Inbound Rate Limiter (`src/api/rateLimiter.ts`)
 
-The public Solana RPC (`https://api.mainnet-beta.solana.com`) rate-limits aggressively (~10 req/s in
-practice) and returns 429s often. Implement rotation across free endpoints **before** falling back to
-exponential backoff:
+Per-IP continuous token bucket. Applied to all scanner routes, not to `/health`.
+
+```typescript
+const buckets = new Map<string, { tokens: number; last: number }>();
+const RATE_LIMIT = 60;
+const WINDOW_MS  = 60_000;
+
+export function checkRateLimit(ip: string): boolean {
+  const now    = Date.now();
+  const bucket = buckets.get(ip) ?? { tokens: RATE_LIMIT, last: now };
+  const elapsed = now - bucket.last;
+  bucket.tokens = Math.min(RATE_LIMIT, bucket.tokens + (elapsed / WINDOW_MS) * RATE_LIMIT);
+  bucket.last = now;
+  if (bucket.tokens < 1) { buckets.set(ip, bucket); return false; }
+  bucket.tokens -= 1;
+  buckets.set(ip, bucket);
+  if (buckets.size > 10_000) buckets.clear();
+  return true;
+}
+```
+
+Middleware order in `server.ts` — strictly in this order:
+1. Body size cap (`app.use("*")`) — 1024 byte limit, returns 413
+2. Rate limiter (`app.use("/scan/*")`, `/wallet/*`, `/market/*`) — returns 429
+3. Route handlers
+
+---
+
+## RPC Rotation & Retry Logic (`src/sources/helius.ts`)
 
 ```typescript
 const RPC_ENDPOINTS = [
-  process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com",   // primary (Helius if key set)
-  "https://rpc.ankr.com/solana",                                          // Ankr free tier
-  "https://api.mainnet-beta.solana.com",                                  // official fallback
+  process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com",
+  "https://rpc.ankr.com/solana",
+  "https://api.mainnet-beta.solana.com",
 ] as const;
 ```
 
-**Retry logic:**
-- Max 3 retries total, rotating endpoints on each retry
+- Max 3 retries, rotating endpoints on each attempt
 - Delays: 500ms → 1000ms → 2000ms (exponential)
-- Respect `Retry-After` header on 429 responses — if header is present, use that value instead of
-  the backoff delay (capped at 5s to protect SLA)
-- On final failure, return `null` and set `data_confidence` accordingly
-- Do **not** retry on 400/404 — these are invalid addresses, not transient failures
+- Respect `Retry-After` header on 429 (capped at 5s)
+- Do not retry on 400/404 — invalid address, not transient
+
+---
+
+## Retry Logic (`src/utils/retry.ts`)
+
+Used by all four ACP handlers. Retry up to 3 times before returning any error.
 
 ```typescript
-async function rpcWithRetry<T>(fn: (endpoint: string) => Promise<T>): Promise<T | null> {
-  const delays = [500, 1000, 2000];
-  for (let i = 0; i < RPC_ENDPOINTS.length; i++) {
-    try {
-      return await fn(RPC_ENDPOINTS[i]);
-    } catch (err: any) {
-      const isRateLimit = err?.status === 429;
-      const retryAfter  = isRateLimit ? Math.min(parseInt(err?.headers?.["retry-after"] ?? "0") * 1000, 5000) : 0;
-      const delay       = retryAfter || delays[i] || 2000;
-      if (i < RPC_ENDPOINTS.length - 1) await sleep(delay);
-    }
-  }
-  return null;
-}
-```
-
----
-
-## Risk Scorer (`src/scanner/riskScorer.ts`)
-
-Deterministic, no ML. Score starts at 100 and penalties are subtracted. Grade is assigned from final
-score. `has_rug_history` is an instant-fail regardless of score.
-
-```typescript
-interface RiskFactors {
-  mint_authority_revoked: boolean | null;    // null = unknown → treat as false (25pt penalty)
-  freeze_authority_revoked: boolean | null;  // null = unknown → treat as false (15pt penalty)
-  top_10_holder_pct: number | null;          // null = unknown → treat as 100% (worst-case)
-  liquidity_usd: number | null;              // null = unknown → treat as $0 (worst-case)
-  has_rug_history: boolean;                  // true = instant F, no score computed
-  bundled_launch: boolean;                   // true = 20pt penalty
-  buy_sell_ratio: number | null;             // null = unknown → no penalty (insufficient data)
-  token_age_days: number | null;             // null = unknown → 10pt penalty
-}
-
-// Penalty table
-// mint_authority_revoked === false (or null):  -25
-// freeze_authority_revoked === false (or null): -15
-// top_10_holder_pct > 80%:                     -20
-// top_10_holder_pct > 95%:                     -35 (overrides >80% penalty)
-// liquidity_usd < $10k:                        -20
-// liquidity_usd < $1k:                         -35 (overrides <$10k penalty)
-// bundled_launch === true:                     -20
-// buy_sell_ratio < 0.5:                        -10
-// token_age_days < 1:                          -15
-// token_age_days null:                         -10
-
-// Grade bands
-// 80–100 → A
-// 60–79  → B
-// 40–59  → C
-// 20–39  → D
-// 0–19   → F
-// has_rug_history → F (bypass scoring)
-
-function calculateRiskGrade(factors: RiskFactors): "A" | "B" | "C" | "D" | "F"
-```
-
----
-
-## Solana Program IDs (hardcode these)
-
-```typescript
-export const PROGRAMS = {
-  PUMP_FUN:          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-  TOKEN_PROGRAM:     "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-  TOKEN_2022:        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-  METAPLEX_METADATA: "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-  RAYDIUM_AMM_V4:    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-  ORCA_WHIRLPOOL:    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-} as const;
-```
-
----
-
-## API Server (`src/api/server.ts`)
-
-Use **Hono**, running on port `8000`, host `0.0.0.0`.
-
-```
-POST /scan/quick    → quickScan()
-POST /scan/deep     → deepDive()
-POST /wallet/risk   → walletRisk()
-POST /market/intel  → marketIntel()
-GET  /health        → { status, uptime_seconds, cache_hits, total_requests, circuit_breakers }
-```
-
-The `/health` response must include circuit breaker state for each source so you can monitor degradation:
-
-```typescript
-GET /health → {
-  status: "ok" | "degraded",
-  uptime_seconds: number,
-  cache_hits: number,
-  total_requests: number,
-  circuit_breakers: {
-    dexscreener: "CLOSED" | "OPEN" | "HALF_OPEN",
-    rugcheck:    "CLOSED" | "OPEN" | "HALF_OPEN",
-    helius_rpc:  "CLOSED" | "OPEN" | "HALF_OPEN",
-    birdeye:     "CLOSED" | "OPEN" | "HALF_OPEN",
-    solscan:     "CLOSED" | "OPEN" | "HALF_OPEN",
-  }
-}
-```
-
-`status: "degraded"` when any breaker is OPEN.
-
----
-
-## ACP Integration
-
- **Note:** ACP tooling is already configured on the server at `/root/virtuals-acp`.
- `config.json` contains the agent wallet and API key. Do not re-run setup.
- The `acp/offerings/` directory in this project is where handlers live —
- the runtime itself lives in `/root/virtuals-acp`.
-
-### `offering.json` format
-
-```json
-{
-  "name": "sol_quick_scan",
-  "description": "Instant Solana token safety check. Returns risk grade, mint/freeze authority status, holder concentration, and liquidity in under 5 seconds. Essential pre-trade check for any Solana trading agent. $0.01 per call.",
-  "price": "0.01",
-  "currency": "USDC",
-  "requirements": {
-    "type": "object",
-    "properties": {
-      "token_address": {
-        "type": "string",
-        "description": "Solana token mint address (base58, 32–44 characters)"
-      }
-    },
-    "required": ["token_address"]
-  }
-}
-```
-
-### `handlers.ts` pattern (thin wrapper only)
-
-```typescript
-import { isValidSolanaAddress } from "../../src/validate.js";
-
-export async function executeJob(requirements: any): Promise<any> {
-  try {
-    const response = await fetch("http://localhost:8000/scan/quick", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requirements),
-      signal: AbortSignal.timeout(10_000),
-    });
-    return response.json();
-  } catch (err) {
-    return { error: true, message: String(err), data_confidence: "LOW" };
-  }
-}
-
-export function validateRequirements(requirements: any): boolean {
-  return isValidSolanaAddress(requirements?.token_address);
-}
-
-// ⚠️ TODO BEFORE PRODUCTION: Implement actual Virtuals Protocol payment verification.
-// This stub always approves. Replace with real ACP payment verification flow
-// using the Virtuals Protocol SDK before going live on the marketplace.
-export async function requestPayment(requirements: any): Promise<any> {
-  return { approved: true };
-}
-```
-
-**Timeouts:** 35s for `sol_deep_dive`, 12s for `sol_wallet_risk`, 10s for `sol_quick_scan` and `sol_market_intel`.
-
----
-
-## `start.sh`
-
-```bash
-#!/bin/bash
-set -e
-
-# Start the Hono API server in background
-npx tsx src/api/server.ts &
-SERVER_PID=$!
-
-# Wait for server to be ready — poll /health instead of blind sleep
-echo "Waiting for API server..."
-until curl -sf http://localhost:8000/health > /dev/null 2>&1; do
-  sleep 0.5
-done
-echo "API server ready."
-
-# Start ACP seller runtime
-cd acp && npx tsx ../../node_modules/.bin/acp serve start
-
-# Cleanup on exit
-trap "kill $SERVER_PID 2>/dev/null" EXIT
-```
-
----
-
-## Process Management (PM2)
-
-The server runs 24/7 — the process **will** crash. Do not rely on `start.sh` alone.
-
-**`ecosystem.config.js`:**
-```javascript
-module.exports = {
-  apps: [{
-    name: "solprobe",
-    script: "./start.sh",
-    interpreter: "bash",
-    restart_delay: 3000,
-    max_restarts: 20,
-    watch: false,
-    env: {
-      NODE_ENV: "production",
-    },
-    log_file: "logs/combined.log",
-    error_file: "logs/error.log",
-    time: true,
-  }]
-};
-```
-
-```bash
-# Deploy
-pm2 start ecosystem.config.js
-pm2 save        # persist across reboots
-pm2 startup     # generate systemd/init script
-```
-
----
-
-## Tests
-
-Write tests using **Vitest**:
-
-1. **`quickScan.test.ts`**
-   - Known good token: USDC (`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`)
-   - Known rug: use a retired token with revoked LP
-   - Verify response shape and `risk_grade` is deterministic
-   - Verify `isValidSolanaAddress` rejects short strings, garbage, and accepts valid base58
-
-2. **`sources.test.ts`**
-   - Mock all external APIs
-   - Verify each client handles 200, 429 (with Retry-After), and 500 correctly
-   - Verify parallel fetching actually runs concurrently (mock with artificial delays — total time
-     should be ~max(individual delays), not sum)
-   - Verify circuit breaker opens after 5 consecutive failures and recovers after cooldown
-
-3. **`deepDive.test.ts`**
-   - Verify `recommendation` is never `undefined` — defaults to `"DYOR"` on LOW confidence
-   - Verify degraded response when RugCheck is down (fallback chain engages)
-   - Verify `momentum_score` is always 0–100 and never throws on missing data
-
-4. **`circuitBreaker.test.ts`**
-   - CLOSED → OPEN after 5 failures
-   - OPEN rejects immediately (0 ms cost — mock Date.now)
-   - OPEN → HALF_OPEN after cooldown
-   - HALF_OPEN → CLOSED on success
-   - HALF_OPEN → OPEN on failure
-
----
-
-## Environment Variables
-
-Never hardcode keys. Use a `.env` file:
-
-```
-HELIUS_API_KEY=           # optional — improves RPC rate limits significantly
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-PORT=8000
-LOG_LEVEL=info            # debug | info | warn | error
-```
-
----
-
-## Build Order
-
-Work in this sequence — do not skip ahead:
-
-1. `src/validate.ts` — `isValidSolanaAddress()` used everywhere; build first
-2. `src/sources/dexscreener.ts` — covers ~80% of needed data, validate with a live call against
-   BONK (`DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263`)
-3. `src/scanner/riskScorer.ts`
-4. `src/scanner/quickScan.ts` + `src/api/server.ts` (quick endpoint only, no cache yet)
-5. **Live end-to-end test** against BONK before continuing — verify SLA, response shape, and
-   that a 400 is returned for a garbage address
-6. `src/circuitBreaker.ts` + `src/cache.ts` — caching, deduplication, rate limiting, circuit breakers
-7. Remaining source clients: `rugcheck.ts`, `helius.ts`, `birdeye.ts`, `solscan.ts`
-   (each with circuit breaker wrapping and per-source timeouts)
-8. Remaining scanner modules: `deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`
-   (use fallback priority table for every field)
-9. ACP `handlers.ts` files for all 4 services
-10. Tests (`circuitBreaker.test.ts` first — it has no external deps)
-11. `README.md`, `start.sh`, `ecosystem.config.js`
-
----
-
-## Setup (for README)
-
-```bash
-# 1. Install deps
-npm install
-
-# 2. Clone ACP tooling
-git clone https://github.com/Virtual-Protocol/openclaw-acp
-
-# 3. Configure env
-cp .env.example .env
-
-# 4. Setup ACP agent
-npx tsx bin/acp.ts setup
-
-# 5. Init each offering (run 4 times, once per service)
-npx tsx bin/acp.ts sell init
-
-# 6. Register on marketplace
-npx tsx bin/acp.ts sell create
-
-# 7. Install PM2 globally
-npm install -g pm2
-
-# 8. Start everything under PM2
-pm2 start ecosystem.config.js
-pm2 save && pm2 startup
-```
-
-# Tokenization Step
-
-# CLAUDE.md — SolProbe Tokenization Step
-
-> This file is the working brief for Claude Code.
-> Scope: **Token launch preparation only** — no changes to the scanner API or ACP handlers.
-
----
-
-## Who You Are Working With
-
-**SolProbe** is a live Solana token scanner agent on the Virtuals Protocol ACP marketplace.
-- Agent ID: #24456
-- Chain: Base (Ethereum L2)
-- Agent wallet: `0xbCcc9...e7193E`
-- All 4 services are registered and operational
-- 10 sandbox jobs completed — graduation is gated on tokenization
-
-The scanner backend (`/root/solprobe`) and ACP seller runtime (`/root/virtuals-acp`) are **already running in production**. Do not touch them unless explicitly asked.
-
----
-
-## What We Are Building Now
-
-**Goal:** Prepare everything needed to tokenize SolProbe on Virtuals Protocol and graduate to the public A2A marketplace.
-
-This is a **preparation and tooling task**, not a smart contract task. The actual token launch happens via the Virtuals Protocol UI at `app.virtuals.io/acp`. Our job is to get all the surrounding infrastructure ready so the launch goes smoothly and the token flywheel starts working immediately after graduation.
-
-### Deliverables for This Step
-
-1. **Token metadata package** — name, ticker, description, image assets, socials, in the format Virtuals Protocol expects for the tokenization form
-2. **Buyback script** (`/root/solprobe/scripts/buyback.ts`) — monitors the agent wallet for incoming USDC revenue and auto-buys + burns agent token on a configurable schedule
-3. **Revenue tracker** (`/root/solprobe/scripts/revenueTracker.ts`) — logs per-service revenue to a local SQLite DB so we can measure flywheel health
-4. **Graduation checklist** (`/root/solprobe/GRADUATION.md`) — step-by-step human-readable launch checklist
-
----
-
-## Token Details
-
-| Field | Value |
-|---|---|
-| Name | SolProbe |
-| Ticker | SPROBE |
-| Tagline | The first Solana scanner agent on ACP — scan tokens, not vibes |
-| Description (short) | SolProbe scans Solana tokens and wallets for other AI agents. Risk grading, market signals, deep dives — all via A2A calls on Virtuals Protocol. |
-| Website | https://solprobe.xyz |
-| Twitter | @solprobe |
-| Chain | Base |
-
-The description should emphasise: utility-first, not speculative; A2A revenue-generating; first-mover on Solana within ACP.
-
----
-
-## Token Economics (Do Not Change These)
-
-These are fixed by Virtuals Protocol:
-- 100 VIRTUAL to mint (non-refundable)
-- 42,425 VIRTUAL bonding curve target
-- 30% of trading fees → buyback & burn of SPROBE
-- 60% of trading fees → agent wallet (`0xbCcc9...e7193E`)
-- 10% → protocol treasury
-
-The buyback script should handle the 30% buyback/burn portion that flows to the agent wallet.
-
----
-
-## Buyback Script Requirements
-
-File: `/root/solprobe/scripts/buyback.ts`
-
-Behaviour:
-- Polls agent wallet balance on Base every `BUYBACK_INTERVAL_MINUTES` (default: 60)
-- When balance exceeds `BUYBACK_THRESHOLD_USDC` (default: 5.0), triggers a buy
-- Buys SPROBE token using the agent wallet private key (loaded from `.env`)
-- Burns purchased tokens by sending to the dead address (`0x000...dEaD`)
-- Logs every buyback event to stdout and to `/root/solprobe/logs/buyback.log`
-- Dry-run mode via `DRY_RUN=true` env var — logs what it would do without transacting
-
-Environment variables to add to `.env`:
-```
-AGENT_WALLET_PRIVATE_KEY=    # DO NOT COMMIT — Base wallet key
-SPROBE_TOKEN_ADDRESS=        # Fill in after token launch
-BUYBACK_INTERVAL_MINUTES=60
-BUYBACK_THRESHOLD_USDC=5.0
-DRY_RUN=true                 # Set to false after token is live
-```
-
-Use `viem` for Base chain interactions (already in the ecosystem, preferred over ethers).
-
----
-
-## Revenue Tracker Requirements
-
-File: `/root/solprobe/scripts/revenueTracker.ts`
-
-Behaviour:
-- Hooks into the existing Hono server via a lightweight middleware (do not modify scanner logic)
-- Increments per-service counters in a SQLite DB (`/root/solprobe/data/revenue.db`) on every successful job delivery
-- Exposes a `GET /revenue/summary` endpoint returning:
-
-```json
-{
-  "total_usdc": 1.23,
-  "by_service": {
-    "sol_quick_scan": { "calls": 100, "revenue_usdc": 1.00 },
-    "sol_wallet_risk": { "calls": 5,   "revenue_usdc": 0.10 },
-    "sol_market_intel": { "calls": 2,  "revenue_usdc": 0.10 },
-    "sol_deep_dive":    { "calls": 0,  "revenue_usdc": 0.00 }
-  },
-  "since": "2025-01-01T00:00:00Z"
-}
-```
-
-Use `better-sqlite3` for the DB (synchronous, no async complexity).
-
----
-
-## Stack Constraints
-
-- **Language:** TypeScript (ESM, Node 22+)
-- **No new frameworks** — Hono is already the HTTP layer, use it
-- **Viem** for any Base chain interactions
-- **Better-sqlite3** for local DB
-- **PM2** for process management — add any new long-running scripts to `ecosystem.config.cjs`
-- All scripts go in `/root/solprobe/scripts/`
-- All logs go in `/root/solprobe/logs/` (create if not exists)
-- All data files go in `/root/solprobe/data/` (create if not exists)
-
----
-
-## What NOT to Do
-
-- Do not modify `src/scanner/`, `src/sources/`, or `src/api/server.ts` directly (revenue tracker hooks in via middleware)
-- Do not modify any files in `/root/virtuals-acp/`
-- Do not generate or commit private keys or wallet secrets
-- Do not write Solidity or deploy smart contracts — the token launch is done through the Virtuals UI
-- Do not change existing PM2 process names (`solprobe`, `acp-seller`)
-
----
-
-## Key Files for Context
-
-| File | Purpose |
-|---|---|
-| `/root/solprobe/src/api/server.ts` | Hono server — middleware goes here |
-| `/root/solprobe/ecosystem.config.cjs` | PM2 config — add new processes here |
-| `/root/solprobe/.env` | Add new env vars here |
-
----
-
-## Definition of Done
-
-- [ ] Token metadata document ready to copy-paste into Virtuals Protocol tokenization form
-- [ ] `buyback.ts` script written, typed, dry-run tested locally
-- [ ] `revenueTracker.ts` middleware written, `GET /revenue/summary` returns valid JSON
-- [ ] Both scripts registered in `ecosystem.config.cjs` (buyback as a cron-style process)
-- [ ] `GRADUATION.md` checklist complete
-- [ ] No existing tests broken, health endpoint still returns `"status": "ok"`
-
----
-
-# Reliability & Success Rate Improvements
-
-> Scope: Improve ACP job completion rate, SLA compliance, and data quality.
-> Do not modify tokenization scripts, buyback.ts, or revenueTracker.ts.
-> All changes are confined to `src/` unless explicitly stated.
-
----
-
-## Overview of Changes
-
-| # | Change | Files Affected | Priority |
-|---|---|---|---|
-| 1 | Retry logic — 3 attempts before failing | `acp/offerings/*/handlers.ts` | 🔴 First |
-| 2 | SLA-aware timeout budgets per service | `src/api/server.ts`, handlers | 🔴 First |
-| 3 | Weighted source resolver with rolling stats | `src/sources/resolver.ts` (new) | 🟡 Second |
-| 4 | Honest `data_confidence` scoring | `src/scanner/riskScorer.ts` | 🟡 Second |
-| 5 | Per-service cache TTLs | `src/cache.ts` | 🟡 Second |
-| 6 | Degraded health status on critical source failure | `src/api/server.ts` | 🟢 Third |
-
----
-
-## 1. Retry Logic in ACP Handlers
-
-**File to create:** `src/utils/retry.ts`
-
-All four ACP `handlers.ts` files must use this utility. The rule is:
-**retry up to 3 times with exponential backoff before returning any error.**
-Never return a degraded or error response without having genuinely attempted the call at least 3 times.
-
-```typescript
-// src/utils/retry.ts
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  options: {
-    attempts?: number;
-    delayMs?: number;
-    backoff?: "linear" | "exponential";
-    label?: string;
-  } = {}
+  options: { attempts?: number; delayMs?: number; backoff?: "linear" | "exponential"; label?: string } = {}
 ): Promise<T> {
-  const {
-    attempts = 3,
-    delayMs = 400,
-    backoff = "exponential",
-    label = "operation",
-  } = options;
-
+  const { attempts = 3, delayMs = 400, backoff = "exponential", label = "operation" } = options;
   let lastError: unknown;
-
   for (let i = 1; i <= attempts; i++) {
     try {
       return await fn();
     } catch (err) {
       lastError = err;
-      const wait =
-        backoff === "exponential" ? delayMs * 2 ** (i - 1) : delayMs * i;
-      console.warn(
-        `[retry] ${label} attempt ${i}/${attempts} failed — waiting ${wait}ms`
-      );
-      if (i < attempts) await sleep(wait);
+      const wait = backoff === "exponential" ? delayMs * 2 ** (i - 1) : delayMs * i;
+      console.warn(`[retry] ${label} attempt ${i}/${attempts} failed — waiting ${wait}ms`);
+      if (i < attempts) await new Promise(res => setTimeout(res, wait));
     }
   }
-
   throw lastError;
 }
-
-const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-```
-
-**All four `handlers.ts` files must adopt this pattern:**
-
-```typescript
-// acp/offerings/sol_quick_scan/handlers.ts (and equivalents for other 3 services)
-import { withRetry } from "../../../src/utils/retry.js";
-import type {
-  ExecuteJobResult,
-  ValidationResult,
-} from "../../../runtime/offeringTypes.js";
-
-export async function executeJob(
-  requirements: any
-): Promise<ExecuteJobResult> {
-  try {
-    const result = await withRetry(
-      () =>
-        fetch("http://localhost:8000/scan/quick", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requirements),
-          signal: AbortSignal.timeout(RETRY_CONFIG.sol_quick_scan.timeoutMs),
-        }).then((r) => r.json()),
-      {
-        attempts: RETRY_CONFIG.sol_quick_scan.attempts,
-        delayMs: RETRY_CONFIG.sol_quick_scan.delayMs,
-        backoff: "exponential",
-        label: "sol_quick_scan",
-      }
-    );
-
-    return { deliverable: JSON.stringify(result) };
-  } catch (err) {
-    // Only reached after all retry attempts genuinely exhausted
-    return {
-      deliverable: JSON.stringify({
-        error: true,
-        message: "Service temporarily unavailable after 3 attempts",
-        retry_suggested: true,
-        data_confidence: "NONE",
-      }),
-    };
-  }
-}
 ```
 
 ---
 
-## 2. Per-Service Retry & Timeout Config
+## Weighted Source Resolver (`src/sources/resolver.ts`)
 
-**Add to `src/utils/retry.ts`** (or a shared constants file if one already exists):
-
-```typescript
-// Per-attempt timeout — not total budget. Resets each retry.
-// Total worst-case time = (timeoutMs × attempts) + sum of backoff delays.
-// All values leave headroom within the advertised SLA.
-export const RETRY_CONFIG = {
-  sol_quick_scan: {
-    attempts: 3,
-    delayMs: 300,
-    timeoutMs: 4_000, // SLA 5s — 3 × 4s + 300+600ms ≈ 13s worst case, capped by ACP timeout
-  },
-  sol_wallet_risk: {
-    attempts: 3,
-    delayMs: 500,
-    timeoutMs: 6_000, // SLA 10s
-  },
-  sol_market_intel: {
-    attempts: 3,
-    delayMs: 400,
-    timeoutMs: 5_000, // SLA 10s
-  },
-  sol_deep_dive: {
-    attempts: 3,
-    delayMs: 800,
-    timeoutMs: 8_000, // SLA 30s
-  },
-} as const;
-```
-
-**SLA timeout enforcement in `src/api/server.ts`:**
-
-Each Hono endpoint must enforce a hard SLA deadline using `AbortSignal.timeout()` at the
-**endpoint level** (not just per-source fetch). If the deadline is blown, return a structured
-error immediately — a timeout is worse than a low-confidence response in ACP's eyes.
+Tracks rolling success rates and re-ranks sources every 100 requests.
 
 ```typescript
-// src/api/server.ts — example for /scan/quick
-app.post("/scan/quick", async (c) => {
-  const SLA_DEADLINE_MS = 4_500; // 500ms below the 5s advertised SLA
-  const body = await c.req.json();
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SLA_DEADLINE_MS);
-
-  try {
-    const result = await quickScan(body.token_address, controller.signal);
-    clearTimeout(timer);
-    return c.json(result);
-  } catch (err) {
-    clearTimeout(timer);
-    if (controller.signal.aborted) {
-      return c.json(
-        {
-          error: true,
-          message: "SLA deadline exceeded",
-          retry_suggested: true,
-          data_confidence: "NONE",
-        },
-        503
-      );
-    }
-    throw err;
-  }
-});
-```
-
----
-
-## 3. Weighted Source Resolver
-
-**File to create:** `src/sources/resolver.ts`
-
-The existing fallback chain is static. This module tracks rolling success rates and
-re-ranks sources automatically every 100 requests so degraded sources are deprioritised
-**before** they cause failures, not after.
-
-```typescript
-// src/sources/resolver.ts
 type SourceName = "dexscreener" | "rugcheck" | "helius" | "birdeye" | "solscan";
 
 interface SourceStats {
   priority: number;
-  successRate: number;   // rolling — updated every call
-  avgLatencyMs: number;  // rolling average
+  successRate: number;
+  avgLatencyMs: number;
   totalCalls: number;
   failures: number;
 }
@@ -1162,141 +543,368 @@ const SOURCE_STATS: Record<SourceName, SourceStats> = {
   solscan:     { priority: 5, successRate: 0.85, avgLatencyMs: 900,  totalCalls: 0, failures: 0 },
 };
 
-/** Call after every source fetch — pass success=false on any thrown error or non-200. */
-export function recordSourceResult(
-  source: SourceName,
-  success: boolean,
-  latencyMs: number
-): void {
+export function recordSourceResult(source: SourceName, success: boolean, latencyMs: number): void {
   const s = SOURCE_STATS[source];
   s.totalCalls++;
   if (!success) s.failures++;
-
-  // Recalculate rolling average latency (exponential moving average, α=0.1)
   s.avgLatencyMs = s.avgLatencyMs * 0.9 + latencyMs * 0.1;
-
-  // Recalculate rolling success rate every 100 calls
-  if (s.totalCalls % 100 === 0) {
-    s.successRate = 1 - s.failures / s.totalCalls;
-  }
+  if (s.totalCalls % 100 === 0) s.successRate = 1 - s.failures / s.totalCalls;
 }
 
-/** Returns sources ranked by current success rate (best first). */
 export function rankSources(candidates?: SourceName[]): SourceName[] {
   const pool = candidates ?? (Object.keys(SOURCE_STATS) as SourceName[]);
-  return [...pool].sort(
-    (a, b) => SOURCE_STATS[b].successRate - SOURCE_STATS[a].successRate
-  );
+  return [...pool].sort((a, b) => SOURCE_STATS[b].successRate - SOURCE_STATS[a].successRate);
 }
 
-/** Snapshot of current stats — exposed via /health for observability. */
 export function getSourceStats(): Record<SourceName, SourceStats> {
   return { ...SOURCE_STATS };
 }
 ```
 
-**Usage in source clients** (e.g. `dexscreener.ts`):
-
-```typescript
-import { recordSourceResult } from "./resolver.js";
-
-export async function fetchDexScreener(address: string) {
-  const start = Date.now();
-  try {
-    const data = await fetch(`https://api.dexscreener.com/...`).then(r => r.json());
-    recordSourceResult("dexscreener", true, Date.now() - start);
-    return data;
-  } catch (err) {
-    recordSourceResult("dexscreener", false, Date.now() - start);
-    throw err;
-  }
-}
-```
+Call `recordSourceResult()` in every source client after each fetch.
 
 ---
 
-## 4. Honest `data_confidence` Scoring
+## Risk Scorer (`src/scanner/riskScorer.ts`)
 
-**File:** `src/scanner/riskScorer.ts`
+Deterministic, no ML. Score starts at 100, penalties subtracted. `has_rug_history`
+is an instant F regardless of score.
 
-The `data_confidence` field must reflect real data quality. Buyer agents will notice
-if confidence scores are inflated — this drives churn. Rules:
+### Penalty table
+- `mint_authority_revoked === false` (or null): -25
+- `freeze_authority_revoked === false` (or null): -15
+- `top_10_holder_pct > 80%`: -20 / `> 95%`: -35
+- `liquidity_usd < $10k`: -20 / `< $1k`: -35
+- `bundled_launch === true`: -20
+- `buy_sell_ratio < 0.5`: -10
+- `token_age_days < 1`: -15 / null: -10
 
-- `HIGH` requires **at least 2 sources corroborating** AND data **under 60 seconds old**
-- `MEDIUM` if only one condition is met
-- `LOW` if neither condition is met or only one source returned data
-- Never return `HIGH` from a single source, regardless of how clean the data looks
+### Grade bands
+80–100 → A | 60–79 → B | 40–59 → C | 20–39 → D | 0–19 → F | rug history → F
+
+### Confidence scoring
 
 ```typescript
-// Add to src/scanner/riskScorer.ts
 export function scoreConfidence(
-  sources: string[],      // names of sources that returned valid data
-  dataAgeMs: number       // milliseconds since data was fetched
+  sources: string[],
+  dataAgeMs: number,
+  rugCheckAgeSeconds?: number
 ): "HIGH" | "MEDIUM" | "LOW" {
   const corroborated = sources.length >= 2;
-  const fresh = dataAgeMs < 60_000; // under 60 seconds
+  const fresh = dataAgeMs < 60_000;
+  // RugCheck age only caps deep_dive (bundled, insider fields)
+  // Authority flags now come from Helius — not affected by RugCheck staleness
+  const historicalDataStale = rugCheckAgeSeconds !== undefined && rugCheckAgeSeconds > 86_400;
 
+  if (historicalDataStale) return "MEDIUM";
   if (corroborated && fresh) return "HIGH";
   if (corroborated || fresh) return "MEDIUM";
   return "LOW";
 }
 ```
 
-All four scanner modules (`quickScan.ts`, `deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`)
-must call `scoreConfidence()` with the actual list of sources that contributed data to the
-response. Do not hardcode confidence values.
-
 ---
 
-## 5. Per-Service Cache TTLs
+## LLM Narrative Engine (`src/llm/narrativeEngine.ts`)
 
-**File:** `src/cache.ts`
+Only `sol_quick_scan` and `sol_deep_dive` get LLM calls.
+`sol_wallet_risk` and `sol_market_intel` produce deterministic structured outputs — no LLM.
 
-Replace any single global TTL with service-specific values. Wallet history changes slowly;
-market signals go stale in seconds. Correct TTLs protect free API rate limits as volume
-scales and dramatically improve p95 latency.
+The LLM receives the fully assembled, scored result. All data collection and grading
+happens first. The LLM only converts the result into analyst-quality prose.
 
-```typescript
-// src/cache.ts — TTL constants
-export const CACHE_TTL: Record<string, number> = {
-  sol_quick_scan:   30_000,   // 30s — authority flags + liquidity don't change quickly
-  sol_market_intel: 15_000,   // 15s — this is a signals product, tighter staleness budget
-  sol_wallet_risk:  300_000,  // 5 min — wallet history is slow-moving
-  sol_deep_dive:    60_000,   // 1 min — expensive to recompute, acceptable staleness
-};
+### Provider cascade
+
+Failures fall through in order. The deterministic template is the last resort, not
+the first fallback. A $0.50 deep dive returning a two-sentence template is not
+acceptable — the cascade exists to prevent that.
+
+```
+Anthropic (primary) → Groq (fallback) → deterministic template (last resort)
 ```
 
-Cache key format: `{service}:{address}` — e.g. `sol_quick_scan:DezXAZ8z...`
+Quality hierarchy by tier:
+```
+Sonnet 4.6 > Mixtral 8x7B > Haiku > Llama 3.1 8B > template
+```
 
-Do not share cache entries across services. A `sol_quick_scan` result and a
-`sol_deep_dive` result for the same address have different TTLs and different shapes.
+Groq is chosen as the fallback provider because it is free, has an
+OpenAI-compatible API, and has the fastest inference of any free provider
+(~600 tokens/second). Ollama on the VPS is not viable — the CCX23 has no GPU
+and a quantised 7B model on CPU takes 3–8s, which blows both SLAs.
+
+### Full implementation
+
+```typescript
+// src/llm/narrativeEngine.ts
+
+interface Provider {
+  name: string;
+  baseUrl: string;
+  apiKey: () => string;
+  models: { fast: string; deep: string };
+  format: "anthropic" | "openai";
+}
+
+const PROVIDERS: Provider[] = [
+  {
+    name: "anthropic",
+    baseUrl: "https://api.anthropic.com/v1/messages",
+    apiKey: () => process.env.ANTHROPIC_API_KEY ?? "",
+    models: {
+      fast: "claude-haiku-4-5-20251001",
+      deep: "claude-sonnet-4-6",
+    },
+    format: "anthropic",
+  },
+  {
+    name: "groq",
+    baseUrl: "https://api.groq.com/openai/v1/chat/completions",
+    apiKey: () => process.env.GROQ_API_KEY ?? "",
+    models: {
+      fast: "llama-3.1-8b-instant",  // fast enough for one-sentence summary
+      deep: "mixtral-8x7b-32768",    // stronger reasoning for deep dive
+    },
+    format: "openai",
+  },
+];
+
+const QUICK_SCAN_SYSTEM = `You are a Solana token security analyst writing
+one-sentence risk summaries for AI trading agents. Be specific and reference
+actual values. Never hedge excessively. Never use the word "ensure".`;
+
+const DEEP_DIVE_SYSTEM = `You are a Solana token security analyst writing
+risk reports for AI trading agents. Connect data points into coherent analysis.
+Reference patterns explicitly — do not list fields independently.`;
+
+export async function generateQuickScanSummary(scanResult: QuickScanData): Promise<string> {
+  const prompt = `Write a single sentence summarising this token's risk profile.
+Include the risk grade and the single most important risk factor.
+If grade is F, lead with the primary failure reason.
+Output only the sentence, under 30 words, no preamble.
+
+${JSON.stringify(scanResult, null, 2)}`;
+
+  const result = await callWithFallback("fast", QUICK_SCAN_SYSTEM, prompt, 80);
+  return result || fallbackQuickSummary(scanResult);
+}
+
+export async function generateDeepDiveReport(scanResult: DeepDiveData): Promise<string> {
+  const prompt = `Write a 3–5 sentence risk report for this token.
+Cross-reference holder concentration with LP lock status.
+Reference buy/sell ratio alongside momentum score.
+If the dev wallet shows a pattern of short-lived tokens, say so explicitly.
+State the recommendation and why in the final sentence.
+Output only the report, no preamble or sign-off.
+
+${JSON.stringify(scanResult, null, 2)}`;
+
+  const result = await callWithFallback("deep", DEEP_DIVE_SYSTEM, prompt, 300);
+  return result || fallbackDeepReport(scanResult);
+}
+
+async function callWithFallback(
+  tier: "fast" | "deep",
+  system: string,
+  userPrompt: string,
+  maxTokens: number
+): Promise<string> {
+  for (const provider of PROVIDERS) {
+    const key = provider.apiKey();
+    if (!key) {
+      console.warn(`[llm] ${provider.name} skipped — API key not set`);
+      continue;
+    }
+    try {
+      const result = await callProvider(provider, tier, system, userPrompt, maxTokens);
+      if (result) {
+        if (provider.name !== "anthropic") {
+          console.info(`[llm] served by fallback provider: ${provider.name}`);
+        }
+        return result;
+      }
+    } catch (err) {
+      console.warn(`[llm] ${provider.name} failed — trying next provider`, err);
+    }
+  }
+  return ""; // caller falls through to deterministic template
+}
+
+async function callProvider(
+  provider: Provider,
+  tier: "fast" | "deep",
+  system: string,
+  userPrompt: string,
+  maxTokens: number
+): Promise<string> {
+  const model = provider.models[tier];
+
+  const body =
+    provider.format === "anthropic"
+      ? JSON.stringify({
+          model,
+          max_tokens: maxTokens,
+          system,                                              // top-level — enables prompt caching
+          messages: [{ role: "user", content: userPrompt }],
+        })
+      : JSON.stringify({
+          model,
+          max_tokens: maxTokens,
+          messages: [
+            { role: "system", content: system },              // OpenAI format
+            { role: "user", content: userPrompt },
+          ],
+        });
+
+  const headers: Record<string, string> =
+    provider.format === "anthropic"
+      ? {
+          "Content-Type": "application/json",
+          "x-api-key": provider.apiKey(),
+          "anthropic-version": "2023-06-01",
+        }
+      : {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${provider.apiKey()}`,
+        };
+
+  const response = await fetch(provider.baseUrl, {
+    method: "POST",
+    headers,
+    body,
+    signal: AbortSignal.timeout(8_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`${provider.name} API ${response.status}: ${await response.text()}`);
+  }
+
+  const data = await response.json();
+
+  // Anthropic: data.content[0].text — OpenAI: data.choices[0].message.content
+  return provider.format === "anthropic"
+    ? (data.content?.[0]?.text?.trim() ?? "")
+    : (data.choices?.[0]?.message?.content?.trim() ?? "");
+}
+
+// Deterministic last-resort fallbacks
+export function fallbackQuickSummary(r: QuickScanData): string {
+  const topRisk =
+    r.risk_grade === "F" ? "failed critical safety checks"
+    : r.risk_grade === "D" ? `top-10 holders control ${r.top_10_holder_pct?.toFixed(0) ?? "?"}% of supply`
+    : `liquidity is ${r.liquidity_usd != null ? `$${(r.liquidity_usd / 1000).toFixed(0)}k` : "unknown"}`;
+  return `Grade ${r.risk_grade}: ${topRisk}.`;
+}
+
+export function fallbackDeepReport(r: DeepDiveData): string {
+  return `Risk grade ${r.risk_grade} with ${r.top_10_holder_pct?.toFixed(0) ?? "?"}% top-10 concentration ` +
+    `and ${r.liquidity_usd != null ? `$${(r.liquidity_usd / 1000).toFixed(0)}k` : "unknown"} liquidity. ` +
+    `Recommendation: ${r.recommendation}.`;
+}
+```
+
+### SLA rules
+
+- `sol_quick_scan` 5s SLA: LLM runs sequentially after all parallel fetches.
+  If elapsed time exceeds 4.2s before the LLM call starts, skip both providers
+  and use `fallbackQuickSummary` directly. Log the skip.
+- `sol_deep_dive` 30s SLA: Sonnet call has comfortable headroom. If Anthropic
+  fails and Groq also fails within budget, use `fallbackDeepReport`. Log both
+  failures and the fallback reason.
+- Never let any provider failure propagate as a scan error.
+- Log which provider served each response (skip logging when Anthropic succeeds
+  to avoid log noise).
+
+### Environment variables
+
+```
+ANTHROPIC_API_KEY=sk-ant-...   # primary — prompt caching applies
+GROQ_API_KEY=gsk_...           # fallback — free tier, get at console.groq.com
+```
+
+Both keys are optional at startup but at least one must be set or all LLM
+calls will fall through to the deterministic template immediately. Log a
+startup warning if both are missing.
+
+### Adding a third provider
+
+The PROVIDERS array is ordered — insert new providers at any position. The
+cascade tries them in array order and stops at the first success. To add a
+provider, append an entry following the same interface. The `format` field
+controls request/response shape: `"openai"` for any OpenAI-compatible API,
+`"anthropic"` for Anthropic only.
 
 ---
 
-## 6. Degraded Health Status
+## Constants (`src/constants.ts`)
 
-**File:** `src/api/server.ts`
+```typescript
+/**
+ * Virtuals Protocol controlled addresses.
+ * Never flag these as insider holders, team wallets, or rug participants.
+ * Source: Virtuals Protocol graduation requirements.
+ */
+export const VIRTUALS_PROTOCOL_ADDRESSES = new Set([
+  "0xe2890629ef31b32132003c02b29a50a025deee8a", // sell wall wallet
+  "0xf8dd39c71a278fe9f4377d009d7627ef140f809e", // sell execution contract
+]);
 
-The `/health` endpoint must distinguish between `ok` and `degraded`. PM2 or an
-external monitor can poll this to alert before ACP sees failures.
+export function isProtocolAddress(address: string): boolean {
+  return VIRTUALS_PROTOCOL_ADDRESSES.has(address.toLowerCase());
+}
 
-DexScreener and RugCheck are **critical** — if both circuit breakers are OPEN
-simultaneously, no meaningful scan can be completed. Surface this explicitly.
+export const PROGRAMS = {
+  PUMP_FUN:          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  TOKEN_PROGRAM:     "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  TOKEN_2022:        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  METAPLEX_METADATA: "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+  RAYDIUM_AMM_V4:    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+  ORCA_WHIRLPOOL:    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+} as const;
+```
+
+**Integration — two places, both required:**
+
+```typescript
+// quickScan.ts and deepDive.ts — filter before concentration calc
+const filteredHolders = holders.filter(h => !isProtocolAddress(h.address));
+const top10Pct = calculateConcentration(filteredHolders.slice(0, 10));
+
+// deepDive.ts — dev wallet check
+if (isProtocolAddress(devWalletAddress)) {
+  return { address: devWalletAddress, is_protocol_address: true,
+           sol_balance: null, created_tokens_count: null, previous_rugs: false };
+}
+```
+
+---
+
+## API Server (`src/api/server.ts`)
+
+Hono on port 8000, host `0.0.0.0`.
+
+```
+POST /scan/quick    → quickScan()
+POST /scan/deep     → deepDive()
+POST /wallet/risk   → walletRisk()
+POST /market/intel  → marketIntel()
+GET  /health        → status, uptime, circuit_breakers, source_success_rates
+GET  /revenue/summary → revenueTracker middleware
+```
+
+### Health endpoint
 
 ```typescript
 app.get("/health", async (c) => {
-  const breakers = circuitBreaker.getAll(); // existing call
-  const sourceStats = getSourceStats();     // from resolver.ts (new)
-
-  const criticalDown = ["dexscreener", "rugcheck"].filter(
-    (s) => breakers[s] === "OPEN"
-  );
+  const breakers = circuitBreaker.getAll();
+  const sourceStats = getSourceStats();
+  const criticalDown = ["dexscreener", "helius_rpc"].filter(s => breakers[s] === "OPEN");
 
   return c.json({
     status: criticalDown.length > 0 ? "degraded" : "ok",
     uptime_seconds: Math.floor(process.uptime()),
-    cache_hits: cache.getHits(),           // existing
-    total_requests: cache.getTotal(),      // existing
+    cache_hits: cache.getHits(),
+    total_requests: cache.getTotal(),
     degraded_sources: criticalDown,
     circuit_breakers: breakers,
     source_success_rates: Object.fromEntries(
@@ -1306,60 +914,270 @@ app.get("/health", async (c) => {
 });
 ```
 
-**PM2 health watchdog — add to `ecosystem.config.cjs`:**
+Status is `"degraded"` when DexScreener or Helius circuit breaker is OPEN.
 
-```javascript
-// ecosystem.config.cjs — add alongside existing solprobe and acp-seller entries
-{
-  name: "health-watchdog",
-  script: "scripts/healthWatchdog.ts",
-  interpreter: "npx",
-  interpreter_args: "tsx",
-  cron_restart: "*/5 * * * *",   // every 5 minutes
-  autorestart: false,
+---
+
+## ACP Integration
+
+ACP tooling is already configured at `/root/virtuals-acp`. Do not re-run setup.
+The job queue and all 4 handlers live in `/root/virtuals-acp/src/seller/`.
+
+### Job Queue (`virtuals-acp/src/seller/jobQueue.ts`)
+
+```typescript
+import type { ExecuteJobResult } from "../runtime/offeringTypes.js";
+
+type Job = {
+  requirements: any;
+  resolve: (result: ExecuteJobResult) => void;
+  reject: (err: unknown) => void;
+};
+
+const queue: Job[] = [];
+let processing = false;
+const MAX_QUEUE_DEPTH = 50;
+
+async function drain(handler: (req: any) => Promise<ExecuteJobResult>): Promise<void> {
+  if (processing) return;
+  processing = true;
+  while (queue.length > 0) {
+    const job = queue.shift()!;
+    try { job.resolve(await handler(job.requirements)); }
+    catch (err) { job.reject(err); }
+  }
+  processing = false;
+}
+
+export function enqueue(
+  requirements: any,
+  handler: (req: any) => Promise<ExecuteJobResult>
+): Promise<ExecuteJobResult> {
+  return new Promise((resolve, reject) => {
+    if (queue.length >= MAX_QUEUE_DEPTH) {
+      reject(new Error("Queue full — try again later"));
+      return;
+    }
+    queue.push({ requirements, resolve, reject });
+    console.log(`[jobQueue] depth=${queue.length}`);
+    drain(handler);
+  });
 }
 ```
 
-**File to create:** `scripts/healthWatchdog.ts`
+### Handler Pattern (all 4 services)
 
 ```typescript
-// scripts/healthWatchdog.ts
-const res = await fetch("http://localhost:8000/health");
-const health = await res.json();
+// sol_quick_scan/handlers.ts — identical structure for all 4, only URL/timeout/field differ
+import type { ExecuteJobResult, ValidationResult } from "../../../runtime/offeringTypes.js";
+import { enqueue } from "../../jobQueue.js";
 
-if (health.status !== "ok") {
-  console.error(
-    `[watchdog] DEGRADED — down sources: ${health.degraded_sources.join(", ")}`
-  );
-  // Extend here: send a webhook, write to a log file, or trigger PM2 restart
-  process.exit(1); // non-zero exit triggers PM2 alert
+export async function executeJob(requirements: any): Promise<ExecuteJobResult> {
+  return enqueue(requirements, async (req) => {
+    const response = await fetch("http://localhost:8000/scan/quick", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const result = await response.json();
+    return { deliverable: JSON.stringify(result) }; // must be wrapped
+  });
 }
 
+export function validateRequirements(requirements: any): ValidationResult {
+  const addr = requirements?.token_address;
+  return typeof addr === "string" && addr.length >= 32 && addr.length <= 44;
+}
+
+export async function requestPayment(requirements: any): Promise<string> {
+  return "Payment accepted"; // must be plain string — never return an object
+}
+```
+
+**Per-service values:**
+
+| Service | URL | Timeout | Validated field |
+|---|---|---|---|
+| `sol_quick_scan` | `/scan/quick` | `10_000` | `token_address` |
+| `sol_wallet_risk` | `/wallet/risk` | `12_000` | `wallet_address` |
+| `sol_market_intel` | `/market/intel` | `10_000` | `token_address` |
+| `sol_deep_dive` | `/scan/deep` | `35_000` | `token_address` |
+
+### `offering.json` format
+
+```json
+{
+  "name": "sol_quick_scan",
+  "description": "Instant Solana token safety check. Returns risk grade (A–F), mint/freeze authority status, top-10 holder concentration, and liquidity in under 5 seconds. Essential pre-trade check for any Solana trading agent. $0.02 per call.",
+  "jobFee": 0.02,
+  "jobFeeType": "fixed",
+  "priceV2": { "type": "fixed", "value": 0.02 },
+  "requiredFunds": false,
+  "requirement": {
+    "type": "object",
+    "properties": {
+      "token_address": { "type": "string", "description": "Solana token mint address (base58, 32–44 characters)" }
+    },
+    "required": ["token_address"]
+  }
+}
+```
+
+---
+
+## Revenue Tracker (`scripts/revenueTracker.ts`)
+
+Middleware that hooks into Hono server. Logs per-service call counts to SQLite.
+Uses `better-sqlite3`. DB at `/root/solprobe/data/revenue.db`.
+
+Exposes `GET /revenue/summary`:
+```json
+{
+  "total_usdc": 1.23,
+  "by_service": {
+    "sol_quick_scan":   { "calls": 100, "revenue_usdc": 2.00 },
+    "sol_wallet_risk":  { "calls": 5,   "revenue_usdc": 0.10 },
+    "sol_market_intel": { "calls": 2,   "revenue_usdc": 0.10 },
+    "sol_deep_dive":    { "calls": 0,   "revenue_usdc": 0.00 }
+  },
+  "since": "2025-01-01T00:00:00Z"
+}
+```
+
+Do not modify scanner logic — hook in via middleware only.
+
+---
+
+## Health Watchdog (`scripts/healthWatchdog.ts`)
+
+```typescript
+const res = await fetch("http://localhost:8000/health");
+const health = await res.json();
+if (health.status !== "ok") {
+  console.error(`[watchdog] DEGRADED — down sources: ${health.degraded_sources.join(", ")}`);
+  process.exit(1);
+}
 console.log(`[watchdog] ok — uptime ${health.uptime_seconds}s`);
 ```
 
 ---
 
-## Build Order for These Changes
+## Process Management
 
-Work in this sequence to avoid breaking existing functionality:
+**`ecosystem.config.cjs`:**
 
-1. `src/utils/retry.ts` — no dependencies, safe to build first
-2. Update all four `acp/offerings/*/handlers.ts` to use `withRetry` + `RETRY_CONFIG`
-3. `src/sources/resolver.ts` — add `recordSourceResult()` calls to each source client
-4. Update `src/scanner/riskScorer.ts` — add `scoreConfidence()`, wire into all 4 scanners
-5. Update `src/cache.ts` — swap global TTL for `CACHE_TTL` map
-6. Update `src/api/server.ts` — SLA deadline enforcement + degraded health status
-7. `scripts/healthWatchdog.ts` + `ecosystem.config.cjs` entry
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: "solprobe",
+      script: "./start.sh",
+      interpreter: "bash",
+      restart_delay: 3000,
+      max_restarts: 20,
+      watch: false,
+      env: { NODE_ENV: "production" },
+      log_file: "logs/combined.log",
+      error_file: "logs/error.log",
+      time: true,
+    },
+    {
+      name: "acp-seller",
+      // managed separately in /root/virtuals-acp
+    },
+    {
+      name: "health-watchdog",
+      script: "scripts/healthWatchdog.ts",
+      interpreter: "npx",
+      interpreter_args: "tsx",
+      cron_restart: "*/5 * * * *",
+      autorestart: false,
+    },
+  ]
+};
+```
 
-**Do not skip straight to step 6** — the health endpoint's `source_success_rates` field
-depends on `resolver.ts` being in place first.
+---
+
+## Tests (Vitest)
+
+1. **`quickScan.test.ts`** — BONK (good), known rug (F grade), verify response shape,
+   verify `isValidSolanaAddress` rejects garbage
+2. **`sources.test.ts`** — mock all APIs, verify 200/429/500 handling, verify parallel
+   fetching runs concurrently, verify Helius always called for authority flags
+3. **`deepDive.test.ts`** — `recommendation` never undefined, `momentum_score` always 0–100,
+   protocol addresses not flagged as suspicious
+4. **`circuitBreaker.test.ts`** — CLOSED→OPEN after 5 failures, OPEN rejects immediately,
+   OPEN→HALF_OPEN after cooldown, HALF_OPEN→CLOSED on success
+
+---
+
+## Environment Variables
+
+```
+# RPC & data sources
+HELIUS_API_KEY=
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+PORT=8000
+LOG_LEVEL=info
+
+# LLM narrative layer — at least one must be set or all calls fall to template
+ANTHROPIC_API_KEY=sk-ant-...   # primary provider
+GROQ_API_KEY=gsk_...           # fallback provider — free, get at console.groq.com
+
+# Buyback script — add only after PM2 non-root user migration
+AGENT_WALLET_PRIVATE_KEY=
+SPROBE_TOKEN_ADDRESS=
+BUYBACK_INTERVAL_MINUTES=60
+BUYBACK_THRESHOLD_USDC=5.0
+DRY_RUN=true
+```
+
+---
+
+## Build Order
+
+Work in this sequence. Do not skip ahead.
+
+1. `src/constants.ts` — no deps
+2. `src/validate.ts` — no deps, used everywhere
+3. `src/utils/retry.ts` — no deps
+4. `src/circuitBreaker.ts` — no deps
+5. `src/sources/resolver.ts` — no deps
+6. `src/cache.ts` — deduplication, TTLs, token buckets
+7. `src/api/rateLimiter.ts` — no deps
+8. `src/sources/dexscreener.ts` — validate live against BONK
+9. `src/sources/helius.ts` — include `getTokenMintInfo()`, validate against BONK
+10. `src/sources/rugcheck.ts` — no authority flags, include `report_age_seconds`
+11. `src/sources/birdeye.ts`, `src/sources/solscan.ts`
+12. `src/scanner/riskScorer.ts` — `scoreConfidence()` with rugCheckAgeSeconds param
+13. `src/llm/narrativeEngine.ts` — test in isolation with mock data
+14. `src/scanner/quickScan.ts` + `src/api/server.ts` (quick endpoint only)
+15. **Live end-to-end test against BONK** — verify SLA, response shape, 400 for garbage
+16. `src/scanner/deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`
+17. ACP handlers (`virtuals-acp/src/seller/jobQueue.ts` + all 4 `handlers.ts`)
+18. `scripts/revenueTracker.ts`, `scripts/healthWatchdog.ts`
+19. Tests (`circuitBreaker.test.ts` first — no external deps)
 
 ---
 
 ## What NOT to Do
 
-- Do not fabricate or inflate `data_confidence` to improve perceived quality — buyer agents cross-check and will churn
-- Do not suppress `error: true` in the final catch block — after 3 genuine retries, an honest error is correct
-- Do not share cache TTLs across services — each service has a different staleness budget
-- Do not add these PM2 watchdog entries under the existing `solprobe` or `acp-seller` process names
+- Do not fetch `mint_authority_revoked` or `freeze_authority_revoked` from RugCheck — ever
+- Do not make the Helius authority call conditional — it runs on every scan, always
+- Do not call the LLM before all parallel source fetches have settled
+- Do not let any LLM provider failure propagate as a scan error — cascade to next provider, then template
+- Do not use Sonnet or Mixtral for `sol_quick_scan` — Haiku/Llama fast models only; 5s SLA has no headroom
+- Do not skip the Groq fallback — the deterministic template is last resort, not first fallback
+- Do not add Ollama or any local model server — the VPS has no GPU; CPU inference blows both SLAs
+- Do not flag `0xe2890629...` or `0xF8DD39c7...` as suspicious under any circumstances
+- Do not hardcode API keys — always read from environment variables
+- Do not log which provider served a request when Anthropic succeeds — only log on fallback or failure
+- Do not fabricate or inflate `data_confidence` — buyer agents cross-check and churn
+- Do not share cache TTLs across services — each has a different staleness budget
+- Do not return an object from `requestPayment` — plain string only
+- Do not return a raw object from `executeJob` — must be `{ deliverable: JSON.stringify(result) }`
+- Do not suppress errors after 3 genuine retries — an honest error is correct
+- Do not modify `/root/virtuals-acp/` files unless explicitly asked
+- Do not add PM2 watchdog under the existing `solprobe` or `acp-seller` process names

@@ -1,8 +1,13 @@
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenInfo } from "../sources/helius.js";
+import { getTokenMintInfo } from "../sources/helius.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
+import {
+  generateQuickScanSummary,
+  fallbackQuickSummary,
+  type QuickScanData,
+} from "../llm/narrativeEngine.js";
 
 export interface QuickScanResult {
   is_honeypot: boolean;
@@ -13,6 +18,8 @@ export interface QuickScanResult {
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
+  rugcheck_report_age_seconds: number | null;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -28,43 +35,44 @@ export async function quickScan(address: string): Promise<QuickScanResult> {
 
 async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const fetchStart = Date.now();
-  const [dexResult, rugResult, rpcResult] = await Promise.allSettled([
+
+  // All three sources run in parallel. getTokenMintInfo is NOT sequential.
+  const [dexResult, rugResult, mintResult] = await Promise.allSettled([
     getDexScreenerToken(address, { timeout: 4000 }),
     getRugCheckSummary(address, { timeout: 3000 }),
-    getTokenInfo(address, { timeout: 3000 }),
+    getTokenMintInfo(address, { timeout: 3000 }),  // sole source for authority flags
   ]);
 
-  const dexData = dexResult.status === "fulfilled" ? dexResult.value : null;
-  const rugData = rugResult.status === "fulfilled" ? rugResult.value : null;
-  const rpcData = rpcResult.status === "fulfilled" ? rpcResult.value : null;
+  const dexData  = dexResult.status  === "fulfilled" ? dexResult.value  : null;
+  const rugData  = rugResult.status  === "fulfilled" ? rugResult.value  : null;
+  const mintData = mintResult.status === "fulfilled" ? mintResult.value : null;
 
-  if (dexResult.status === "rejected") logError("dexscreener", dexResult.reason, address);
-  if (rugResult.status === "rejected") logError("rugcheck", rugResult.reason, address);
-  if (rpcResult.status === "rejected") logError("helius_rpc", rpcResult.reason, address);
+  if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
+  if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
+  if (mintResult.status === "rejected") logError("helius_rpc",  mintResult.reason,  address);
 
-  // Source priority: RugCheck primary, Helius fallback, null if both unavailable
-  const mint_authority_revoked =
-    rugData?.mint_authority_revoked ?? rpcData?.mint_authority_revoked ?? null;
-  const freeze_authority_revoked =
-    rugData?.freeze_authority_revoked ?? rpcData?.freeze_authority_revoked ?? null;
-  const top_10_holder_pct =
-    rugData?.top_10_holder_pct ?? rpcData?.top_10_holder_pct ?? null;
+  // ── Authority flags: Helius only, unconditionally ─────────────────────────
+  // On null (RPC failure), default to false (conservative — treat as not revoked).
+  const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
+  const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
 
-  // liquidity: DexScreener primary (Birdeye fallback added in step 7)
+  // ── Holder concentration: from RugCheck (already filtered for protocol addrs) ─
+  const top_10_holder_pct = rugData?.top_10_holder_pct ?? null;
+
+  // ── Liquidity ─────────────────────────────────────────────────────────────
   const liquidity_usd = dexData?.liquidity_usd ?? null;
 
-  // Honeypot + rug history from RugCheck; false is the conservative default
-  // (never mark safe when data is missing — but honeypot=false is safe-side default;
-  // if rugcheck is down we cannot claim it's a honeypot either)
-  const is_honeypot = rugData?.is_honeypot ?? false;
+  // ── Honeypot + rug history ─────────────────────────────────────────────────
+  const is_honeypot    = rugData?.is_honeypot    ?? false;
   const has_rug_history = rugData?.has_rug_history ?? false;
 
-  // Token age — prefer pair creation timestamp, fall back to RPC
+  // ── RugCheck report age ────────────────────────────────────────────────────
+  const rugcheck_report_age_seconds = rugData?.report_age_seconds ?? null;
+
+  // ── Token age ─────────────────────────────────────────────────────────────
   let token_age_days: number | null = null;
   if (dexData?.pair_created_at_ms != null) {
     token_age_days = (Date.now() - dexData.pair_created_at_ms) / (1000 * 60 * 60 * 24);
-  } else if (rpcData?.token_age_days != null) {
-    token_age_days = rpcData.token_age_days;
   }
 
   const factors: RiskFactors = {
@@ -73,74 +81,52 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     top_10_holder_pct,
     liquidity_usd,
     has_rug_history,
-    bundled_launch: false, // deep dive only
+    bundled_launch: rugData?.bundled_launch_detected ?? false,
     buy_sell_ratio: dexData?.buy_sell_ratio_1h ?? null,
     token_age_days,
   };
 
   const risk_grade = calculateRiskGrade(factors);
 
-  // data_confidence: based on source corroboration and data freshness
+  // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
-    dexData !== null ? "dexscreener" : null,
-    rugData !== null ? "rugcheck" : null,
-    rpcData !== null ? "helius" : null,
+    dexData  !== null ? "dexscreener" : null,
+    rugData  !== null ? "rugcheck"    : null,
+    mintData !== null ? "helius"      : null,
   ].filter((s): s is string => s !== null);
   const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
-  const summary = buildSummary({
+  // ── LLM summary — sequential, after all parallel fetches complete ──────────
+  const llmInputData: QuickScanData = {
     is_honeypot,
-    has_rug_history,
     mint_authority_revoked,
     freeze_authority_revoked,
-    liquidity_usd,
     top_10_holder_pct,
+    liquidity_usd,
     risk_grade,
     data_confidence,
-  });
+    has_rug_history,
+  };
+
+  let summary: string;
+  const elapsed = Date.now() - fetchStart;
+  if (elapsed >= 4_200) {
+    // SLA headroom exhausted — skip LLM to guarantee response time
+    console.warn(`[quickScan] skipping LLM summary — elapsed ${elapsed}ms exceeds 4200ms`);
+    summary = fallbackQuickSummary(llmInputData);
+  } else {
+    summary = await generateQuickScanSummary(llmInputData);
+  }
 
   return {
     is_honeypot,
-    mint_authority_revoked: mint_authority_revoked ?? false,
-    freeze_authority_revoked: freeze_authority_revoked ?? false,
+    mint_authority_revoked,
+    freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
     risk_grade,
     summary,
     data_confidence,
+    rugcheck_report_age_seconds,
   };
-}
-
-function buildSummary(fields: {
-  is_honeypot: boolean;
-  has_rug_history: boolean;
-  mint_authority_revoked: boolean | null;
-  freeze_authority_revoked: boolean | null;
-  liquidity_usd: number | null;
-  top_10_holder_pct: number | null;
-  risk_grade: string;
-  data_confidence: string;
-}): string {
-  const flags: string[] = [];
-
-  if (fields.is_honeypot) flags.push("honeypot detected");
-  if (fields.has_rug_history) flags.push("rug history flagged");
-  if (fields.mint_authority_revoked === false) flags.push("mint authority active");
-  if (fields.freeze_authority_revoked === false) flags.push("freeze authority active");
-  if (fields.top_10_holder_pct !== null && fields.top_10_holder_pct > 80)
-    flags.push(`top-10 holders own ${fields.top_10_holder_pct.toFixed(1)}%`);
-
-  const liqStr =
-    fields.liquidity_usd !== null
-      ? `$${fields.liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })} liquidity`
-      : "liquidity unknown";
-
-  const grade = `risk grade ${fields.risk_grade}`;
-  const conf =
-    fields.data_confidence !== "HIGH"
-      ? ` (${fields.data_confidence.toLowerCase()} confidence)`
-      : "";
-
-  const flagStr = flags.length > 0 ? `${flags.join(", ")}; ` : "";
-  return `${flagStr}${liqStr}; ${grade}${conf}.`;
 }

@@ -1,10 +1,16 @@
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenInfo } from "../sources/helius.js";
+import { getTokenMintInfo } from "../sources/helius.js";
 import { getBirdeyeToken } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
+import { isProtocolAddress } from "../constants.js";
+import {
+  generateDeepDiveReport,
+  fallbackDeepReport,
+  type DeepDiveData,
+} from "../llm/narrativeEngine.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -12,9 +18,12 @@ import { deduplicate, getOrFetch } from "../cache.js";
 
 export interface DevWalletAnalysis {
   address: string;
-  sol_balance: number;
-  created_tokens_count: number;
+  /** null when the address is a Virtuals Protocol address */
+  sol_balance: number | null;
+  /** null when the address is a Virtuals Protocol address */
+  created_tokens_count: number | null;
   previous_rugs: boolean;
+  is_protocol_address?: boolean;
 }
 
 export interface LiquidityLockStatus {
@@ -48,6 +57,8 @@ export interface DeepDiveResult {
   full_risk_report: string;
   recommendation: "BUY" | "AVOID" | "WATCH" | "DYOR";
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
+  rugcheck_report_age_seconds: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,69 +189,6 @@ function deriveRecommendation(
   return "DYOR";
 }
 
-/** Build 3–5 sentence risk report. */
-function buildFullReport(fields: {
-  risk_grade: string;
-  is_honeypot: boolean;
-  has_rug_history: boolean;
-  mint_authority_revoked: boolean;
-  freeze_authority_revoked: boolean;
-  top_10_holder_pct: number | null;
-  liquidity_usd: number | null;
-  volume_24h: number;
-  momentum_score: number;
-  pump_fun_launched: boolean;
-  bundled_launch_detected: boolean;
-  data_confidence: string;
-}): string {
-  const sentences: string[] = [];
-
-  const gradeDesc: Record<string, string> = {
-    A: "low-risk profile",
-    B: "moderate-risk profile",
-    C: "elevated-risk profile",
-    D: "high-risk profile",
-    F: "critical-risk profile",
-  };
-  sentences.push(
-    `This token shows a ${gradeDesc[fields.risk_grade] ?? "unknown-risk profile"} (grade ${fields.risk_grade}).`
-  );
-
-  const authFlags: string[] = [];
-  if (!fields.mint_authority_revoked) authFlags.push("mint authority is still active");
-  if (!fields.freeze_authority_revoked) authFlags.push("freeze authority is still active");
-  if (authFlags.length > 0) {
-    sentences.push(`Authority risk: ${authFlags.join(" and ")}, meaning the developer can mint new tokens or freeze accounts.`);
-  } else {
-    sentences.push("Both mint and freeze authorities are revoked — the supply is fixed and accounts cannot be frozen.");
-  }
-
-  const liqStr = fields.liquidity_usd != null
-    ? `$${fields.liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
-    : "unknown";
-  const vol24Str = fields.volume_24h > 0
-    ? `$${fields.volume_24h.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
-    : "minimal";
-  sentences.push(`Liquidity: ${liqStr}; 24 h volume: ${vol24Str}; momentum score ${fields.momentum_score}/100.`);
-
-  const risks: string[] = [];
-  if (fields.is_honeypot) risks.push("honeypot pattern detected");
-  if (fields.has_rug_history) risks.push("prior rug history");
-  if (fields.pump_fun_launched) risks.push("pump.fun launch");
-  if (fields.bundled_launch_detected) risks.push("bundled launch pattern");
-  if (fields.top_10_holder_pct != null && fields.top_10_holder_pct > 80)
-    risks.push(`top-10 holders control ${fields.top_10_holder_pct.toFixed(1)}% of supply`);
-  if (risks.length > 0) {
-    sentences.push(`Additional risk signals: ${risks.join(", ")}.`);
-  }
-
-  if (fields.data_confidence !== "HIGH") {
-    sentences.push(`Data confidence is ${fields.data_confidence.toLowerCase()} — one or more sources were unavailable; treat analysis conservatively.`);
-  }
-
-  return sentences.join(" ");
-}
-
 function logError(source: string, reason: unknown, address: string): void {
   const ts = new Date().toISOString();
   const msg = reason instanceof Error ? reason.message : String(reason);
@@ -258,12 +206,13 @@ export async function deepDive(address: string): Promise<DeepDiveResult> {
 
 async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const fetchStart = Date.now();
-  // Parallel fetch all sources + dev wallet RPC calls
-  const [dexResult, rugResult, rpcResult, birdResult, scanResult, mintAuthResult] =
+
+  // All sources run in parallel. getTokenMintInfo is NOT sequential.
+  const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
-      getTokenInfo(address, { timeout: 3000 }),
+      getTokenMintInfo(address, { timeout: 3000 }),  // sole source for authority flags
       getBirdeyeToken(address, { timeout: 4000 }),
       getSolscanMeta(address, { timeout: 4000 }),
       getMintAuthorityAddress(address, 4000),
@@ -271,75 +220,85 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   const dexData  = dexResult.status  === "fulfilled" ? dexResult.value  : null;
   const rugData  = rugResult.status  === "fulfilled" ? rugResult.value  : null;
-  const rpcData  = rpcResult.status  === "fulfilled" ? rpcResult.value  : null;
+  const mintData = mintResult.status === "fulfilled" ? mintResult.value : null;
   const birdData = birdResult.status === "fulfilled" ? birdResult.value : null;
-  // solscan result used only for side-effects (metadata could extend summary in future)
   const mintAuthAddress = mintAuthResult.status === "fulfilled" ? mintAuthResult.value : null;
 
   if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
   if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
-  if (rpcResult.status  === "rejected") logError("helius_rpc",  rpcResult.reason,   address);
+  if (mintResult.status === "rejected") logError("helius_rpc",  mintResult.reason,  address);
   if (birdResult.status === "rejected") logError("birdeye",     birdResult.reason,  address);
   if (scanResult.status === "rejected") logError("solscan",     scanResult.reason,  address);
 
-  // Fetch dev wallet SOL balance if we have an authority address
-  const devSolBalance = mintAuthAddress
-    ? await getSolBalance(mintAuthAddress, 3000)
-    : null;
+  // ── Authority flags: Helius only, unconditionally ─────────────────────────
+  const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
+  const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
 
-  // ---------- Authority / holder fields (priority: RugCheck → Helius) ----------
-  const mint_authority_revoked   = rugData?.mint_authority_revoked   ?? rpcData?.mint_authority_revoked   ?? null;
-  const freeze_authority_revoked = rugData?.freeze_authority_revoked ?? rpcData?.freeze_authority_revoked ?? null;
-  const top_10_holder_pct        = rugData?.top_10_holder_pct        ?? rpcData?.top_10_holder_pct        ?? null;
-  const is_honeypot              = rugData?.is_honeypot  ?? false;
-  const has_rug_history          = rugData?.has_rug_history ?? false;
+  // ── Holder concentration (RugCheck, protocol addrs already filtered) ───────
+  const top_10_holder_pct = rugData?.top_10_holder_pct ?? null;
+  const is_honeypot       = rugData?.is_honeypot       ?? false;
+  const has_rug_history   = rugData?.has_rug_history   ?? false;
 
-  // ---------- Price / volume (priority: DexScreener → Birdeye) ----------
-  const liquidity_usd       = dexData?.liquidity_usd       ?? birdData?.liquidity_usd       ?? null;
-  const volume_1h_usd       = dexData?.volume_1h_usd       ?? birdData?.volume_1h_usd       ?? null;
-  const volume_24h          = dexData?.volume_24h_usd      ?? birdData?.volume_24h_usd      ?? 0;
+  // ── RugCheck report age ────────────────────────────────────────────────────
+  const rugcheck_report_age_seconds = rugData?.report_age_seconds ?? null;
+
+  // ── Price / volume (priority: DexScreener → Birdeye) ─────────────────────
+  const liquidity_usd        = dexData?.liquidity_usd        ?? birdData?.liquidity_usd        ?? null;
+  const volume_1h_usd        = dexData?.volume_1h_usd        ?? birdData?.volume_1h_usd        ?? null;
+  const volume_24h           = dexData?.volume_24h_usd       ?? birdData?.volume_24h_usd       ?? 0;
   const price_change_24h_pct = dexData?.price_change_24h_pct ?? birdData?.price_change_24h_pct ?? 0;
   const price_change_1h_pct  = dexData?.price_change_1h_pct  ?? birdData?.price_change_1h_pct  ?? null;
   const buy_sell_ratio_1h    = dexData?.buy_sell_ratio_1h ?? null;
 
-  // ---------- Token age ----------
+  // ── Token age ─────────────────────────────────────────────────────────────
   let token_age_days: number | null = null;
   if (dexData?.pair_created_at_ms != null) {
     token_age_days = (Date.now() - dexData.pair_created_at_ms) / 86_400_000;
   }
 
-  // ---------- Risk grade ----------
+  // ── Risk grade ────────────────────────────────────────────────────────────
+  const bundled_launch_detected = rugData?.bundled_launch_detected
+    ?? ((token_age_days != null && token_age_days < 1) && (top_10_holder_pct != null && top_10_holder_pct > 90));
+
   const factors: RiskFactors = {
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
     has_rug_history,
-    bundled_launch: false, // computed below, not fed back into scorer
+    bundled_launch: bundled_launch_detected,
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
   };
   const risk_grade = calculateRiskGrade(factors);
 
-  // ---------- Deep-only signals ----------
-
-  // pump.fun: any pair launched via the pumpfun DEX
+  // ── Deep-only signals ─────────────────────────────────────────────────────
   const pump_fun_launched = dexData?.pairs.some((p) =>
     p.dexId?.toLowerCase().includes("pump")
   ) ?? false;
 
-  // Bundled launch: very young token + extreme holder concentration (> 95%)
-  const bundled_launch_detected =
-    (token_age_days != null && token_age_days < 1) &&
-    (top_10_holder_pct != null && top_10_holder_pct > 90);
-
-  // Dev wallet
-  const dev_wallet_analysis: DevWalletAnalysis = {
-    address: mintAuthAddress ?? "unknown",
-    sol_balance: devSolBalance ?? 0,
-    created_tokens_count: 0,          // requires tx history — unavailable on public RPC
-    previous_rugs: has_rug_history,   // conservative: flag if current token has rug history
-  };
+  // ── Dev wallet analysis ───────────────────────────────────────────────────
+  let dev_wallet_analysis: DevWalletAnalysis;
+  if (mintAuthAddress && isProtocolAddress(mintAuthAddress)) {
+    // Protocol address — skip expensive RPC calls, return sentinel shape
+    dev_wallet_analysis = {
+      address: mintAuthAddress,
+      is_protocol_address: true,
+      sol_balance: null,
+      created_tokens_count: null,
+      previous_rugs: false,
+    };
+  } else {
+    const devSolBalance = mintAuthAddress
+      ? await getSolBalance(mintAuthAddress, 3000)
+      : null;
+    dev_wallet_analysis = {
+      address: mintAuthAddress ?? "unknown",
+      sol_balance: devSolBalance ?? 0,
+      created_tokens_count: 0, // requires tx history — unavailable on public RPC
+      previous_rugs: has_rug_history,
+    };
+  }
 
   // LP lock — cannot be verified via on-chain lock program without specialised API
   const liquidity_lock_status: LiquidityLockStatus = {
@@ -348,52 +307,39 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     locked_pct: 0,
   };
 
-  // Trading pattern
-  const unique_buyers_24h =
-    dexData?.pair?.txns?.h24?.buys ?? 0;
+  // ── Trading pattern ───────────────────────────────────────────────────────
+  const unique_buyers_24h = dexData?.pair?.txns?.h24?.buys ?? 0;
   const wash_trading_score = deriveWashTradingScore(buy_sell_ratio_1h, volume_24h || null, liquidity_usd);
-
   const trading_pattern: TradingPattern = {
     buy_sell_ratio_1h: buy_sell_ratio_1h ?? 0.5,
     unique_buyers_24h,
     wash_trading_score,
   };
 
-  // Momentum score (0–100, on-chain signals only)
+  // ── Momentum score ────────────────────────────────────────────────────────
   const momentum_score = deriveMomentumScore(volume_1h_usd, volume_24h || null, price_change_1h_pct, buy_sell_ratio_1h);
 
-  // Data confidence — based on source corroboration and data freshness
+  // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
-    dexData !== null ? "dexscreener" : null,
-    rugData !== null ? "rugcheck" : null,
-    rpcData !== null ? "helius" : null,
-    birdData !== null ? "birdeye" : null,
+    dexData  !== null ? "dexscreener" : null,
+    rugData  !== null ? "rugcheck"    : null,
+    mintData !== null ? "helius"      : null,
+    birdData !== null ? "birdeye"     : null,
   ].filter((s): s is string => s !== null);
-  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
+  const data_confidence = scoreConfidence(
+    sources,
+    Date.now() - fetchStart,
+    rugcheck_report_age_seconds !== null ? rugcheck_report_age_seconds : undefined
+  );
 
   const recommendation = deriveRecommendation(risk_grade, is_honeypot, has_rug_history, momentum_score, data_confidence);
 
-  const full_risk_report = buildFullReport({
-    risk_grade,
-    is_honeypot,
-    has_rug_history,
-    mint_authority_revoked: mint_authority_revoked ?? false,
-    freeze_authority_revoked: freeze_authority_revoked ?? false,
-    top_10_holder_pct,
-    liquidity_usd,
-    volume_24h,
-    momentum_score,
-    pump_fun_launched,
-    bundled_launch_detected,
-    data_confidence,
-  });
-
-  // Quick-scan-style one-liner summary
+  // ── Quick-scan-style one-liner summary ─────────────────────────────────────
   const flags: string[] = [];
   if (is_honeypot) flags.push("honeypot");
   if (has_rug_history) flags.push("rug history");
-  if (mint_authority_revoked === false) flags.push("mint authority active");
-  if (freeze_authority_revoked === false) flags.push("freeze authority active");
+  if (!mint_authority_revoked) flags.push("mint authority active");
+  if (!freeze_authority_revoked) flags.push("freeze authority active");
   const liqStr = liquidity_usd != null
     ? `$${liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })} liquidity`
     : "liquidity unknown";
@@ -401,10 +347,40 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const flagStr = flags.length > 0 ? `${flags.join(", ")}; ` : "";
   const summary = `${flagStr}${liqStr}; grade ${risk_grade}; momentum ${momentum_score}/100${conf}.`;
 
+  // ── LLM full risk report — sequential, after all parallel fetches complete ─
+  const llmInput: DeepDiveData = {
+    risk_grade,
+    is_honeypot,
+    has_rug_history,
+    mint_authority_revoked,
+    freeze_authority_revoked,
+    top_10_holder_pct,
+    liquidity_usd,
+    volume_24h,
+    momentum_score,
+    pump_fun_launched,
+    bundled_launch_detected,
+    data_confidence,
+    recommendation,
+    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    insider_flags: rugData?.insider_flags ?? false,
+  };
+
+  const llmStart = Date.now();
+  let full_risk_report: string;
+  try {
+    full_risk_report = await generateDeepDiveReport(llmInput);
+  } catch {
+    full_risk_report = fallbackDeepReport(llmInput);
+  }
+  const llmElapsed = Date.now() - llmStart;
+  const totalElapsed = Date.now() - fetchStart;
+  console.info(`[deepDive] ${address} total=${totalElapsed}ms llm=${llmElapsed}ms`);
+
   return {
     is_honeypot,
-    mint_authority_revoked: mint_authority_revoked ?? false,
-    freeze_authority_revoked: freeze_authority_revoked ?? false,
+    mint_authority_revoked,
+    freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
     risk_grade,
@@ -420,5 +396,6 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     full_risk_report,
     recommendation,
     data_confidence,
+    rugcheck_report_age_seconds,
   };
 }

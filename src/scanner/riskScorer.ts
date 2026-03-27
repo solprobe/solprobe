@@ -61,12 +61,23 @@ export function calculateRiskGrade(factors: RiskFactors): RiskGrade {
 
 export function scoreConfidence(
   sources: string[],
-  dataAgeMs: number
+  dataAgeMs: number,
+  rugCheckAgeSeconds?: number
 ): "HIGH" | "MEDIUM" | "LOW" {
   const corroborated = sources.length >= 2;
   const fresh = dataAgeMs < 60_000;
 
-  if (corroborated && fresh) return "HIGH";
-  if (corroborated || fresh) return "MEDIUM";
-  return "LOW";
+  let result: "HIGH" | "MEDIUM" | "LOW";
+  if (corroborated && fresh) result = "HIGH";
+  else if (corroborated || fresh) result = "MEDIUM";
+  else result = "LOW";
+
+  // RugCheck's bundled_launch / insider_flags data is used in deep dive only.
+  // A staleness threshold of 24 h is acceptable for those historical pattern fields.
+  // Authority flags (mint, freeze) come from Helius live — not affected by this cap.
+  if (rugCheckAgeSeconds !== undefined && rugCheckAgeSeconds > 86_400) {
+    if (result === "HIGH") result = "MEDIUM";
+  }
+
+  return result;
 }

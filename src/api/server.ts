@@ -244,6 +244,12 @@ app.get("/health", (c) => {
 
 const port = parseInt(process.env.PORT ?? "8000");
 
+// Warn at startup if both LLM providers are unconfigured — scans will fall back
+// to deterministic templates rather than analyst prose.
+if (!process.env.ANTHROPIC_API_KEY && !process.env.GROQ_API_KEY) {
+  console.warn("[startup] WARNING: neither ANTHROPIC_API_KEY nor GROQ_API_KEY is set — LLM summaries will use template fallbacks");
+}
+
 serve({ fetch: app.fetch, hostname: "0.0.0.0", port }, () => {
   console.log(`SolProbe listening on http://0.0.0.0:${port}`);
 });
