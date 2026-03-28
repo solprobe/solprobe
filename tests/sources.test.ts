@@ -112,10 +112,13 @@ describe("getRugCheckSummary", () => {
     const result = await getRugCheckSummary(USDC, { timeout: 1000 });
 
     expect(result).not.toBeNull();
-    expect(result!.mint_authority_revoked).toBe(true);   // null mintAuthority = revoked
-    expect(result!.freeze_authority_revoked).toBe(true);
-    expect(result!.top_10_holder_pct).toBeCloseTo(50);   // 10 × 5%
+    // RugCheck owns: has_rug_history, bundled_launch_detected, rugcheck_risk_score, insider_flags, report_age_seconds
+    // mint_authority_revoked and freeze_authority_revoked are Helius-only fields
     expect(result!.has_rug_history).toBe(false);
+    expect(result!.bundled_launch_detected).toBe(false);
+    expect(result!.insider_flags).toBe(false);
+    expect(result!.report_age_seconds).toBe(-1); // no timestamp in mock → -1
+    expect(result!.top_10_holder_pct).toBeCloseTo(50);   // 10 × 5% — RugCheck still owns holder concentration
   });
 
   it("throws on HTTP 500", async () => {

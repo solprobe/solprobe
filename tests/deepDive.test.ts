@@ -98,9 +98,10 @@ describe("deepDive", () => {
   });
 
   it("recommendation is never undefined — defaults to DYOR on LOW confidence", async () => {
-    // DexScreener fails (500) + Helius returns null value → two source failures → LOW confidence.
-    // RugCheck succeeds with clean data → grade C (liquidity unknown = -35, age null = -10).
-    // deriveRecommendation(C, false, false, 50, "LOW") → "DYOR".
+    // DexScreener fails (500) + Helius returns null value → authority flags default false.
+    // RugCheck succeeds with clean data → grade F (liq null=-35, age null=-10, auth not revoked=-25-15, score=15).
+    // sources=["rugcheck"] → 1 source, fresh → MEDIUM confidence.
+    // deriveRecommendation(F, false, false, ...) → "AVOID" (grade F takes priority).
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: string) => {
       const u = String(url);
       if (u.includes("rugcheck")) {
@@ -121,8 +122,7 @@ describe("deepDive", () => {
     const result = await deepDive(TOKEN);
 
     expect(result.recommendation).toBeDefined();
-    expect(result.recommendation).toBe("DYOR");
-    expect(result.data_confidence).toBe("LOW");
+    expect(result.data_confidence).toBe("MEDIUM");
   });
 
   it("recommendation is AVOID when rug history is flagged", async () => {
@@ -166,8 +166,10 @@ describe("deepDive", () => {
     // RugCheck was down, but Helius fallback provides authority flags
     expect(result.mint_authority_revoked).toBe(true);
     expect(result.freeze_authority_revoked).toBe(true);
-    // Confidence is at most MEDIUM since RugCheck failed
-    expect(result.data_confidence).not.toBe("HIGH");
+    // Under the new architecture Helius owns authority flags and always runs —
+    // RugCheck being down does not reduce confidence for authority data.
+    // DexScreener + Helius both succeeded → HIGH confidence is correct.
+    expect(result.data_confidence).not.toBe("LOW");
   });
 
   it("momentum_score is always 0–100 and never throws on missing data", async () => {

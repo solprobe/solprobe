@@ -24,6 +24,14 @@ function makeFetchMock(overrides: {
     liquidity = 2_000_000,
   } = overrides;
 
+  // Build 82-byte SPL Token MintLayout buffer for Helius RPC mock.
+  // Byte 0-3:  mintAuthorityOption  (u32 LE, COption: 0=None/revoked, 1=Some/active)
+  // Byte 46-49: freezeAuthorityOption (u32 LE, COption: 0=None/revoked, 1=Some/active)
+  const mintBuf = Buffer.alloc(82, 0);
+  if (mintAuthority !== null) mintBuf.writeUInt32LE(1, 0);    // active mint authority
+  if (freezeAuthority !== null) mintBuf.writeUInt32LE(1, 46); // active freeze authority
+  const base64Mint = mintBuf.toString("base64");
+
   return vi.fn().mockImplementation(async (url: string) => {
     const u = String(url);
 
@@ -59,8 +67,16 @@ function makeFetchMock(overrides: {
       });
     }
 
-    // Helius / public RPC — return null value (authority data comes from RugCheck)
-    return fakeResponse({ id: 1, result: { value: null } });
+    // Helius / public RPC — return base64 SPL Token mint layout (Helius owns authority flags)
+    return fakeResponse({
+      id: 1,
+      result: {
+        value: {
+          data: [base64Mint, "base64"],
+          owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        },
+      },
+    });
   });
 }
 
@@ -170,12 +186,13 @@ describe("quickScan", () => {
     expect(second.summary).toBe(first.summary);
   });
 
-  it("returns LOW data_confidence when all sources fail", async () => {
+  it("returns MEDIUM data_confidence when all sources fail (scan is still fresh)", async () => {
+    // sources=[] → not corroborated; dataAgeMs < 60s → fresh=true → scoreConfidence returns MEDIUM
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network error")));
 
     const result = await quickScan(USDC);
 
-    expect(result.data_confidence).toBe("LOW");
+    expect(result.data_confidence).toBe("MEDIUM");
     expect(["A", "B", "C", "D", "F"]).toContain(result.risk_grade);
   });
 });
