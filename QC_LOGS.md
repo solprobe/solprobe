@@ -8,18 +8,22 @@
 
 ### Results
 
-| Token | Service | Grade | Confidence | Summary quality | Status |
-|---|---|---|---|---|---|
-| BONK | sol_quick_scan | A | HIGH | LLM prose |  Pass |
+--- quick scan (BONK) ---
+{
+  "grade": "A",
+  "confidence": "HIGH",
+  "summary_len": 153,
+  "summary": "Excellent security profile with revoked authorities and no rug risk, but concentrated ownership (40.3% in top 10) poses moderate exit liquidity concerns."
+}
 
-### Rejection handling
-- Invalid address → 400 
+--- invalid address (must be 400) ---
+✅ 400 returned correctly
 
-### Health
-- Status: ok 
-- Degraded sources: none 
+--- health check ---
+{
+  "status": "ok",
+  "degraded": [],
+  "uptime": 39
+}
 
-### Notes
-- LLM keys confirmed working — summaries returning analyst prose (153 chars)
-- Deterministic template fallback confirmed working when keys unset
-- Birdeye circuit breaker was OPEN on startup (non-critical, fallback source only)
+--- done ---
