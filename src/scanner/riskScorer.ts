@@ -1,3 +1,5 @@
+import { isAuthorityExempt } from "../sources/jupiterTokenList.js";
+
 export interface RiskFactors {
   mint_authority_revoked: boolean | null;   // null → treat as false (25pt penalty)
   freeze_authority_revoked: boolean | null; // null → treat as false (15pt penalty)
@@ -11,14 +13,18 @@ export interface RiskFactors {
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
 
-export function calculateRiskGrade(factors: RiskFactors): RiskGrade {
+export function calculateRiskGrade(factors: RiskFactors, tokenAddress?: string): RiskGrade {
   if (factors.has_rug_history) return "F";
+
+  const exempt = tokenAddress ? isAuthorityExempt(tokenAddress) : false;
 
   let score = 100;
 
-  // Authority penalties
-  if (factors.mint_authority_revoked !== true) score -= 25;
-  if (factors.freeze_authority_revoked !== true) score -= 15;
+  // Authority penalties — skipped for exempt tokens (stablecoins, wrapped assets)
+  if (!exempt) {
+    if (factors.mint_authority_revoked !== true) score -= 25;
+    if (factors.freeze_authority_revoked !== true) score -= 15;
+  }
 
   // Holder concentration
   const holderPct = factors.top_10_holder_pct ?? 100;

@@ -10,6 +10,7 @@ import { getCacheStats } from "../cache.js";
 import { revenueMiddleware, getRevenueSummary } from "../revenueTracker.js";
 import { checkRateLimit } from "./rateLimiter.js";
 import { getSourceStats } from "../sources/resolver.js";
+import { loadJupiterTokenList, ensureFresh } from "../sources/jupiterTokenList.js";
 import "dotenv/config";
 
 // ---------------------------------------------------------------------------
@@ -225,7 +226,8 @@ app.get("/revenue/summary", (c) => {
   return c.json(getRevenueSummary());
 });
 
-app.get("/health", (c) => {
+app.get("/health", async (c) => {
+  await ensureFresh();
   const breakers = getBreakerStates();
   const sourceStats = getSourceStats();
   const criticalDown = (["dexscreener", "helius_rpc"] as const).filter(
@@ -244,6 +246,11 @@ app.get("/health", (c) => {
 });
 
 const port = parseInt(process.env.PORT ?? "8000");
+
+// Load Jupiter token list at startup (fire-and-forget — does not block server start)
+loadJupiterTokenList().catch(err =>
+  console.warn("[startup] Jupiter token list unavailable:", err)
+);
 
 // Warn at startup if both LLM providers are unconfigured — scans will fall back
 // to deterministic templates rather than analyst prose.

@@ -57,6 +57,8 @@ export interface QuickScanData {
   risk_grade: string;
   data_confidence: string;
   has_rug_history?: boolean;
+  authority_exempt?: boolean;
+  authority_exempt_reason?: string | null;
 }
 
 export interface DeepDiveData {
@@ -75,6 +77,8 @@ export interface DeepDiveData {
   recommendation: string;
   rugcheck_risk_score?: number | null;
   insider_flags?: boolean;
+  authority_exempt?: boolean;
+  authority_exempt_reason?: string | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import { getSolscanMeta } from "../sources/solscan.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress } from "../constants.js";
+import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
 import {
   generateDeepDiveReport,
   fallbackDeepReport,
@@ -59,6 +60,10 @@ export interface DeepDiveResult {
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
   rugcheck_report_age_seconds: number | null;
+  /** True when this token is on the Jupiter strict list with a legitimately retained authority. */
+  authority_exempt: boolean;
+  /** Human-readable reason for the exemption, or null when not exempt. */
+  authority_exempt_reason: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +275,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
   };
-  const risk_grade = calculateRiskGrade(factors);
+  const authority_exempt = isAuthorityExempt(address);
+  const authority_exempt_reason = getExemptReason(address);
+  const risk_grade = calculateRiskGrade(factors, address);
 
   // ── Deep-only signals ─────────────────────────────────────────────────────
   const pump_fun_launched = dexData?.pairs.some((p) =>
@@ -364,6 +371,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     recommendation,
     rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
     insider_flags: rugData?.insider_flags ?? false,
+    authority_exempt,
+    authority_exempt_reason,
   };
 
   const llmStart = Date.now();
@@ -397,5 +406,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     recommendation,
     data_confidence,
     rugcheck_report_age_seconds,
+    authority_exempt,
+    authority_exempt_reason,
   };
 }

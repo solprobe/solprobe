@@ -67,7 +67,8 @@ solprobe/
 │   │   ├── helius.ts           # includes getTokenMintInfo()
 │   │   ├── birdeye.ts
 │   │   ├── solscan.ts
-│   │   └── resolver.ts         # weighted source resolver
+│   │   ├── resolver.ts         # weighted source resolver
+│   │   └── jupiterTokenList.ts # authority exemption via Jupiter strict list
 │   ├── api/
 │   │   ├── server.ts
 │   │   └── rateLimiter.ts      # inbound per-IP rate limiter
@@ -109,6 +110,8 @@ solprobe/
   liquidity_usd: number | null;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;                       // LLM (Haiku) or deterministic fallback
+  authority_exempt: boolean;             // true if Jupiter strict list exempts this token
+  authority_exempt_reason: string | null; // why authority penalties were skipped
   rugcheck_report_age_seconds: number | null;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
@@ -118,6 +121,8 @@ solprobe/
 ```typescript
 {
   // all quick_scan fields, plus:
+  authority_exempt: boolean;             // inherited from quick_scan fields
+  authority_exempt_reason: string | null;
   dev_wallet_analysis: {
     address: string;
     is_protocol_address?: boolean;       // true if Virtuals protocol address
@@ -302,6 +307,154 @@ not revoked). Never default to `true`.
 
 The `RugCheckResult` interface must NOT contain `mint_authority_revoked` or
 `freeze_authority_revoked`. These fields must never come from RugCheck.
+
+---
+
+## Jupiter Token List (`src/sources/jupiterTokenList.ts`)
+
+The Jupiter strict token list is the authoritative source for identifying tokens
+with legitimately retained authorities — stablecoins, wrapped assets, and bridge
+tokens. This replaces any static token whitelist. The list is fetched once at
+startup and refreshed every 24 hours in the background.
+
+**Why Jupiter:** Actively maintained by the most authoritative source in Solana
+DeFi, covers thousands of verified tokens, has semantic tags built in, and
+requires no guesswork. USDC, USDT, wETH, wBTC, mSOL, JitoSOL and any future
+verified tokens are handled automatically.
+
+```typescript
+// src/sources/jupiterTokenList.ts
+
+interface JupiterToken {
+  address: string;
+  symbol: string;
+  name: string;
+  tags: string[];
+}
+
+// Tags that indicate legitimately retained authority — not a rug risk
+const EXEMPT_TAGS = new Set(["stablecoin", "wormhole", "wrapped"]);
+const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+let tokenMap = new Map<string, JupiterToken>();
+let lastFetched = 0;
+
+export async function loadJupiterTokenList(): Promise<void> {
+  try {
+    const res = await fetch("https://token.jup.ag/strict", {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`Jupiter list HTTP ${res.status}`);
+    const tokens: JupiterToken[] = await res.json();
+    const map = new Map<string, JupiterToken>();
+    for (const t of tokens) map.set(t.address, t);
+    tokenMap = map;
+    lastFetched = Date.now();
+    console.info(`[jupiter] loaded ${map.size} tokens from strict list`);
+  } catch (err) {
+    console.warn("[jupiter] failed to load token list — using cached version", err);
+  }
+}
+
+export async function ensureFresh(): Promise<void> {
+  if (Date.now() - lastFetched > REFRESH_INTERVAL_MS) {
+    await loadJupiterTokenList();
+  }
+}
+
+export function isAuthorityExempt(address: string): boolean {
+  const token = tokenMap.get(address);
+  if (!token) return false;
+  return token.tags.some(tag => EXEMPT_TAGS.has(tag));
+}
+
+export function getExemptReason(address: string): string | null {
+  const token = tokenMap.get(address);
+  if (!token) return null;
+  const matchedTag = token.tags.find(tag => EXEMPT_TAGS.has(tag));
+  if (!matchedTag) return null;
+  const reasons: Record<string, string> = {
+    stablecoin: `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
+    wormhole:   `${token.symbol} is a Wormhole-wrapped asset — authority retained by bridge program`,
+    wrapped:    `${token.symbol} is a wrapped asset — authority retained by wrapping protocol`,
+  };
+  return reasons[matchedTag] ?? `${token.symbol} is a verified token with legitimate retained authority`;
+}
+```
+
+**On fetch failure:** keep serving the previously cached map. If the map is empty
+(first startup and fetch failed), log a warning and proceed — scoring applies full
+penalties which is the conservative safe default.
+
+**Integration in `src/api/server.ts`:**
+
+Load at startup (fire-and-forget — does not block server start):
+```typescript
+import { loadJupiterTokenList, ensureFresh } from "../sources/jupiterTokenList.js";
+
+loadJupiterTokenList().catch(err =>
+  console.warn("[startup] Jupiter token list unavailable:", err)
+);
+```
+
+Call `ensureFresh()` inside the `/health` endpoint so the list refreshes
+automatically every 24h without a server restart:
+```typescript
+app.get("/health", async (c) => {
+  await ensureFresh();
+  // ... rest of handler unchanged
+});
+```
+
+**Integration in `src/scanner/riskScorer.ts`:**
+
+Check `isAuthorityExempt()` before applying authority penalties. Only these
+two penalties are bypassed for exempt tokens:
+- `mint_authority_revoked === false`: skip the -25 penalty
+- `freeze_authority_revoked === false`: skip the -15 penalty
+
+All other penalties still apply (concentration, liquidity, bundled launch, etc).
+
+```typescript
+import { isAuthorityExempt } from "../sources/jupiterTokenList.js";
+
+export function calculateRiskScore(factors: RiskFactors, tokenAddress?: string) {
+  const exempt = tokenAddress ? isAuthorityExempt(tokenAddress) : false;
+  let score = 100;
+
+  // Authority penalties — skipped for exempt tokens
+  if (!exempt) {
+    if (!factors.mint_authority_revoked)  score -= 25;
+    if (!factors.freeze_authority_revoked) score -= 15;
+  }
+
+  // All other penalties apply regardless of exempt status
+  // ... concentration, liquidity, bundled launch, etc
+}
+```
+
+**Integration in `src/scanner/quickScan.ts` and `src/scanner/deepDive.ts`:**
+
+Add exempt status to response and pass to LLM prompt:
+```typescript
+import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
+
+const exempt = isAuthorityExempt(address);
+const exemptReason = getExemptReason(address);
+
+// Include in response
+const result = {
+  ...scanData,
+  authority_exempt: exempt,
+  authority_exempt_reason: exemptReason,
+};
+
+// Include in LLM prompt so narrative reflects it correctly
+const llmInput = {
+  ...result,
+  ...(exempt ? { note: `This token is authority-exempt: ${exemptReason}` } : {}),
+};
+```
 
 ---
 
@@ -838,6 +991,10 @@ controls request/response shape: `"openai"` for any OpenAI-compatible API,
 
 ## Constants (`src/constants.ts`)
 
+Contains only Virtuals Protocol addresses and Solana program IDs.
+The static token whitelist previously here has been replaced by the
+Jupiter strict list in `src/sources/jupiterTokenList.ts`.
+
 ```typescript
 /**
  * Virtuals Protocol controlled addresses.
@@ -895,7 +1052,10 @@ GET  /revenue/summary → revenueTracker middleware
 ### Health endpoint
 
 ```typescript
+import { ensureFresh } from "../sources/jupiterTokenList.js";
+
 app.get("/health", async (c) => {
+  await ensureFresh(); // refresh Jupiter token list if stale (24h TTL)
   const breakers = circuitBreaker.getAll();
   const sourceStats = getSourceStats();
   const criticalDown = ["dexscreener", "helius_rpc"].filter(s => breakers[s] === "OPEN");
@@ -1103,9 +1263,11 @@ module.exports = {
 ## Tests (Vitest)
 
 1. **`quickScan.test.ts`** — BONK (good), known rug (F grade), verify response shape,
-   verify `isValidSolanaAddress` rejects garbage
+   verify `isValidSolanaAddress` rejects garbage, verify USDC grades A/B with
+   `authority_exempt: true`
 2. **`sources.test.ts`** — mock all APIs, verify 200/429/500 handling, verify parallel
-   fetching runs concurrently, verify Helius always called for authority flags
+   fetching runs concurrently, verify Helius always called for authority flags,
+   verify Jupiter list returns exempt=true for stablecoin tags
 3. **`deepDive.test.ts`** — `recommendation` never undefined, `momentum_score` always 0–100,
    protocol addresses not flagged as suspicious
 4. **`circuitBreaker.test.ts`** — CLOSED→OPEN after 5 failures, OPEN rejects immediately,
@@ -1145,20 +1307,21 @@ Work in this sequence. Do not skip ahead.
 3. `src/utils/retry.ts` — no deps
 4. `src/circuitBreaker.ts` — no deps
 5. `src/sources/resolver.ts` — no deps
-6. `src/cache.ts` — deduplication, TTLs, token buckets
-7. `src/api/rateLimiter.ts` — no deps
-8. `src/sources/dexscreener.ts` — validate live against BONK
-9. `src/sources/helius.ts` — include `getTokenMintInfo()`, validate against BONK
-10. `src/sources/rugcheck.ts` — no authority flags, include `report_age_seconds`
-11. `src/sources/birdeye.ts`, `src/sources/solscan.ts`
-12. `src/scanner/riskScorer.ts` — `scoreConfidence()` with rugCheckAgeSeconds param
-13. `src/llm/narrativeEngine.ts` — test in isolation with mock data
-14. `src/scanner/quickScan.ts` + `src/api/server.ts` (quick endpoint only)
-15. **Live end-to-end test against BONK** — verify SLA, response shape, 400 for garbage
-16. `src/scanner/deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`
-17. ACP handlers (`virtuals-acp/src/seller/jobQueue.ts` + all 4 `handlers.ts`)
-18. `scripts/revenueTracker.ts`, `scripts/healthWatchdog.ts`
-19. Tests (`circuitBreaker.test.ts` first — no external deps)
+6. `src/sources/jupiterTokenList.ts` — no deps, test `isAuthorityExempt` in isolation
+7. `src/cache.ts` — deduplication, TTLs, token buckets
+8. `src/api/rateLimiter.ts` — no deps
+9. `src/sources/dexscreener.ts` — validate live against BONK
+10. `src/sources/helius.ts` — include `getTokenMintInfo()`, validate against BONK
+11. `src/sources/rugcheck.ts` — no authority flags, include `report_age_seconds`
+12. `src/sources/birdeye.ts`, `src/sources/solscan.ts`
+13. `src/scanner/riskScorer.ts` — `scoreConfidence()` + authority exemption logic
+14. `src/llm/narrativeEngine.ts` — test in isolation with mock data
+15. `src/scanner/quickScan.ts` + `src/api/server.ts` (quick endpoint only)
+16. **Live end-to-end test against BONK and USDC** — BONK grades A, USDC grades A/B with authority_exempt: true
+17. `src/scanner/deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`
+18. ACP handlers (`virtuals-acp/src/seller/jobQueue.ts` + all 4 `handlers.ts`)
+19. `scripts/revenueTracker.ts`, `scripts/healthWatchdog.ts`
+20. Tests (`circuitBreaker.test.ts` first — no external deps)
 
 ---
 
@@ -1166,6 +1329,9 @@ Work in this sequence. Do not skip ahead.
 
 - Do not fetch `mint_authority_revoked` or `freeze_authority_revoked` from RugCheck — ever
 - Do not make the Helius authority call conditional — it runs on every scan, always
+- Do not use a static token whitelist to exempt tokens from authority penalties — use the Jupiter strict list
+- Do not hardcode USDC, USDT, or any token address as exempt — Jupiter handles this dynamically
+- Do not block server startup waiting for the Jupiter list — load it fire-and-forget
 - Do not call the LLM before all parallel source fetches have settled
 - Do not let any LLM provider failure propagate as a scan error — cascade to next provider, then template
 - Do not use Sonnet or Mixtral for `sol_quick_scan` — Haiku/Llama fast models only; 5s SLA has no headroom

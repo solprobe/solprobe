@@ -2,6 +2,7 @@ import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo } from "../sources/helius.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
+import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateQuickScanSummary,
@@ -20,6 +21,10 @@ export interface QuickScanResult {
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
   rugcheck_report_age_seconds: number | null;
+  /** True when this token is on the Jupiter strict list with a legitimately retained authority. */
+  authority_exempt: boolean;
+  /** Human-readable reason for the exemption, or null when not exempt. */
+  authority_exempt_reason: string | null;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -86,7 +91,10 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     token_age_days,
   };
 
-  const risk_grade = calculateRiskGrade(factors);
+  const authority_exempt = isAuthorityExempt(address);
+  const authority_exempt_reason = getExemptReason(address);
+
+  const risk_grade = calculateRiskGrade(factors, address);
 
   // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
@@ -106,6 +114,8 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     risk_grade,
     data_confidence,
     has_rug_history,
+    authority_exempt,
+    authority_exempt_reason,
   };
 
   let summary: string;
@@ -128,5 +138,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     summary,
     data_confidence,
     rugcheck_report_age_seconds,
+    authority_exempt,
+    authority_exempt_reason,
   };
 }
