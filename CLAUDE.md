@@ -312,7 +312,7 @@ The `RugCheckResult` interface must NOT contain `mint_authority_revoked` or
 
 ## Jupiter Token List (`src/sources/jupiterTokenList.ts`)
 
-The Jupiter strict token list is the authoritative source for identifying tokens
+The Jupiter verified token list is the authoritative source for identifying tokens
 with legitimately retained authorities — stablecoins, wrapped assets, and bridge
 tokens. This replaces any static token whitelist. The list is fetched once at
 startup and refreshed every 24 hours in the background.
@@ -320,7 +320,28 @@ startup and refreshed every 24 hours in the background.
 **Why Jupiter:** Actively maintained by the most authoritative source in Solana
 DeFi, covers thousands of verified tokens, has semantic tags built in, and
 requires no guesswork. USDC, USDT, wETH, wBTC, mSOL, JitoSOL and any future
-verified tokens are handled automatically.
+verified tokens are handled automatically without manual list maintenance.
+
+**API details:**
+- Endpoint: `https://lite-api.jup.ag/tokens/v2/tag?query=verified`
+- No API key required — free public endpoint
+- Response: array of token objects where each token has `id` (the mint address),
+  `symbol`, `name`, `tags[]`
+- The v2 API uses `id` not `address` for the mint — important for map population
+
+**Confirmed working tags in v2 response (verified from live API):**
+
+| Tag | Meaning |
+|---|---|
+| `"stable"` | Stablecoins (USDC, USDT etc) — primary tag in v2 |
+| `"stablecoin"` | Legacy tag — keep for seed list compatibility |
+| `"wormhole"` | Wormhole bridge-wrapped assets |
+| `"wrapped"` | Other wrapped assets and liquid staking tokens |
+| `"verified"` | Broadly verified by Jupiter community |
+
+> **Note:** The v2 API uses `"stable"` not `"stablecoin"` for stablecoins.
+> USDC has tags `["community", "moonshot-verified", "strict", "verified", "stable"]`.
+> Both tags must be in EXEMPT_TAGS to handle seed list entries and live API entries.
 
 ```typescript
 // src/sources/jupiterTokenList.ts
@@ -333,26 +354,66 @@ interface JupiterToken {
 }
 
 // Tags that indicate legitimately retained authority — not a rug risk
-const EXEMPT_TAGS = new Set(["stablecoin", "wormhole", "wrapped"]);
+// Includes both v1 tag names (seed list) and v2 tag names (live API)
+const EXEMPT_TAGS = new Set([
+  "stable",       // v2 API tag for stablecoins (USDC, USDT etc)
+  "stablecoin",   // seed list compatibility
+  "wormhole",     // Wormhole-wrapped assets
+  "wrapped",      // other wrapped assets and liquid staking
+  "verified",     // broadly verified by Jupiter
+]);
+
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+// Seed list — always populated at module load, no network cost
+// Ensures known majors work even if the Jupiter API fetch fails
+const SEED_LIST: JupiterToken[] = [
+  { address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", symbol: "USDC",    name: "USD Coin",           tags: ["stablecoin"] },
+  { address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  symbol: "USDT",    name: "Tether USD",          tags: ["stablecoin"] },
+  { address: "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX",   symbol: "USDH",    name: "USDH",                tags: ["stablecoin"] },
+  { address: "UXPhBoR3qG4UCiGNJfV7MqhHyFqKN68g45GoYvAeL2m",  symbol: "UXD",     name: "UXD Stablecoin",      tags: ["stablecoin"] },
+  { address: "So11111111111111111111111111111111111111112",    symbol: "SOL",     name: "Wrapped SOL",         tags: ["wrapped"] },
+  { address: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  symbol: "WETH",    name: "Wrapped Ether",       tags: ["wormhole"] },
+  { address: "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  symbol: "WBTC",    name: "Wrapped Bitcoin",     tags: ["wormhole"] },
+  { address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  symbol: "mSOL",    name: "Marinade staked SOL", tags: ["wrapped"] },
+  { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  symbol: "JitoSOL", name: "Jito Staked SOL",     tags: ["wrapped"] },
+  { address: "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",   symbol: "bSOL",    name: "BlazeStake SOL",      tags: ["wrapped"] },
+];
+
+// Populate from seed at module load — synchronous, zero network cost
 let tokenMap = new Map<string, JupiterToken>();
+for (const t of SEED_LIST) tokenMap.set(t.address, t);
+console.info(`[jupiter] seed list loaded (${tokenMap.size} tokens)`);
+
 let lastFetched = 0;
 
 export async function loadJupiterTokenList(): Promise<void> {
   try {
-    const res = await fetch("https://token.jup.ag/strict", {
-      signal: AbortSignal.timeout(10_000),
-    });
+    const res = await fetch(
+      "https://lite-api.jup.ag/tokens/v2/tag?query=verified",
+      { signal: AbortSignal.timeout(10_000) }
+    );
     if (!res.ok) throw new Error(`Jupiter list HTTP ${res.status}`);
-    const tokens: JupiterToken[] = await res.json();
-    const map = new Map<string, JupiterToken>();
-    for (const t of tokens) map.set(t.address, t);
-    tokenMap = map;
+
+    // v2 response: array of objects with "id" (mint address), not "address"
+    const tokens: Array<{ id: string; name: string; symbol: string; tags: string[] }> =
+      await res.json();
+
+    // Merge fetched tokens on top of seed — API wins on conflict
+    // Seed entries remain even if the API fetch fails
+    for (const t of tokens) {
+      tokenMap.set(t.id, {
+        address: t.id,
+        name: t.name,
+        symbol: t.symbol,
+        tags: t.tags ?? [],
+      });
+    }
+
     lastFetched = Date.now();
-    console.info(`[jupiter] loaded ${map.size} tokens from strict list`);
+    console.info(`[jupiter] loaded ${tokenMap.size} tokens (API + seed)`);
   } catch (err) {
-    console.warn("[jupiter] failed to load token list — using cached version", err);
+    console.warn("[jupiter] fetch failed — serving from seed list only", err);
   }
 }
 
@@ -374,17 +435,18 @@ export function getExemptReason(address: string): string | null {
   const matchedTag = token.tags.find(tag => EXEMPT_TAGS.has(tag));
   if (!matchedTag) return null;
   const reasons: Record<string, string> = {
+    stable:     `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
     stablecoin: `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
     wormhole:   `${token.symbol} is a Wormhole-wrapped asset — authority retained by bridge program`,
     wrapped:    `${token.symbol} is a wrapped asset — authority retained by wrapping protocol`,
+    verified:   `${token.symbol} is a Jupiter-verified token with legitimate retained authority`,
   };
   return reasons[matchedTag] ?? `${token.symbol} is a verified token with legitimate retained authority`;
 }
 ```
 
-**On fetch failure:** keep serving the previously cached map. If the map is empty
-(first startup and fetch failed), log a warning and proceed — scoring applies full
-penalties which is the conservative safe default.
+**On fetch failure:** the seed list remains in the map and all known majors
+continue to work. The API fetch is additive — it never clears the seed.
 
 **Integration in `src/api/server.ts`:**
 
@@ -422,7 +484,7 @@ export function calculateRiskScore(factors: RiskFactors, tokenAddress?: string) 
   const exempt = tokenAddress ? isAuthorityExempt(tokenAddress) : false;
   let score = 100;
 
-  // Authority penalties — skipped for exempt tokens
+  // Authority penalties — skipped for exempt tokens (stablecoins, wrapped assets)
   if (!exempt) {
     if (!factors.mint_authority_revoked)  score -= 25;
     if (!factors.freeze_authority_revoked) score -= 15;
@@ -435,7 +497,6 @@ export function calculateRiskScore(factors: RiskFactors, tokenAddress?: string) 
 
 **Integration in `src/scanner/quickScan.ts` and `src/scanner/deepDive.ts`:**
 
-Add exempt status to response and pass to LLM prompt:
 ```typescript
 import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
 

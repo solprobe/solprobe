@@ -19,11 +19,28 @@ interface TokenCacheEntry {
 }
 
 // Tags that indicate legitimately retained authority — not a rug risk
-const EXEMPT_TAGS = new Set(["stablecoin", "wormhole", "wrapped"]);
+const EXEMPT_TAGS = new Set([
+  "stable",       // stablecoins in v2 (USDC, USDT etc)
+  "stablecoin",   // keep for seed list compatibility
+  "wormhole",     // wormhole wrapped assets
+  "wrapped",      // other wrapped assets
+  "verified",     // broadly verified tokens
+]);
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const TOKEN_CACHE_TTL_MS   =  1 * 60 * 60 * 1000; // 1 hour
 
-let tokenMap  = new Map<string, JupiterToken>();
+// Critical tokens that must always be exempt even if the fetch fails
+const SEED_LIST: JupiterToken[] = [
+  { address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", symbol: "USDC",    name: "USD Coin",       tags: ["stable", "stablecoin"] },
+  { address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", symbol: "USDT",    name: "Tether USD",    tags: ["stable", "stablecoin"] },
+  { address: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", symbol: "wETH",    name: "Wrapped Ether",  tags: ["wormhole", "wrapped"] },
+  { address: "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", symbol: "wBTC",    name: "Wrapped Bitcoin", tags: ["wormhole", "wrapped"] },
+  { address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  symbol: "mSOL",    name: "Marinade staked SOL", tags: ["verified"] },
+  { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", symbol: "JitoSOL", name: "Jito Staked SOL",    tags: ["verified"] },
+];
+
+// Pre-populate with seed list — available synchronously before the async fetch completes
+let tokenMap  = new Map<string, JupiterToken>(SEED_LIST.map(t => [t.address, t]));
 let lastFetched = 0;
 const TOKEN_CACHE = new Map<string, TokenCacheEntry>();
 
@@ -33,13 +50,21 @@ const TOKEN_CACHE = new Map<string, TokenCacheEntry>();
 
 export async function loadJupiterTokenList(): Promise<void> {
   try {
-    const res = await fetch("https://token.jup.ag/strict", {
+    const res = await fetch("https://lite-api.jup.ag/tokens/v2/tag?query=verified", {
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) throw new Error(`Jupiter list HTTP ${res.status}`);
-    const tokens: JupiterToken[] = await res.json();
-    const map = new Map<string, JupiterToken>();
-    for (const t of tokens) map.set(t.address, t);
+    const tokens = (await res.json()) as any[];
+    // Seed the map first so critical stablecoins survive a partial fetch
+    const map = new Map<string, JupiterToken>(SEED_LIST.map((t: JupiterToken) => [t.address, t]));
+    for (const t of tokens) {
+      map.set(t.id, {
+        address: t.id,
+        name: t.name ?? "",
+        symbol: t.symbol ?? "",
+        tags: t.tags ?? [],
+      });
+    }
     tokenMap = map;
     lastFetched = Date.now();
     console.info(`[jupiter] loaded ${map.size} tokens from strict list`);
@@ -91,20 +116,10 @@ async function lookupJupiterToken(address: string): Promise<{ exempt: boolean; r
     return { exempt: cached.exempt, reason: cached.reason };
   }
 
-  const apiKey = process.env.JUPITER_API_KEY;
-  if (!apiKey) {
-    console.warn("[jupiter] JUPITER_API_KEY not set — skipping API lookup");
-    TOKEN_CACHE.set(address, { exempt: false, reason: null, fetchedAt: Date.now() });
-    return { exempt: false, reason: null };
-  }
-
   try {
     const res = await fetch(
-      `https://api.jup.ag/tokens/v2/search?query=${address}`,
-      {
-        headers: { "x-api-key": apiKey },
-        signal: AbortSignal.timeout(3_000),
-      }
+      `https://lite-api.jup.ag/tokens/v2/search?query=${address}`,
+      { signal: AbortSignal.timeout(3_000) }
     );
     if (!res.ok) throw new Error(`Jupiter API ${res.status}`);
 
