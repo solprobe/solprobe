@@ -10,12 +10,13 @@ import { getCacheStats } from "../cache.js";
 import { revenueMiddleware, getRevenueSummary } from "../revenueTracker.js";
 import { checkRateLimit } from "./rateLimiter.js";
 import { getSourceStats } from "../sources/resolver.js";
+import "dotenv/config";
 
 // ---------------------------------------------------------------------------
 // SLA enforcement helper
 // ---------------------------------------------------------------------------
 
-class SlaExceededError extends Error {}
+class SlaExceededError extends Error { }
 
 async function withSlaDeadline<T>(fn: () => Promise<T>, deadlineMs: number): Promise<T> {
   return Promise.race([
@@ -27,10 +28,10 @@ async function withSlaDeadline<T>(fn: () => Promise<T>, deadlineMs: number): Pro
 }
 
 const SLA_DEADLINE_MS = {
-  quick:  4_500,
-  deep:  28_000,
+  quick: 4_500,
+  deep: 28_000,
   wallet: 9_000,
-  intel:  9_000,
+  intel: 9_000,
 } as const;
 
 const app = new Hono();
