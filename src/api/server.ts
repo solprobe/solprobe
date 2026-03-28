@@ -227,7 +227,7 @@ app.get("/revenue/summary", (c) => {
 app.get("/health", (c) => {
   const breakers = getBreakerStates();
   const sourceStats = getSourceStats();
-  const criticalDown = (["dexscreener", "rugcheck"] as const).filter(
+  const criticalDown = (["dexscreener", "helius_rpc"] as const).filter(
     (s) => breakers[s] === "OPEN"
   );
   return c.json({
