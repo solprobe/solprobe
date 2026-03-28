@@ -32,7 +32,7 @@ GRADUATION.md
 .vscode/
 .idea/
 
-.data/
+data/
 
 
 acp/config.json
