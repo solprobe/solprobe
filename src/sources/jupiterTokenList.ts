@@ -20,11 +20,10 @@ interface TokenCacheEntry {
 
 // Tags that indicate legitimately retained authority — not a rug risk
 const EXEMPT_TAGS = new Set([
-  "stable",       // stablecoins in v2 (USDC, USDT etc)
-  "stablecoin",   // keep for seed list compatibility
-  "wormhole",     // wormhole wrapped assets
-  "wrapped",      // other wrapped assets
-  "verified",     // broadly verified tokens
+  "stable",       // stablecoins (USDC, USDT etc) — v2 API tag
+  "stablecoin",   // seed list compatibility
+  "wormhole",     // Wormhole bridge-wrapped assets
+  "wrapped",      // wrapped assets and liquid staking tokens
 ]);
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const TOKEN_CACHE_TTL_MS   =  1 * 60 * 60 * 1000; // 1 hour
@@ -35,8 +34,8 @@ const SEED_LIST: JupiterToken[] = [
   { address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", symbol: "USDT",    name: "Tether USD",    tags: ["stable", "stablecoin"] },
   { address: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", symbol: "wETH",    name: "Wrapped Ether",  tags: ["wormhole", "wrapped"] },
   { address: "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E", symbol: "wBTC",    name: "Wrapped Bitcoin", tags: ["wormhole", "wrapped"] },
-  { address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  symbol: "mSOL",    name: "Marinade staked SOL", tags: ["verified"] },
-  { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", symbol: "JitoSOL", name: "Jito Staked SOL",    tags: ["verified"] },
+  { address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  symbol: "mSOL",    name: "Marinade staked SOL", tags: ["wrapped"] },
+  { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", symbol: "JitoSOL", name: "Jito Staked SOL",    tags: ["wrapped"] },
 ];
 
 // Pre-populate with seed list — available synchronously before the async fetch completes

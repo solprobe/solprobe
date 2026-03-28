@@ -22,12 +22,15 @@ export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false
     if (factors.freeze_authority_revoked !== true) score -= 15;
   }
 
-  // Holder concentration
-  const holderPct = factors.top_10_holder_pct ?? 100;
-  if (holderPct > 95) {
-    score -= 35;
-  } else if (holderPct > 80) {
-    score -= 20;
+  // Holder concentration — skipped for exempt tokens
+  // Stablecoin/wrapped asset reserves held by custodians are not rug risk
+  if (!exempt) {
+    const holderPct = factors.top_10_holder_pct ?? 100;
+    if (holderPct > 95) {
+      score -= 35;
+    } else if (holderPct > 80) {
+      score -= 20;
+    }
   }
 
   // Liquidity

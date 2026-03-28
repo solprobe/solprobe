@@ -331,17 +331,24 @@ verified tokens are handled automatically without manual list maintenance.
 
 **Confirmed working tags in v2 response (verified from live API):**
 
-| Tag | Meaning |
-|---|---|
-| `"stable"` | Stablecoins (USDC, USDT etc) — primary tag in v2 |
-| `"stablecoin"` | Legacy tag — keep for seed list compatibility |
-| `"wormhole"` | Wormhole bridge-wrapped assets |
-| `"wrapped"` | Other wrapped assets and liquid staking tokens |
-| `"verified"` | Broadly verified by Jupiter community |
+| Tag | Meaning | In EXEMPT_TAGS |
+|---|---|---|
+| `"stable"` | Stablecoins (USDC, USDT etc) — primary tag in v2 | ✅ yes |
+| `"stablecoin"` | Legacy tag — seed list compatibility | ✅ yes |
+| `"wormhole"` | Wormhole bridge-wrapped assets | ✅ yes |
+| `"wrapped"` | Other wrapped assets and liquid staking tokens | ✅ yes |
+| `"verified"` | Jupiter identity verification — applies to memecoins too | ❌ NO |
+| `"strict"` | Jupiter strict list membership — applies to memecoins too | ❌ NO |
+| `"community"` | Community-submitted token | ❌ NO |
 
-> **Note:** The v2 API uses `"stable"` not `"stablecoin"` for stablecoins.
-> USDC has tags `["community", "moonshot-verified", "strict", "verified", "stable"]`.
-> Both tags must be in EXEMPT_TAGS to handle seed list entries and live API entries.
+> **Critical:** `"verified"` and `"strict"` must NEVER be in EXEMPT_TAGS.
+> These tags confirm a token's identity but say nothing about whether retained
+> authority is legitimate. BONK, WIF, and thousands of memecoins carry these
+> tags — including them incorrectly exempts memecoins from authority penalties,
+> which are the most important safety signal SolProbe provides.
+>
+> Only `"stable"`, `"stablecoin"`, `"wormhole"`, and `"wrapped"` indicate that
+> retained mint/freeze authority is by institutional design rather than rug risk.
 
 ```typescript
 // src/sources/jupiterTokenList.ts
@@ -354,13 +361,12 @@ interface JupiterToken {
 }
 
 // Tags that indicate legitimately retained authority — not a rug risk
-// Includes both v1 tag names (seed list) and v2 tag names (live API)
+// "verified" and "strict" intentionally excluded — they apply to memecoins like BONK
 const EXEMPT_TAGS = new Set([
   "stable",       // v2 API tag for stablecoins (USDC, USDT etc)
   "stablecoin",   // seed list compatibility
   "wormhole",     // Wormhole-wrapped assets
   "wrapped",      // other wrapped assets and liquid staking
-  "verified",     // broadly verified by Jupiter
 ]);
 
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -439,7 +445,6 @@ export function getExemptReason(address: string): string | null {
     stablecoin: `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
     wormhole:   `${token.symbol} is a Wormhole-wrapped asset — authority retained by bridge program`,
     wrapped:    `${token.symbol} is a wrapped asset — authority retained by wrapping protocol`,
-    verified:   `${token.symbol} is a Jupiter-verified token with legitimate retained authority`,
   };
   return reasons[matchedTag] ?? `${token.symbol} is a verified token with legitimate retained authority`;
 }
@@ -785,13 +790,73 @@ Deterministic, no ML. Score starts at 100, penalties subtracted. `has_rug_histor
 is an instant F regardless of score.
 
 ### Penalty table
-- `mint_authority_revoked === false` (or null): -25
-- `freeze_authority_revoked === false` (or null): -15
-- `top_10_holder_pct > 80%`: -20 / `> 95%`: -35
-- `liquidity_usd < $10k`: -20 / `< $1k`: -35
-- `bundled_launch === true`: -20
-- `buy_sell_ratio < 0.5`: -10
-- `token_age_days < 1`: -15 / null: -10
+
+Penalties marked **[exempt skip]** are bypassed entirely for authority-exempt tokens
+(stablecoins and wrapped assets identified by Jupiter tags). All other
+penalties apply regardless of exempt status.
+
+| Condition | Penalty | Exempt skip |
+|---|---|---|
+| `mint_authority_revoked === false` or null | -25 | ✅ yes |
+| `freeze_authority_revoked === false` or null | -15 | ✅ yes |
+| `top_10_holder_pct > 95%` or null | -35 | ✅ yes |
+| `top_10_holder_pct > 80%` | -20 | ✅ yes |
+| `liquidity_usd < $1k` or null | -35 | ❌ no |
+| `liquidity_usd < $10k` | -20 | ❌ no |
+| `bundled_launch === true` | -20 | ❌ no |
+| `buy_sell_ratio < 0.5` | -10 | ❌ no |
+| `token_age_days === null` | -10 | ❌ no |
+| `token_age_days < 1` | -15 | ❌ no |
+
+**Why concentration is also exempt-skipped:** For stablecoins and wrapped assets,
+large holdings by institutional custodians (Circle treasury, Tether reserves, bridge
+programs) are by design and carry no rug risk. When `top_10_holder_pct` is null for
+USDC (Helius cannot meaningfully rank billions of micro-accounts), the null-defaults-
+to-100% worst-case assumption is incorrect and produces a misleading grade.
+
+**Implementation:**
+
+```typescript
+export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false): RiskGrade {
+  if (factors.has_rug_history) return "F";
+
+  let score = 100;
+
+  // Authority penalties — skipped for exempt tokens
+  if (!exempt) {
+    if (!factors.mint_authority_revoked)  score -= 25;
+    if (!factors.freeze_authority_revoked) score -= 15;
+  }
+
+  // Concentration penalty — skipped for exempt tokens
+  // Stablecoin/wrapped asset reserves held by custodians are not rug risk
+  if (!exempt) {
+    const holderPct = factors.top_10_holder_pct ?? 100;
+    if (holderPct > 95) score -= 35;
+    else if (holderPct > 80) score -= 20;
+  }
+
+  // Liquidity penalties — always apply
+  const liq = factors.liquidity_usd ?? 0;
+  if (liq < 1_000) score -= 35;
+  else if (liq < 10_000) score -= 20;
+
+  // Launch and trading penalties — always apply
+  if (factors.bundled_launch) score -= 20;
+  if (factors.buy_sell_ratio !== null && factors.buy_sell_ratio < 0.5) score -= 10;
+
+  // Age penalties — always apply
+  if (factors.token_age_days === null) score -= 10;
+  else if (factors.token_age_days < 1) score -= 15;
+
+  // Grade bands
+  if (score >= 80) return "A";
+  if (score >= 60) return "B";
+  if (score >= 40) return "C";
+  if (score >= 20) return "D";
+  return "F";
+}
+```
 
 ### Grade bands
 80–100 → A | 60–79 → B | 40–59 → C | 20–39 → D | 0–19 → F | rug history → F
