@@ -261,6 +261,94 @@ export async function generateQuickScanSummary(data: QuickScanData): Promise<str
   return result || fallbackQuickSummary(data);
 }
 
+// ---------------------------------------------------------------------------
+// Wallet risk types + generators
+// ---------------------------------------------------------------------------
+
+export interface WalletRiskData {
+  wallet_age_days: number | null;
+  trading_style: string;
+  win_rate_pct: number | null;
+  sniper_score: number;
+  rug_exit_rate_pct: number | null;
+  funding_wallet_risk: string;
+  risk_score: number;
+  is_bot: boolean;
+  pnl_estimate_30d_usdc: number | null;
+}
+
+export function fallbackWalletRiskSummary(data: WalletRiskData): string {
+  const style = data.trading_style;
+  const risk = data.risk_score > 70 ? "high" : data.risk_score > 40 ? "moderate" : "low";
+  const age = data.wallet_age_days != null ? `${Math.round(data.wallet_age_days)}d old` : "age unknown";
+  return `${style.charAt(0).toUpperCase() + style.slice(1)} wallet (${age}) — ${risk} counterparty risk score ${data.risk_score}/100.`;
+}
+
+export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
+  const system =
+    "You are a DeFi counterparty risk analyst. Output exactly one sentence assessing wallet risk. Never hedge or use qualifiers like 'appears to' or 'may be'. Be specific and direct.";
+
+  const userMsg = [
+    `Wallet age: ${data.wallet_age_days != null ? Math.round(data.wallet_age_days) + " days" : "unknown"}.`,
+    `Trading style: ${data.trading_style}.`,
+    `Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}.`,
+    `Sniper score: ${data.sniper_score}/100.`,
+    `Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "unknown"}.`,
+    `Funding risk: ${data.funding_wallet_risk}.`,
+    `Risk score: ${data.risk_score}/100.`,
+    `Is bot: ${data.is_bot}.`,
+    `30d PnL estimate: ${data.pnl_estimate_30d_usdc != null ? "$" + data.pnl_estimate_30d_usdc.toFixed(0) : "unknown"}.`,
+  ].join(" ");
+
+  const result = await callWithFallback("fast", 80, system, userMsg);
+  return result || fallbackWalletRiskSummary(data);
+}
+
+// ---------------------------------------------------------------------------
+// Market intel types + generators
+// ---------------------------------------------------------------------------
+
+export interface MarketIntelData {
+  current_price_usd: number;
+  price_change_1h_pct: number;
+  price_change_24h_pct: number;
+  volume_1h_usd: number;
+  volume_24h_usd: number;
+  buy_pressure: string;
+  sell_pressure: string;
+  large_txs_last_hour: number;
+  signal: string;
+}
+
+export function fallbackMarketIntelSummary(data: MarketIntelData): string {
+  const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
+  const vol = data.volume_1h_usd > 0 ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
+  return `${dir} signal — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure.`;
+}
+
+export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
+  const system =
+    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. Never hedge. Be specific with numbers.";
+
+  const userMsg = [
+    `Price: $${data.current_price_usd}.`,
+    `1h change: ${data.price_change_1h_pct.toFixed(2)}%.`,
+    `24h change: ${data.price_change_24h_pct.toFixed(2)}%.`,
+    `1h volume: $${(data.volume_1h_usd / 1000).toFixed(0)}k.`,
+    `24h volume: $${(data.volume_24h_usd / 1000).toFixed(0)}k.`,
+    `Buy pressure: ${data.buy_pressure}. Sell pressure: ${data.sell_pressure}.`,
+    `Large txs (>$10k) last hour: ${data.large_txs_last_hour}.`,
+    `Signal: ${data.signal}.`,
+  ].join(" ");
+
+  const result = await callWithFallback("fast", 80, system, userMsg);
+  return result || fallbackMarketIntelSummary(data);
+}
+
+// ---------------------------------------------------------------------------
+// Deep dive generator
+// ---------------------------------------------------------------------------
+
 /**
  * Generate a 3–5 sentence analyst report for a deep dive result.
  * Tries Anthropic Sonnet first, falls back to Groq Mixtral, then template.

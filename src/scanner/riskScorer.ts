@@ -7,6 +7,10 @@ export interface RiskFactors {
   bundled_launch: boolean;                  // true → 20pt penalty
   buy_sell_ratio: number | null;            // null → no penalty (insufficient data)
   token_age_days: number | null;            // null → 10pt penalty
+  rugcheck_risk_score: number | null;       // RugCheck aggregate score
+  single_holder_danger: boolean;            // RugCheck risks[] "Single holder ownership" at danger
+  lp_burned: boolean | null;               // null → unknown (no penalty); false → -25
+  dev_wallet_age_days: number | null;       // deep dive only; no scoring penalty currently
 }
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
@@ -32,6 +36,20 @@ export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false
       score -= 20;
     }
   }
+
+  // RugCheck risk score — never skipped for exempt tokens
+  if (factors.rugcheck_risk_score !== null && factors.rugcheck_risk_score !== undefined) {
+    if (factors.rugcheck_risk_score > 5_000) score -= 30;
+    else if (factors.rugcheck_risk_score > 2_000) score -= 20;
+    else if (factors.rugcheck_risk_score > 1_000) score -= 10;
+  }
+
+  // Single holder danger from RugCheck risks[] — never skipped
+  if (factors.single_holder_danger) score -= 25;
+
+  // LP burn — only penalise when explicitly detected as not burned (false)
+  // null = unknown = no penalty (conservative: don't penalise lack of data)
+  if (factors.lp_burned === false) score -= 25;
 
   // Liquidity
   const liq = factors.liquidity_usd ?? 0;

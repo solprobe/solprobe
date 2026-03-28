@@ -1,7 +1,7 @@
 {
   "name": "sol_quick_scan",
-  "description": "Instant Solana token safety check. Returns risk grade, mint/freeze authority status, holder concentration, and liquidity in under 5 seconds. Essential pre-trade check for any Solana trading agent. $0.01 per call.",
-  "price": "0.01",
+  "description": "Instant Solana token safety check. Returns risk grade (A–F), LP burn status, mint/freeze authority, holder concentration, RugCheck risk score, and liquidity in under 5 seconds. Includes AI-generated safety summary. Essential pre-trade check for any Solana trading agent. $0.05 per call.",
+  "price": "0.05",
   "currency": "USDC",
   "requirements": {
     "type": "object",

@@ -1,7 +1,7 @@
 {
   "name": "sol_wallet_risk",
-  "description": "Solana wallet counterparty risk assessment. Returns wallet age, transaction count, bot detection, whale status, trading style (sniper/hodler/flipper/bot), and a 0–100 risk score. Under 10 seconds. $0.02 per call.",
-  "price": "0.02",
+  "description": "Deep Solana wallet counterparty risk assessment from real transaction history. Returns win rate, sniper score, rug exit rate, PnL estimate, bot detection, trading style (sniper/hodler/flipper/bot/degen), funding wallet risk, and a 0–100 risk score with AI-generated verdict. Under 20 seconds. $0.10 per call.",
+  "price": "0.10",
   "currency": "USDC",
   "requirements": {
     "type": "object",

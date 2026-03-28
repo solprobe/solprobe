@@ -1,6 +1,6 @@
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo } from "../sources/helius.js";
+import { getTokenMintInfo, checkLPBurned } from "../sources/helius.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import { deduplicate, getOrFetch } from "../cache.js";
@@ -16,6 +16,9 @@ export interface QuickScanResult {
   freeze_authority_revoked: boolean;
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
+  lp_burned: boolean | null;
+  rugcheck_risk_score: number | null;
+  single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
@@ -56,6 +59,10 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
   if (mintResult.status === "rejected") logError("helius_rpc",  mintResult.reason,  address);
 
+  // ── Phase 2: LP burn check — requires LP mint from phase 1 ───────────────
+  const lpMint = dexData?.lp_mint_address ?? null;
+  const lp_burned = lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null;
+
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   // On null (RPC failure), default to false (conservative — treat as not revoked).
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
@@ -89,6 +96,10 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     bundled_launch: rugData?.bundled_launch_detected ?? false,
     buy_sell_ratio: dexData?.buy_sell_ratio_1h ?? null,
     token_age_days,
+    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    single_holder_danger: rugData?.single_holder_danger ?? false,
+    lp_burned,
+    dev_wallet_age_days: null, // quickScan never fetches this
   };
 
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
@@ -133,6 +144,9 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
+    lp_burned,
+    rugcheck_risk_score: factors.rugcheck_risk_score,
+    single_holder_danger: factors.single_holder_danger,
     risk_grade,
     summary,
     data_confidence,

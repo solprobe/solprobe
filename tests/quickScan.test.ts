@@ -62,6 +62,7 @@ function makeFetchMock(overrides: {
           address: `addr${i}111111111111111111111111111111111111`,
           pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
         })),
+        score: 0,
         risks: [],
         rugged,
       });
@@ -145,6 +146,9 @@ describe("quickScan", () => {
       is_honeypot:             expect.any(Boolean),
       mint_authority_revoked:  expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
+      lp_burned:               expect.toBeOneOf([true, false, null]),
+      rugcheck_risk_score:     expect.toBeOneOf([expect.any(Number), null]),
+      single_holder_danger:    expect.any(Boolean),
       risk_grade:              expect.stringMatching(/^[ABCDF]$/),
       summary:                 expect.any(String),
       data_confidence:         expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
@@ -194,5 +198,111 @@ describe("quickScan", () => {
 
     expect(result.data_confidence).toBe("MEDIUM");
     expect(["A", "B", "C", "D", "F"]).toContain(result.risk_grade);
+  });
+
+  it("applies LP burn penalty when lp_burned is false", async () => {
+    // Use RUG (not Jupiter-exempt) with both authorities active so authority penalties apply.
+    // lp_burned: true  → score 100 - 25 (mint) - 15 (freeze) = 60 → grade B
+    // lp_burned: false → score 100 - 25 (mint) - 15 (freeze) - 25 (lp) = 35 → grade D
+    const LP_MINT = "FakeLPMint1111111111111111111111111111111111";
+    const mintBuf = Buffer.alloc(82, 0);
+    mintBuf.writeUInt32LE(1, 0);   // mint authority active (not revoked)
+    mintBuf.writeUInt32LE(1, 46);  // freeze authority active (not revoked)
+    const base64Mint = mintBuf.toString("base64");
+
+    function makeLP(burned: boolean) {
+      return vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("dexscreener")) {
+          return fakeResponse({ pairs: [{
+            chainId: "solana", dexId: "raydium",
+            pairAddress: "fakePairAddr111111111111111111111111111111111",
+            baseToken: { address: RUG, name: "Test", symbol: "TST" },
+            quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+            priceUsd: "0.001",
+            priceChange: { h1: 0, h24: 0 },
+            volume: { h1: 50_000, h24: 500_000 },
+            liquidity: { usd: 2_000_000 },
+            txns: { h1: { buys: 100, sells: 100 }, h24: { buys: 1000, sells: 1000 } },
+            pairCreatedAt: Date.now() - 100 * 86_400_000,
+            info: { liquidityToken: { address: LP_MINT } },
+          }] });
+        }
+        if (u.includes("rugcheck")) {
+          return fakeResponse({ mint: RUG, topHolders: [], score: 0, risks: [], rugged: false });
+        }
+        // Helius / public RPC — differentiate by method
+        const body = JSON.parse((init?.body as string) ?? "{}");
+        if (body.method === "getTokenLargestAccounts") {
+          const topAddr = burned
+            ? "1nc1nerator11111111111111111111111111111111"
+            : "NotABurnAddr111111111111111111111111111111";
+          return fakeResponse({ id: 1, result: { value: [{ address: topAddr, amount: "1000000" }] } });
+        }
+        return fakeResponse({ id: 1, result: { value: { data: [base64Mint, "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+      });
+    }
+
+    vi.stubGlobal("fetch", makeLP(true));
+    const burnedResult = await quickScan(RUG);
+    _resetCache();
+
+    vi.stubGlobal("fetch", makeLP(false));
+    const notBurnedResult = await quickScan(RUG);
+
+    expect(burnedResult.lp_burned).toBe(true);
+    expect(notBurnedResult.lp_burned).toBe(false);
+    const gradeOrder = ["A", "B", "C", "D", "F"];
+    expect(gradeOrder.indexOf(notBurnedResult.risk_grade)).toBeGreaterThan(gradeOrder.indexOf(burnedResult.risk_grade));
+  });
+
+  it("applies single_holder_danger penalty from RugCheck risks array", async () => {
+    // Without single_holder_danger: score 100 - 25 (lp_burned null) = 75 → A
+    // With single_holder_danger:    score 100 - 25 (lp) - 25 (danger) = 50 → C
+    const withDanger = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("dexscreener")) {
+        return fakeResponse({ pairs: [{
+          chainId: "solana", dexId: "raydium",
+          pairAddress: "fakePairAddr111111111111111111111111111111111",
+          baseToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+          quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+          priceUsd: "1.0001",
+          priceChange: { h1: 0.05, h24: 0.12 },
+          volume: { h1: 80_000, h24: 1_500_000 },
+          liquidity: { usd: 2_000_000 },
+          txns: { h1: { buys: 200, sells: 100 }, h24: { buys: 2000, sells: 1000 } },
+          pairCreatedAt: Date.now() - 400 * 86_400_000,
+        }] });
+      }
+      if (u.includes("rugcheck")) {
+        return fakeResponse({
+          mint: USDC,
+          mintAuthority: null,
+          freezeAuthority: null,
+          topHolders: Array.from({ length: 10 }, (_, i) => ({
+            address: `addr${i}111111111111111111111111111111111111`,
+            pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
+          })),
+          score: 0,
+          risks: [{ name: "Single holder ownership", level: "danger", description: "single holder", score: 100, value: "" }],
+          rugged: false,
+        });
+      }
+      const mintBuf2 = Buffer.alloc(82, 0); // authorities revoked
+      return fakeResponse({ id: 1, result: { value: { data: [mintBuf2.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+    });
+
+    vi.stubGlobal("fetch", makeFetchMock()); // clean — no danger
+    const clean = await quickScan(USDC);
+    _resetCache();
+
+    vi.stubGlobal("fetch", withDanger);
+    const dangerous = await quickScan(USDC);
+
+    expect(clean.single_holder_danger).toBe(false);
+    expect(dangerous.single_holder_danger).toBe(true);
+    const gradeOrder = ["A", "B", "C", "D", "F"];
+    expect(gradeOrder.indexOf(dangerous.risk_grade)).toBeGreaterThan(gradeOrder.indexOf(clean.risk_grade));
   });
 });

@@ -1,6 +1,6 @@
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo } from "../sources/helius.js";
+import { getTokenMintInfo, checkLPBurned, getWalletAgeDays } from "../sources/helius.js";
 import { getBirdeyeToken } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
@@ -45,6 +45,9 @@ export interface DeepDiveResult {
   freeze_authority_revoked: boolean;
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
+  lp_burned: boolean | null;
+  rugcheck_risk_score: number | null;
+  single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
   dev_wallet_analysis: DevWalletAnalysis;
@@ -235,6 +238,21 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   if (birdResult.status === "rejected") logError("birdeye",     birdResult.reason,  address);
   if (scanResult.status === "rejected") logError("solscan",     scanResult.reason,  address);
 
+  // ── Phase 2: LP burn check + dev wallet age ──────────────────────────────
+  // Both depend on phase 1 results; run in parallel to minimise latency.
+  const lpMint = dexData?.lp_mint_address ?? null;
+  const devWalletForAge = (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
+    ? mintAuthAddress
+    : null;
+
+  const [lpBurnResult, walletAgeResult] = await Promise.allSettled([
+    lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null),
+    devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 5000 }) : Promise.resolve(null),
+  ]);
+
+  const lp_burned        = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
+  const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
+
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
   const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
@@ -274,6 +292,10 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     bundled_launch: bundled_launch_detected,
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
+    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    single_holder_danger: rugData?.single_holder_danger ?? false,
+    lp_burned,
+    dev_wallet_age_days,
   };
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
   const risk_grade = calculateRiskGrade(factors, authority_exempt);
@@ -391,6 +413,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
+    lp_burned,
+    rugcheck_risk_score: factors.rugcheck_risk_score,
+    single_holder_danger: factors.single_holder_danger,
     risk_grade,
     summary,
     dev_wallet_analysis,

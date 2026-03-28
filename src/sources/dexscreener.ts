@@ -40,6 +40,9 @@ export interface DexScreenerPair {
     h24?: { buys: number; sells: number };
   };
   pairCreatedAt?: number;
+  info?: {
+    liquidityToken?: { address: string } | null;
+  } | null;
 }
 
 export interface DexScreenerTokenData {
@@ -58,6 +61,8 @@ export interface DexScreenerTokenData {
   buy_sell_ratio_1h: number | null;
   /** Unix ms timestamp of pair creation (proxy for token age) */
   pair_created_at_ms: number | null;
+  /** LP token mint address from the best pair; null if unavailable */
+  lp_mint_address: string | null;
 }
 
 /**
@@ -132,6 +137,7 @@ export async function getDexScreenerToken(
       price_change_24h_pct: null,
       buy_sell_ratio_1h: null,
       pair_created_at_ms: null,
+      lp_mint_address: null,
     };
   }
 
@@ -160,5 +166,6 @@ export async function getDexScreenerToken(
     price_change_24h_pct,
     buy_sell_ratio_1h,
     pair_created_at_ms: best.pairCreatedAt ?? null,
+    lp_mint_address: best.info?.liquidityToken?.address ?? null,
   };
 }

@@ -181,6 +181,113 @@ export async function getTokenMintInfo(
   }
 }
 
+// Solana burn addresses — LP tokens sent here are permanently locked/burned
+const BURN_ADDRESSES = new Set([
+  "1nc1nerator11111111111111111111111111111111",
+  "11111111111111111111111111111111",
+]);
+
+/**
+ * Check whether the LP token for a pool has been burned.
+ *
+ * Calls getTokenLargestAccounts on the LP mint and checks whether any of the
+ * top holders is a known burn address. Returns:
+ *   true  — LP is burned (one or more accounts at a burn address)
+ *   false — LP is NOT burned (no burn address found in top holders)
+ *   null  — Unable to determine (RPC failure or LP mint unavailable)
+ */
+export async function checkLPBurned(
+  lpMintAddress: string,
+  options: { timeout?: number } = {}
+): Promise<boolean | null> {
+  if (!isAvailable("helius_rpc")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const start = Date.now();
+
+  type SingleResponse = { id: number; result?: any; error?: any };
+
+  const result = await rpcWithRetry<SingleResponse>(
+    (endpoint) => rpcPost<SingleResponse>(endpoint, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getTokenLargestAccounts",
+      params: [lpMintAddress],
+    }, timeout)
+  );
+
+  if (!result) {
+    recordSourceResult("helius", false, Date.now() - start);
+    return null;
+  }
+
+  try {
+    const accounts: Array<{ address: string; amount: string }> = result?.result?.value ?? [];
+    if (!Array.isArray(accounts) || accounts.length === 0) return null;
+
+    recordSourceResult("helius", true, Date.now() - start);
+    const burned = accounts.some((a) => BURN_ADDRESSES.has(a.address));
+    return burned;
+  } catch {
+    recordSourceResult("helius", false, Date.now() - start);
+    return null;
+  }
+}
+
+/**
+ * Estimate wallet age in days by finding its oldest transaction signature.
+ *
+ * Fetches up to 2 batches of 1000 signatures (oldest-first walk) to find the
+ * first transaction. Returns null on any RPC failure.
+ */
+export async function getWalletAgeDays(
+  walletAddress: string,
+  options: { timeout?: number } = {}
+): Promise<number | null> {
+  const timeout = options.timeout ?? 5000;
+
+  type SingleResponse = { id: number; result?: any; error?: any };
+
+  // Batch 1: fetch most recent 1000 signatures, then jump to the oldest
+  const batch1 = await rpcWithRetry<SingleResponse>(
+    (endpoint) => rpcPost<SingleResponse>(endpoint, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getSignaturesForAddress",
+      params: [walletAddress, { limit: 1000 }],
+    }, timeout)
+  );
+
+  if (!batch1) return null;
+
+  const sigs1: Array<{ signature: string; blockTime?: number | null }> = batch1?.result ?? [];
+  if (!Array.isArray(sigs1) || sigs1.length === 0) return null;
+
+  let oldestSig = sigs1[sigs1.length - 1];
+
+  // If we got a full page there may be older txs — fetch one more batch before it
+  if (sigs1.length === 1000) {
+    const batch2 = await rpcWithRetry<SingleResponse>(
+      (endpoint) => rpcPost<SingleResponse>(endpoint, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "getSignaturesForAddress",
+        params: [walletAddress, { limit: 1000, before: oldestSig.signature }],
+      }, timeout)
+    );
+
+    if (batch2) {
+      const sigs2: Array<{ signature: string; blockTime?: number | null }> = batch2?.result ?? [];
+      if (Array.isArray(sigs2) && sigs2.length > 0) {
+        oldestSig = sigs2[sigs2.length - 1];
+      }
+    }
+  }
+
+  if (oldestSig.blockTime == null) return null;
+  return (Date.now() / 1000 - oldestSig.blockTime) / 86_400;
+}
+
 export async function getTokenInfo(
   address: string,
   options: { timeout?: number } = {}

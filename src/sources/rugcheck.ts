@@ -11,6 +11,7 @@ export interface RugCheckResult {
   has_rug_history: boolean;
   bundled_launch_detected: boolean;
   rugcheck_risk_score: number | null;
+  single_holder_danger: boolean;
   insider_flags: boolean;
   /** Seconds since the RugCheck report was generated. -1 if no timestamp found. */
   report_age_seconds: number;
@@ -121,6 +122,10 @@ export async function getRugCheckSummary(
       r.description?.toLowerCase().includes("bundl")
   );
 
+  const single_holder_danger = risks.some(
+    (r) => r.name === "Single holder ownership" && r.level === "danger"
+  );
+
   const insider_flags = risks.some(
     (r) =>
       r.name?.toLowerCase().includes("insider") ||
@@ -142,6 +147,7 @@ export async function getRugCheckSummary(
     has_rug_history,
     bundled_launch_detected,
     rugcheck_risk_score,
+    single_holder_danger,
     insider_flags,
     report_age_seconds,
     top_10_holder_pct,

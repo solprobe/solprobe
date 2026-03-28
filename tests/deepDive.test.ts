@@ -44,6 +44,7 @@ function makeFetch({
     topHolders: Array.from({ length: 10 }, (_, i) => ({
       address: `addr${i}${"1".repeat(37)}`, pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
     })),
+    score: 0,
     risks: [],
     rugged: false,
   },
@@ -85,6 +86,9 @@ describe("deepDive", () => {
       is_honeypot:              expect.any(Boolean),
       mint_authority_revoked:   expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
+      lp_burned:                expect.toBeOneOf([true, false, null]),
+      rugcheck_risk_score:      expect.toBeOneOf([expect.any(Number), null]),
+      single_holder_danger:     expect.any(Boolean),
       risk_grade:               expect.stringMatching(/^[ABCDF]$/),
       recommendation:           expect.stringMatching(/^(BUY|AVOID|WATCH|DYOR)$/),
       momentum_score:           expect.any(Number),
@@ -110,7 +114,7 @@ describe("deepDive", () => {
           topHolders: Array.from({ length: 10 }, (_, i) => ({
             address: `addr${i}${"1".repeat(37)}`, pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
           })),
-          risks: [], rugged: false,
+          score: 0, risks: [], rugged: false,
         });
       }
       if (u.includes("dexscreener")) return fakeResponse({}, 500);
@@ -132,6 +136,7 @@ describe("deepDive", () => {
         mintAuthority: null,
         freezeAuthority: null,
         topHolders: [],
+        score: 0,
         risks: [],
         rugged: true, // rug history
       },

@@ -43,9 +43,9 @@ TypeScript throughout. Node.js 22+, ESM modules.
 
 | Service | Price | SLA | LLM call |
 |---|---|---|---|
-| `sol_quick_scan` | $0.02 | < 5s | Haiku — `summary` field only |
-| `sol_wallet_risk` | $0.02 | < 10s | None — deterministic output |
-| `sol_market_intel` | $0.05 | < 10s | None — deterministic output |
+| `sol_quick_scan` | $0.05 | < 5s | Haiku — `summary` field only |
+| `sol_wallet_risk` | $0.10 | < 20s | Haiku — `risk_summary` field only |
+| `sol_market_intel` | $0.10 | < 10s | Haiku — `market_summary` field only |
 | `sol_deep_dive` | $0.50 | < 30s | Sonnet — `full_risk_report` only |
 
 ---
@@ -153,15 +153,27 @@ solprobe/
 ```
 
 ### `sol_wallet_risk`
+
+> **Rebuilt service** — $0.10 / 20s SLA. Real behavioural signals derived from
+> actual transaction history, not shallow RPC metadata.
+
 ```typescript
 {
   wallet_age_days: number;
   total_transactions: number;
-  is_bot: boolean;
-  rug_involvement_count: number;
-  whale_status: boolean;
-  risk_score: number;                   // 0–100
-  trading_style: "sniper" | "hodler" | "flipper" | "bot" | "unknown";
+  tokens_traded_30d: number;            // unique tokens traded in last 30 days
+  win_rate_pct: number | null;          // % of closed positions with profitable exit
+  avg_hold_time_hours: number | null;   // mean hold time across closed positions
+  sniper_score: number;                 // 0–100: how often in first 20 buyers at launch
+  rug_exit_rate_pct: number | null;     // % of dead tokens they sold before collapse
+  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW"; // was wallet funded from deployer/mixer?
+  pnl_estimate_30d_usdc: number | null; // rough realised PnL last 30 days
+  largest_single_loss_usdc: number | null;
+  is_bot: boolean;                      // high-frequency, uniform amounts
+  whale_status: boolean;                // >$50k portfolio or >$10k single trades
+  trading_style: "sniper" | "hodler" | "flipper" | "bot" | "degen" | "unknown";
+  risk_score: number;                   // 0–100 counterparty risk
+  risk_summary: string;                 // one sentence, Haiku or deterministic fallback
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
@@ -179,6 +191,7 @@ solprobe/
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;          // txs > $10k
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  market_summary: string;               // LLM (Haiku) or deterministic fallback
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 ```
@@ -242,8 +255,11 @@ safety-critical fields.
 │  mint_authority_revoked     ← getAccountInfo (MintLayout)   │
 │  freeze_authority_revoked   ← getAccountInfo (MintLayout)   │
 │  top_10_holder_pct          ← getTokenLargestAccounts       │
+│  lp_burned                  ← getTokenLargestAccounts on LP │
 │  dev_wallet_address         ← getAsset (Metaplex DAS)       │
+│  dev_wallet_age_days        ← getSignaturesForAddress       │
 │  dev_wallet_sol_balance     ← getBalance                    │
+│  dev_token_count            ← getSignaturesForAddress       │
 │  pump_fun_launched          ← creator program ID check      │
 │  token_age_days             ← first tx signature            │
 └─────────────────────────────────────────────────────────────┘
@@ -253,9 +269,13 @@ safety-critical fields.
 │                                                             │
 │  has_rug_history            ← cross-token flagged DB        │
 │  bundled_launch_detected    ← proprietary launch analysis   │
-│  rugcheck_risk_score        ← their aggregate score         │
+│  rugcheck_risk_score        ← aggregate score (not rugged!) │
+│  single_holder_danger       ← parsed from risks[] array     │
 │  insider_flags              ← insider trading detection     │
 │  report_age_seconds         ← tracked for confidence only   │
+│                                                             │
+│  NOTE: .rugged boolean is null on free tier — use .score    │
+│  NOTE: parse risks[] for danger-level single holder signals │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -307,6 +327,219 @@ not revoked). Never default to `true`.
 
 The `RugCheckResult` interface must NOT contain `mint_authority_revoked` or
 `freeze_authority_revoked`. These fields must never come from RugCheck.
+
+### LP Burn Check (`src/sources/helius.ts`)
+
+Checks whether the liquidity pool tokens have been burned. An unburned LP means
+the creator can rug at any moment. Pump.fun burns LP by default; Raydium does not.
+
+The check: call `getTokenLargestAccounts` on the LP mint address. If the single
+largest holder is a known burn/dead address, the LP is burned. If it is the creator
+wallet or any non-burn address, it is not burned.
+
+Known Solana burn addresses:
+```typescript
+const BURN_ADDRESSES = new Set([
+  "1nc1nerator11111111111111111111111111111111",
+  "11111111111111111111111111111111",          // system program (zero address)
+  "So11111111111111111111111111111111111111112", // sometimes used as burn
+]);
+```
+
+```typescript
+export async function checkLPBurned(
+  lpMintAddress: string,
+  connection: Connection
+): Promise<boolean | null> {
+  try {
+    const pubkey = new PublicKey(lpMintAddress);
+    const holders = await connection.getTokenLargestAccounts(pubkey);
+    if (!holders.value.length) return null;
+
+    // LP is burned if the top holder is a burn/dead address
+    const topHolder = holders.value[0];
+    const ownerInfo = await connection.getAccountInfo(topHolder.address);
+    // If account has no data or is owned by system program it's effectively burned
+    return BURN_ADDRESSES.has(topHolder.address.toBase58()) ||
+           (ownerInfo === null);
+  } catch {
+    return null;
+  }
+}
+```
+
+**On null return:** treat LP as not burned (conservative — worst case). Apply penalty.
+**This call runs in parallel** with other Helius calls in `Promise.allSettled()`.
+**LP mint address source:** DexScreener returns the LP mint in pool data. Extract it
+from `pairs[0].liquidity.base` or equivalent. If not available, skip the check.
+
+### Creator Wallet Age (`src/sources/helius.ts`)
+
+A fresh wallet creating a token is one of the strongest rug predictors. Check when
+the creator wallet first appeared on-chain using `getSignaturesForAddress` with a
+`limit: 1` and `before: undefined` to get the oldest transaction.
+
+```typescript
+export async function getWalletAgeDays(
+  walletAddress: string,
+  connection: Connection
+): Promise<number | null> {
+  try {
+    const pubkey = new PublicKey(walletAddress);
+    // Get the very last (oldest) signature — use 'before' pagination
+    // Fetch in batches until we hit the end
+    let before: string | undefined;
+    let oldestSig: string | null = null;
+
+    // Limit to 2 batches max to stay within SLA — good enough approximation
+    for (let i = 0; i < 2; i++) {
+      const sigs = await connection.getSignaturesForAddress(pubkey, {
+        limit: 1000,
+        before,
+      });
+      if (!sigs.length) break;
+      oldestSig = sigs[sigs.length - 1].signature;
+      if (sigs.length < 1000) break; // reached the beginning
+      before = sigs[sigs.length - 1].signature;
+    }
+
+    if (!oldestSig) return null;
+    const tx = await connection.getTransaction(oldestSig, { maxSupportedTransactionVersion: 0 });
+    if (!tx?.blockTime) return null;
+
+    const ageMs = Date.now() - tx.blockTime * 1000;
+    return Math.floor(ageMs / (1000 * 60 * 60 * 24));
+  } catch {
+    return null;
+  }
+}
+```
+
+**SLA note:** This call is only used in `sol_deep_dive` (30s SLA). Do NOT call
+`getWalletAgeDays` in `sol_quick_scan` (5s SLA) — it is too slow for the quick path.
+For quick scan, use only the signals already available in parallel (RugCheck, DexScreener,
+Helius mint info, top holders).
+
+---
+
+## Wallet Risk Scanner (`src/scanner/walletRisk.ts`)
+
+> **Rebuilt service** — $0.10 / 20s SLA. Real behavioural signals from parsed
+> transaction history. Not shallow RPC metadata heuristics.
+
+### Data sources
+
+| Source | Call | Data extracted |
+|---|---|---|
+| Helius RPC | `getSignaturesForAddress` (last 200 txs) | Total tx count, wallet age |
+| Helius Enhanced API | `getAssetsByOwner` | Current token holdings, portfolio value |
+| Helius Enhanced API | parsed transactions | Buy/sell events, amounts, tokens |
+| DexScreener | price lookups on traded tokens | PnL estimation per position |
+| Public RPC | `getAccountInfo` | SOL balance, funding wallet trace |
+
+All calls run in parallel via `Promise.allSettled()`. Timeout per call: 8000ms.
+Total budget: 18s (leaving 2s for LLM prose generation).
+
+### Signal definitions
+
+**`win_rate_pct`**
+Percentage of closed token positions (bought then sold) where the exit price
+exceeded the entry price. Only calculated when ≥5 closed positions exist.
+Null when insufficient history.
+
+**`sniper_score` (0–100)**
+How frequently this wallet appears in the first 20 buyers of a new token launch.
+Derived by cross-referencing buy timestamps against token creation time from
+DexScreener. 0 = never sniped, 100 = always among first buyers.
+High sniper score is a red flag for counterparty risk — snipers dump on retail.
+
+**`rug_exit_rate_pct`**
+Of all tokens this wallet traded that subsequently died (liquidity < $100 within
+30 days of the wallet's last trade), what % did the wallet sell before collapse.
+High rate = experienced rug trader. Low rate = victim. Null when insufficient data.
+
+**`funding_wallet_risk`**
+Checks the wallet that initially funded this wallet (SOL transfer chain).
+HIGH = funded by a known token deployer or fresh wallet chain
+MEDIUM = funded by an exchange withdrawal or aged wallet
+LOW = funded by a well-established wallet with long history
+
+**`trading_style` classification rules**
+```
+"bot"     → >500 txs/day avg OR uniform trade amounts within 1% variance
+"sniper"  → sniper_score > 60 AND avg_hold_time_hours < 2
+"flipper" → avg_hold_time_hours < 24 AND tokens_traded_30d > 20
+"hodler"  → avg_hold_time_hours > 168 (7 days) AND tokens_traded_30d < 5
+"degen"   → high tx count, diverse tokens, low win rate (<40%)
+"unknown" → insufficient data (<10 closed positions)
+```
+
+**`risk_score` (0–100, higher = riskier counterparty)**
+
+| Signal | Impact |
+|---|---|
+| `sniper_score > 70` | +25 |
+| `sniper_score > 40` | +15 |
+| `win_rate_pct > 80` | +10 (suspiciously good — likely insider) |
+| `rug_exit_rate_pct > 80` | +20 (consistently exits before rugs) |
+| `funding_wallet_risk === HIGH` | +20 |
+| `wallet_age_days < 7` | +20 |
+| `wallet_age_days < 30` | +10 |
+| `is_bot === true` | +15 |
+| `whale_status && sniper_score > 40` | +15 |
+
+Score floored at 0, capped at 100.
+
+### LLM prompt (Haiku)
+
+```typescript
+export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
+  const prompt = `Summarise the counterparty risk profile of this Solana wallet 
+in exactly one sentence. Be direct and specific. Use the data below.
+
+Wallet age: ${data.wallet_age_days ?? "unknown"} days
+Trading style: ${data.trading_style}
+Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}
+Sniper score: ${data.sniper_score}/100
+Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "unknown"}
+Funding risk: ${data.funding_wallet_risk}
+Risk score: ${data.risk_score}/100
+Is bot: ${data.is_bot}
+30d PnL estimate: ${data.pnl_estimate_30d_usdc != null ? "$" + data.pnl_estimate_30d_usdc.toFixed(0) : "unknown"}
+
+Output one sentence only. Example: "High-conviction sniper with 73% win rate 
+and consistent pre-rug exits — treat as informed adversary, not organic trader."`;
+
+  return callWithFallback("fast", WALLET_RISK_SYSTEM, prompt, 80);
+}
+
+const WALLET_RISK_SYSTEM = `You are a DeFi counterparty risk analyst. 
+Output exactly one sentence assessing wallet risk. Never hedge or use 
+qualifiers like "appears to" or "may be". Be specific and direct.`;
+```
+
+### Deterministic fallback
+
+```typescript
+export function fallbackWalletRiskSummary(data: WalletRiskData): string {
+  const style = data.trading_style;
+  const risk = data.risk_score > 70 ? "high" : data.risk_score > 40 ? "moderate" : "low";
+  const age = data.wallet_age_days != null ? `${data.wallet_age_days}d old` : "age unknown";
+  return `${style.charAt(0).toUpperCase() + style.slice(1)} wallet (${age}) — ${risk} counterparty risk score ${data.risk_score}/100.`;
+}
+```
+
+### SLA budget (20s total)
+
+```
+0–8s:   Parallel Helius + DexScreener calls (all via Promise.allSettled)
+8–16s:  Signal calculation (synchronous, fast)
+16–18s: Haiku LLM call (or Groq fallback)
+18–20s: Response assembly and return
+```
+
+If Helius enhanced transaction parsing takes >12s (large wallet), fall back
+to basic metadata only and set `data_confidence: "LOW"`. Never blow the SLA.
 
 ---
 
@@ -795,24 +1028,45 @@ Penalties marked **[exempt skip]** are bypassed entirely for authority-exempt to
 (stablecoins and wrapped assets identified by Jupiter tags). All other
 penalties apply regardless of exempt status.
 
-| Condition | Penalty | Exempt skip |
-|---|---|---|
-| `mint_authority_revoked === false` or null | -25 | ✅ yes |
-| `freeze_authority_revoked === false` or null | -15 | ✅ yes |
-| `top_10_holder_pct > 95%` or null | -35 | ✅ yes |
-| `top_10_holder_pct > 80%` | -20 | ✅ yes |
-| `liquidity_usd < $1k` or null | -35 | ❌ no |
-| `liquidity_usd < $10k` | -20 | ❌ no |
-| `bundled_launch === true` | -20 | ❌ no |
-| `buy_sell_ratio < 0.5` | -10 | ❌ no |
-| `token_age_days === null` | -10 | ❌ no |
-| `token_age_days < 1` | -15 | ❌ no |
+| Condition | Penalty | Exempt skip | Service |
+|---|---|---|---|
+| `mint_authority_revoked === false` or null | -25 | ✅ yes | both |
+| `freeze_authority_revoked === false` or null | -15 | ✅ yes | both |
+| `top_10_holder_pct > 90%` or null | -35 | ✅ yes | both |
+| `top_10_holder_pct > 60%` | -20 | ✅ yes | both |
+| `lp_burned === false` or null | -25 | ❌ no | both |
+| `rugcheck_risk_score > 5000` | -30 | ❌ no | both |
+| `rugcheck_risk_score > 2000` | -20 | ❌ no | both |
+| `rugcheck_risk_score > 1000` | -10 | ❌ no | both |
+| `single_holder_danger === true` | -25 | ❌ no | both |
+| `liquidity_usd < $1k` or null | -35 | ❌ no | both |
+| `liquidity_usd < $10k` | -20 | ❌ no | both |
+| `bundled_launch === true` | -20 | ❌ no | both |
+| `buy_sell_ratio < 0.5` | -10 | ❌ no | both |
+| `token_age_days === null` | -10 | ❌ no | both |
+| `token_age_days < 1` | -15 | ❌ no | both |
+| `dev_wallet_age_days < 7` | -20 | ❌ no | deep only |
+| `dev_wallet_age_days < 1` | -30 | ❌ no | deep only |
+
+**Why concentration thresholds are lower than standard:**
+Memecoin trading is the primary use case. A token where a single wallet holds 70%
+is dangerous regardless of whether that wallet is the dev — it can dump at any time.
+The original 80% threshold missed real rugs like HAWK (71.7% concentration, grade A).
+60% and 90% thresholds are more appropriate for the memecoin risk profile.
+
+**Why RugCheck risk score is used as a penalty:**
+RugCheck’s `rugged` boolean field is unreliable on the free tier — it is null for
+most tokens including confirmed rugs, as it requires manual review. The numeric
+`score` field is always populated and reflects the aggregate of all risk signals
+RugCheck detects (insider ownership, bundled launch, concentration etc).
+A score above 5000 is extreme danger territory. HAWK scored 5909.
+
+Note: RugCheck risk score penalties stack with concentration penalties.
 
 **Why concentration is also exempt-skipped:** For stablecoins and wrapped assets,
 large holdings by institutional custodians (Circle treasury, Tether reserves, bridge
 programs) are by design and carry no rug risk. When `top_10_holder_pct` is null for
-USDC (Helius cannot meaningfully rank billions of micro-accounts), the null-defaults-
-to-100% worst-case assumption is incorrect and produces a misleading grade.
+USDC, the null-defaults-to-100% worst-case assumption is incorrect.
 
 **Implementation:**
 
@@ -822,32 +1076,57 @@ export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false
 
   let score = 100;
 
-  // Authority penalties — skipped for exempt tokens
+  // Authority penalties — skipped for exempt tokens (stablecoins, wrapped assets)
   if (!exempt) {
     if (!factors.mint_authority_revoked)  score -= 25;
     if (!factors.freeze_authority_revoked) score -= 15;
   }
 
   // Concentration penalty — skipped for exempt tokens
-  // Stablecoin/wrapped asset reserves held by custodians are not rug risk
+  // Thresholds: 60%/90% (lower than standard to catch memecoin risk like HAWK)
   if (!exempt) {
     const holderPct = factors.top_10_holder_pct ?? 100;
-    if (holderPct > 95) score -= 35;
-    else if (holderPct > 80) score -= 20;
+    if (holderPct > 90) score -= 35;
+    else if (holderPct > 60) score -= 20;
   }
 
-  // Liquidity penalties — always apply
+  // LP burn penalty — never skipped
+  // Unburned LP = creator can rug at any moment
+  // null treated as not burned (conservative worst-case)
+  if (factors.lp_burned === false || factors.lp_burned === null) score -= 25;
+
+  // RugCheck risk score penalty — never skipped
+  // Use numeric score, not the unreliable rugged boolean (null on free tier)
+  if (factors.rugcheck_risk_score !== null && factors.rugcheck_risk_score !== undefined) {
+    if (factors.rugcheck_risk_score > 5_000) score -= 30;
+    else if (factors.rugcheck_risk_score > 2_000) score -= 20;
+    else if (factors.rugcheck_risk_score > 1_000) score -= 10;
+  }
+
+  // Single holder danger from RugCheck risks array — never skipped
+  if (factors.single_holder_danger) score -= 25;
+
+  // Liquidity penalties — never skipped
   const liq = factors.liquidity_usd ?? 0;
   if (liq < 1_000) score -= 35;
   else if (liq < 10_000) score -= 20;
 
-  // Launch and trading penalties — always apply
+  // Launch and trading penalties — never skipped
   if (factors.bundled_launch) score -= 20;
   if (factors.buy_sell_ratio !== null && factors.buy_sell_ratio < 0.5) score -= 10;
 
-  // Age penalties — always apply
+  // Token age penalties — never skipped
   if (factors.token_age_days === null) score -= 10;
   else if (factors.token_age_days < 1) score -= 15;
+
+  // Creator wallet age penalties — deep dive only (null for quick scan)
+  if (factors.dev_wallet_age_days !== null) {
+    if (factors.dev_wallet_age_days < 1) score -= 30;
+    else if (factors.dev_wallet_age_days < 7) score -= 20;
+  }
+
+  // Floor at 0 — score cannot go negative
+  score = Math.max(0, score);
 
   // Grade bands
   if (score >= 80) return "A";
@@ -857,6 +1136,46 @@ export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false
   return "F";
 }
 ```
+
+**`RiskFactors` interface — complete:**
+
+```typescript
+interface RiskFactors {
+  // Authority flags (Helius only)
+  mint_authority_revoked: boolean | null;
+  freeze_authority_revoked: boolean | null;
+
+  // Concentration (Helius only)
+  top_10_holder_pct: number | null;
+
+  // LP burn status (Helius via LP mint — both services)
+  lp_burned: boolean | null;             // null = unknown, treat as not burned
+
+  // RugCheck signals (historical, staleness acceptable)
+  has_rug_history: boolean;
+  bundled_launch: boolean;
+  rugcheck_risk_score: number | null;    // .score field — always populated
+  single_holder_danger: boolean;         // parsed from risks[] — "danger" level
+
+  // Market data (DexScreener)
+  liquidity_usd: number | null;
+  buy_sell_ratio: number | null;
+
+  // Time signals (Helius)
+  token_age_days: number | null;
+
+  // Creator wallet signals (Helius — deep dive only, null for quick scan)
+  dev_wallet_age_days: number | null;
+}
+```
+
+**Field sources:**
+- `rugcheck_risk_score` → RugCheck response `.score` (always a number)
+- `single_holder_danger` → parse `.risks[]`, true if any entry has
+  `name === "Single holder ownership"` and `level === "danger"`
+- `lp_burned` → Helius `checkLPBurned()` on the LP mint from DexScreener pool data
+- `dev_wallet_age_days` → Helius `getWalletAgeDays()` on creator wallet address
+  (deep dive only — too slow for 5s quick scan SLA)
 
 ### Grade bands
 80–100 → A | 60–79 → B | 40–59 → C | 20–39 → D | 0–19 → F | rug history → F
@@ -886,11 +1205,30 @@ export function scoreConfidence(
 
 ## LLM Narrative Engine (`src/llm/narrativeEngine.ts`)
 
-Only `sol_quick_scan` and `sol_deep_dive` get LLM calls.
-`sol_wallet_risk` and `sol_market_intel` produce deterministic structured outputs — no LLM.
+All four services now include an LLM-generated prose field. Data collection and
+scoring always completes first — the LLM only synthesises results into prose.
 
-The LLM receives the fully assembled, scored result. All data collection and grading
-happens first. The LLM only converts the result into analyst-quality prose.
+| Service | LLM field | Model | Rationale |
+|---|---|---|---|
+| `sol_quick_scan` | `summary` | Haiku | Fast safety verdict, 5s SLA requires small model |
+| `sol_wallet_risk` | `risk_summary` | Haiku | Synthesises 8+ behavioural signals into counterparty verdict |
+| `sol_market_intel` | `market_summary` | Haiku | Turns structured signals into actionable trading context |
+| `sol_deep_dive` | `full_risk_report` | Sonnet | Full analyst narrative, 30s SLA allows premium model |
+
+**Why LLM for wallet_risk:** Eight numeric signals (win rate, sniper score, PnL,
+hold time, rug exit rate, funding risk, bot flag, trading style) are hard for a
+buyer agent to synthesise from raw numbers. A one-sentence verdict like
+"High-conviction sniper with 73% win rate and no rug involvement — low counterparty
+risk" is directly actionable. Haiku cost is ~$0.0003, acceptable at $0.10 price.
+
+**Why LLM for market_intel:** "BULLISH, HIGH buy_pressure, LOW sell_pressure,
+$2.3M 1h volume" requires the buyer agent to synthesise signals itself. Haiku
+converts this to "Strong buying momentum with elevated volume — 3× above 24h
+average, large wallet accumulation detected" which plugs directly into a trading
+agent's decision context without extra processing.
+
+The LLM receives the fully assembled result. All data collection happens first.
+The LLM only converts results into prose.
 
 ### Provider cascade
 
@@ -1082,11 +1420,52 @@ export function fallbackDeepReport(r: DeepDiveData): string {
 }
 ```
 
+### Market Intel LLM prompt (Haiku)
+
+```typescript
+export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
+  const prompt = `Summarise market conditions for this Solana token in one sentence.
+Be direct and actionable for a trading agent making a pre-trade decision.
+
+Price: $${data.current_price_usd}
+1h change: ${data.price_change_1h_pct?.toFixed(2) ?? "?"}%
+24h change: ${data.price_change_24h_pct?.toFixed(2) ?? "?"}%
+1h volume: $${(data.volume_1h_usd / 1000).toFixed(0)}k
+24h volume: $${(data.volume_24h_usd / 1000).toFixed(0)}k
+Buy pressure: ${data.buy_pressure}
+Sell pressure: ${data.sell_pressure}
+Large txs (>$10k) last hour: ${data.large_txs_last_hour}
+Signal: ${data.signal}
+
+Output one sentence only. Example: "Bullish momentum with $2.3M 1h volume 
+(3× daily average) and large wallet accumulation — strong pre-breakout setup."`;
+
+  return callWithFallback("fast", MARKET_INTEL_SYSTEM, prompt, 80);
+}
+
+const MARKET_INTEL_SYSTEM = `You are a crypto market analyst. Output exactly 
+one sentence summarising market conditions and their implication for a trade. 
+Never hedge. Be specific with numbers.`;
+```
+
+Deterministic fallback for market_intel:
+```typescript
+export function fallbackMarketIntelSummary(data: MarketIntelData): string {
+  const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
+  const vol = data.volume_1h_usd != null ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
+  return `${dir} signal — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure.`;
+}
+```
+
 ### SLA rules
 
 - `sol_quick_scan` 5s SLA: LLM runs sequentially after all parallel fetches.
   If elapsed time exceeds 4.2s before the LLM call starts, skip both providers
   and use `fallbackQuickSummary` directly. Log the skip.
+- `sol_wallet_risk` 20s SLA: Parallel Helius calls complete by ~8s. LLM budget
+  is 18s from request start. If exceeded, use `fallbackWalletRiskSummary`.
+- `sol_market_intel` 10s SLA: LLM runs after DexScreener/Birdeye fetches complete.
+  If elapsed time exceeds 9s, skip LLM and use `fallbackMarketIntelSummary`.
 - `sol_deep_dive` 30s SLA: Sonnet call has comfortable headroom. If Anthropic
   fails and Groq also fails within budget, use `fallbackDeepReport`. Log both
   failures and the fallback reason.
@@ -1286,7 +1665,7 @@ export async function requestPayment(requirements: any): Promise<string> {
 | Service | URL | Timeout | Validated field |
 |---|---|---|---|
 | `sol_quick_scan` | `/scan/quick` | `10_000` | `token_address` |
-| `sol_wallet_risk` | `/wallet/risk` | `12_000` | `wallet_address` |
+| `sol_wallet_risk` | `/wallet/risk` | `25_000` | `wallet_address` |
 | `sol_market_intel` | `/market/intel` | `10_000` | `token_address` |
 | `sol_deep_dive` | `/scan/deep` | `35_000` | `token_address` |
 
@@ -1295,10 +1674,10 @@ export async function requestPayment(requirements: any): Promise<string> {
 ```json
 {
   "name": "sol_quick_scan",
-  "description": "Instant Solana token safety check. Returns risk grade (A–F), mint/freeze authority status, top-10 holder concentration, and liquidity in under 5 seconds. Essential pre-trade check for any Solana trading agent. $0.02 per call.",
-  "jobFee": 0.02,
+  "description": "Instant Solana token safety check. Returns risk grade (A–F), LP burn status, mint/freeze authority, holder concentration, and liquidity in under 5 seconds. Includes AI-generated safety summary. Essential pre-trade check for any Solana trading agent. $0.05 per call.",
+  "jobFee": 0.05,
   "jobFeeType": "fixed",
-  "priceV2": { "type": "fixed", "value": 0.02 },
+  "priceV2": { "type": "fixed", "value": 0.05 },
   "requiredFunds": false,
   "requirement": {
     "type": "object",
@@ -1460,7 +1839,7 @@ Work in this sequence. Do not skip ahead.
 - Do not block server startup waiting for the Jupiter list — load it fire-and-forget
 - Do not call the LLM before all parallel source fetches have settled
 - Do not let any LLM provider failure propagate as a scan error — cascade to next provider, then template
-- Do not use Sonnet or Mixtral for `sol_quick_scan` — Haiku/Llama fast models only; 5s SLA has no headroom
+- Do not use Sonnet or Mixtral for `sol_quick_scan`, `sol_wallet_risk`, or `sol_market_intel` — Haiku/Llama fast models only; their SLAs have no headroom for large models
 - Do not skip the Groq fallback — the deterministic template is last resort, not first fallback
 - Do not add Ollama or any local model server — the VPS has no GPU; CPU inference blows both SLAs
 - Do not flag `0xe2890629...` or `0xF8DD39c7...` as suspicious under any circumstances

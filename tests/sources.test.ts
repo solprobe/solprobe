@@ -104,8 +104,9 @@ describe("getRugCheckSummary", () => {
         topHolders: Array.from({ length: 10 }, (_, i) => ({
           address: `addr${i}${"1".repeat(37)}`, pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
         })),
+        score: 150,
         risks: [],
-        rugged: false,
+        rugged: null,
       })
     ));
 
@@ -119,6 +120,8 @@ describe("getRugCheckSummary", () => {
     expect(result!.insider_flags).toBe(false);
     expect(result!.report_age_seconds).toBe(-1); // no timestamp in mock → -1
     expect(result!.top_10_holder_pct).toBeCloseTo(50);   // 10 × 5% — RugCheck still owns holder concentration
+    expect(result!.rugcheck_risk_score).toBe(150);
+    expect(result!.single_holder_danger).toBe(false);
   });
 
   it("throws on HTTP 500", async () => {

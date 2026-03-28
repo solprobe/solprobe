@@ -2,6 +2,11 @@ import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexsc
 import { getBirdeyeToken, type BirdeyeTokenData } from "../sources/birdeye.js";
 import { scoreConfidence } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
+import {
+  generateMarketIntelSummary,
+  fallbackMarketIntelSummary,
+  type MarketIntelData,
+} from "../llm/narrativeEngine.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -18,6 +23,7 @@ export interface MarketIntelResult {
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;  // txs > $10k (estimated from volume/count)
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  market_summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
 
@@ -134,6 +140,28 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   ].filter((s): s is string => s !== null);
   const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
+  // LLM summary — skip if SLA headroom exhausted
+  const llmInput: MarketIntelData = {
+    current_price_usd,
+    price_change_1h_pct,
+    price_change_24h_pct,
+    volume_1h_usd,
+    volume_24h_usd,
+    buy_pressure,
+    sell_pressure,
+    large_txs_last_hour,
+    signal,
+  };
+
+  let market_summary: string;
+  const elapsed = Date.now() - fetchStart;
+  if (elapsed >= 9_000) {
+    console.warn(`[marketIntel] skipping LLM summary — elapsed ${elapsed}ms exceeds 9000ms`);
+    market_summary = fallbackMarketIntelSummary(llmInput);
+  } else {
+    market_summary = await generateMarketIntelSummary(llmInput);
+  }
+
   return {
     current_price_usd,
     price_change_1h_pct,
@@ -145,6 +173,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     sell_pressure,
     large_txs_last_hour,
     signal,
+    market_summary,
     data_confidence,
   };
 }

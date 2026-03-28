@@ -44,14 +44,14 @@ export const RETRY_CONFIG = {
     timeoutMs: 4_000,
   },
   sol_wallet_risk: {
-    attempts: 3,
+    attempts: 1,
     delayMs: 500,
-    timeoutMs: 6_000,
+    timeoutMs: 25_000,
   },
   sol_market_intel: {
-    attempts: 3,
+    attempts: 1,
     delayMs: 400,
-    timeoutMs: 5_000,
+    timeoutMs: 15_000,
   },
   sol_deep_dive: {
     attempts: 3,
