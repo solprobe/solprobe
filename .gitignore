@@ -52,6 +52,3 @@ npm-debug.log*
 .DS_Store
 src/.DS_Store
 
-#qc tests
-qc_smoke.sh
-
