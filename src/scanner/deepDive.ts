@@ -6,7 +6,7 @@ import { getSolscanMeta } from "../sources/solscan.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress } from "../constants.js";
-import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
+import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import {
   generateDeepDiveReport,
   fallbackDeepReport,
@@ -275,9 +275,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
   };
-  const authority_exempt = isAuthorityExempt(address);
-  const authority_exempt_reason = getExemptReason(address);
-  const risk_grade = calculateRiskGrade(factors, address);
+  const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
+  const risk_grade = calculateRiskGrade(factors, authority_exempt);
 
   // ── Deep-only signals ─────────────────────────────────────────────────────
   const pump_fun_launched = dexData?.pairs.some((p) =>

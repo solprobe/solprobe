@@ -2,7 +2,7 @@ import { getDexScreenerToken } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo } from "../sources/helius.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
-import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
+import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateQuickScanSummary,
@@ -91,10 +91,9 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     token_age_days,
   };
 
-  const authority_exempt = isAuthorityExempt(address);
-  const authority_exempt_reason = getExemptReason(address);
+  const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
 
-  const risk_grade = calculateRiskGrade(factors, address);
+  const risk_grade = calculateRiskGrade(factors, authority_exempt);
 
   // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
