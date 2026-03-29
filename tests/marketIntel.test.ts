@@ -199,14 +199,15 @@ describe("marketIntel", () => {
   // -------------------------------------------------------------------------
 
   it("returns BEARISH + LOW confidence for HAWK-like rugged token", async () => {
-    // Low volume (LOW_ACTIVITY) + 95% below ATH → classic rugged token
+    // Low volume (LOW_ACTIVITY) — BEARISH regardless of ATH data:
+    // null ATH (no Birdeye key in CI) and deeply negative ATH both trigger the override
     vi.stubGlobal("fetch", makeFetchMock({
       volume_24h: 5_000,
       liquidity: 20_000,
       buy_sell_ratio: 0.5,
       price_change_1h: 0,
       price_change_24h: 0,
-      ohlcv_items: [{ h: 1.0 }, { h: 0.5 }], // ATH = 1.0, current ≈ 0.000012 → ~-99.999%
+      ohlcv_items: [{ h: 1.0 }, { h: 0.5 }], // ATH = 1.0, current ≈ 0.000012 → ~-99.999% (when key is set)
     }));
     const result = await marketIntel(TOKEN);
     expect(result.token_health).toBe("LOW_ACTIVITY");

@@ -88,7 +88,7 @@ function deriveSignal(
   pct_from_ath: number | null
 ): "BULLISH" | "BEARISH" | "NEUTRAL" {
   if (health === "DEAD" || health === "ILLIQUID") return "BEARISH";
-  if (health === "LOW_ACTIVITY" && pct_from_ath !== null && pct_from_ath < -80) {
+  if (health === "LOW_ACTIVITY" && (pct_from_ath === null || pct_from_ath < -80)) {
     return "BEARISH";
   }
   if (health === "DECLINING" && rawSignal === "NEUTRAL") return "BEARISH";

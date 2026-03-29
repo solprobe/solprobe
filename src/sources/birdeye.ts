@@ -91,7 +91,7 @@ export async function getTokenOHLCV(
   options: { timeout: number }
 ): Promise<{ ath_price_usd: number; candles: number } | null> {
   const apiKey = process.env.BIRDEYE_API_KEY;
-  if (!apiKey) return null;
+  // Key is optional — if missing, fetch will return 401 and we return null gracefully
   if (!isAvailable("birdeye")) return null;
 
   const start = Date.now();
@@ -99,10 +99,13 @@ export async function getTokenOHLCV(
   const timeTo   = Math.floor(Date.now() / 1000);
   const url = `${OHLCV_URL}?address=${encodeURIComponent(address)}&type=1D&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
 
+  const headers: Record<string, string> = { Accept: "application/json", "x-chain": "solana" };
+  if (apiKey) headers["X-API-KEY"] = apiKey;
+
   let res: Response;
   try {
     res = await fetch(url, {
-      headers: { "X-API-KEY": apiKey, Accept: "application/json", "x-chain": "solana" },
+      headers,
       signal: AbortSignal.timeout(options.timeout),
     });
   } catch (err) {
