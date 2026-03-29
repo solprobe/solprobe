@@ -318,6 +318,8 @@ export interface MarketIntelData {
   sell_pressure: string;
   large_txs_last_hour: number;
   signal: string;
+  token_health?: string;
+  pct_from_ath?: number | null;
 }
 
 export function fallbackMarketIntelSummary(data: MarketIntelData): string {
@@ -328,7 +330,11 @@ export function fallbackMarketIntelSummary(data: MarketIntelData): string {
 
 export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
   const system =
-    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. Never hedge. Be specific with numbers.";
+    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. If the token is DEAD or ILLIQUID, lead with that fact. If pct_from_ath is worse than -80%, flag this as a likely rugged token. Never hedge. Be specific with numbers.";
+
+  const athLine = data.pct_from_ath != null
+    ? `Down ${Math.abs(data.pct_from_ath).toFixed(0)}% from ATH.`
+    : "";
 
   const userMsg = [
     `Price: $${data.current_price_usd}.`,
@@ -339,7 +345,9 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
     `Buy pressure: ${data.buy_pressure}. Sell pressure: ${data.sell_pressure}.`,
     `Large txs (>$10k) last hour: ${data.large_txs_last_hour}.`,
     `Signal: ${data.signal}.`,
-  ].join(" ");
+    data.token_health ? `Token health: ${data.token_health}.` : "",
+    athLine,
+  ].filter(Boolean).join(" ");
 
   const result = await callWithFallback("fast", 80, system, userMsg);
   return result || fallbackMarketIntelSummary(data);

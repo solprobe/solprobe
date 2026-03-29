@@ -39,6 +39,34 @@ TypeScript throughout. Node.js 22+, ESM modules.
 
 ---
 
+## Development Verification Rules
+
+These rules apply to every task involving external API data mapping.
+Claude Code must follow them without being asked.
+
+### API field verification (mandatory before mapping)
+Before mapping any field from an external API response, verify the actual
+field name and value against a live API call. Never assume field names from
+documentation alone — they drift.
+
+For every new field added to a source client (rugcheck.ts, dexscreener.ts,
+helius.ts etc), Claude Code must:
+
+1. Run a live curl against the actual endpoint and pipe through jq to confirm
+   the field exists and contains the expected value type
+2. Print the field path and value in a comment above the mapping line
+3. If the field is null or missing in the live response, note the fallback
+
+Example — before writing:
+  rugcheck_risk_score: raw.score ?? null,
+
+Claude Code must first run:
+  curl -s "https://api.rugcheck.xyz/v1/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/report/summary" | jq '{score, normalizedScore}'
+
+And confirm which field contains the real aggregate value before mapping.
+ 
+---
+
 ## Services
 
 | Service | Price | SLA | LLM call |
@@ -191,6 +219,9 @@ solprobe/
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;          // txs > $10k
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
+  pct_from_ath: number | null;          // % below all-time high (negative = below ATH)
+  ath_price_usd: number | null;         // ATH price from Birdeye OHLCV history
   market_summary: string;               // LLM (Haiku) or deterministic fallback
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
 }
@@ -284,7 +315,180 @@ safety-critical fields.
 │  liquidity_usd    price_usd    volume_24h                   │
 │  price_change_24h_pct    buy_sell_ratio    large_txs        │
 └─────────────────────────────────────────────────────────────┘
+
+> **NEW — Birdeye OHLCV** is now also used as a primary source for ATH
+> detection in `sol_market_intel`. This requires a Birdeye API key set as
+> `BIRDEYE_API_KEY` in `.env`. Without the key, `pct_from_ath` returns null.
+
+## Birdeye OHLCV (`src/sources/birdeye.ts`)
+
+Used in `sol_market_intel` to fetch all-time high price and detect dead/rugged tokens.
+
+**Endpoint:** `GET https://public-api.birdeye.so/defi/ohlcv`
+
+**Required header:** `X-API-KEY: {BIRDEYE_API_KEY}`
+
+**Parameters:**
+
+| Param | Value | Notes |
+|---|---|---|
+| `address` | token mint address | base58 |
+| `type` | `1D` | daily candles — covers full token history |
+| `time_from` | unix timestamp | token creation or 2 years ago, whichever is later |
+| `time_to` | `Math.floor(Date.now() / 1000)` | current time |
+| `chain` | `solana` | always solana for SolProbe |
+
+**Response shape** (what matters for ATH detection):
+```typescript
+{
+  success: boolean,
+  data: {
+    items: Array<{
+      o: number,          // open
+      h: number,          // high — use this for ATH calculation
+      l: number,          // low
+      c: number,          // close
+      v: number,          // volume
+      unixTime: number,   // candle timestamp
+      address: string,
+    }>
+  }
+}
 ```
+
+**Implementation in `src/sources/birdeye.ts`:**
+
+```typescript
+export async function getTokenOHLCV(
+  address: string,
+  options: { timeout: number }
+): Promise<{ ath_price_usd: number; candles: number } | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null; // graceful degradation — no key, skip ATH
+
+  if (!isAvailable("birdeye")) return null;
+
+  try {
+    const timeFrom = Math.floor(Date.now() / 1000) - (365 * 2 * 24 * 60 * 60); // 2 years
+    const timeTo   = Math.floor(Date.now() / 1000);
+
+    const url = `https://public-api.birdeye.so/defi/ohlcv` +
+      `?address=${address}&type=1D&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
+
+    const res = await fetch(url, {
+      headers: { "X-API-KEY": apiKey },
+      signal: AbortSignal.timeout(options.timeout),
+    });
+
+    if (!res.ok) throw new Error(`Birdeye OHLCV ${res.status}`);
+
+    const data = await res.json();
+    const items = data?.data?.items ?? [];
+
+    if (!items.length) {
+      recordSuccess("birdeye");
+      return null;
+    }
+
+    // ATH = highest "h" (high) value across all daily candles
+    const ath_price_usd = Math.max(...items.map((c: any) => c.h ?? 0));
+    recordSuccess("birdeye");
+    return { ath_price_usd, candles: items.length };
+  } catch (err) {
+    recordFailure("birdeye");
+    return null;
+  }
+}
+```
+
+**Circuit breaker:** wrap with existing `isAvailable("birdeye")` and
+`recordSuccess/recordFailure("birdeye")` — already defined in circuitBreaker.ts.
+
+**Rate limit:** Birdeye free tier allows 100 req/min on OHLCV. Add to token bucket:
+```typescript
+birdeye: 100 req/min
+```
+
+**Timeout:** 4000ms. Runs in parallel with DexScreener in marketIntel.ts.
+If Birdeye fails or key is missing, `pct_from_ath` and `ath_price_usd` return null.
+This is graceful degradation — market intel still works without Birdeye.
+
+**Environment variable to add to `.env`:**
+```
+BIRDEYE_API_KEY=   # get free key at bds.birdeye.so
+```
+
+---
+
+## Token Health Classification (`src/scanner/marketIntel.ts`)
+
+Applied after all sources settle. These rules override the buy/sell ratio signal
+when volume or liquidity conditions make the ratio statistically meaningless.
+
+```typescript
+function classifyTokenHealth(data: {
+  volume_24h_usd: number | null;
+  liquidity_usd: number | null;
+  price_change_1h_pct: number | null;
+  price_change_24h_pct: number | null;
+}): "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD" {
+  const vol   = data.volume_24h_usd ?? 0;
+  const liq   = data.liquidity_usd  ?? 0;
+  const ch1h  = data.price_change_1h_pct  ?? 0;
+  const ch24h = data.price_change_24h_pct ?? 0;
+
+  if (vol < 1_000 || liq < 1_000)  return "DEAD";
+  if (liq < 5_000)                  return "ILLIQUID";
+  if (vol < 10_000)                 return "LOW_ACTIVITY";
+  if (ch1h < -5 && ch24h < -20)    return "DECLINING";
+  return "ACTIVE";
+}
+```
+
+**Signal override rules** — applied after `classifyTokenHealth()`:
+
+```typescript
+function deriveSignal(
+  rawSignal: "BULLISH" | "BEARISH" | "NEUTRAL",
+  health: string,
+  pct_from_ath: number | null
+): "BULLISH" | "BEARISH" | "NEUTRAL" {
+  // Dead/illiquid tokens are always BEARISH — buy/sell ratio is noise
+  if (health === "DEAD" || health === "ILLIQUID") return "BEARISH";
+
+  // Low activity + sustained price decline = BEARISH regardless of ratio
+  if (health === "LOW_ACTIVITY" && pct_from_ath !== null && pct_from_ath < -80) {
+    return "BEARISH";
+  }
+
+  // Declining tokens override NEUTRAL to BEARISH
+  if (health === "DECLINING" && rawSignal === "NEUTRAL") return "BEARISH";
+
+  return rawSignal;
+}
+```
+
+**data_confidence override:**
+
+| token_health | data_confidence cap |
+|---|---|
+| `DEAD` | `LOW` — always, regardless of source count |
+| `ILLIQUID` | `LOW` |
+| `LOW_ACTIVITY` | `MEDIUM` at best |
+| `DECLINING` | no cap — real data |
+| `ACTIVE` | no cap |
+
+**pct_from_ath calculation:**
+```typescript
+const pct_from_ath = (ath_price_usd !== null && current_price_usd > 0)
+  ? ((current_price_usd - ath_price_usd) / ath_price_usd) * 100  // always negative
+  : null;
+```
+
+A token 95% below ATH with LOW_ACTIVITY is almost certainly rugged.
+A token 30% below ATH with ACTIVE health is in a normal correction.
+
+---
 
 RugCheck staleness is acceptable for its owned fields because rug history,
 bundled launches, and insider flags are historical events — they do not change
@@ -1769,14 +1973,20 @@ module.exports = {
 
 1. **`quickScan.test.ts`** — BONK (good), known rug (F grade), verify response shape,
    verify `isValidSolanaAddress` rejects garbage, verify USDC grades A/B with
-   `authority_exempt: true`
-2. **`sources.test.ts`** — mock all APIs, verify 200/429/500 handling, verify parallel
-   fetching runs concurrently, verify Helius always called for authority flags,
-   verify Jupiter list returns exempt=true for stablecoin tags
+   `authority_exempt: true`. **Mock rule:** always set `lp_burned: true` for healthy
+   token mocks — null triggers the -25 worst-case penalty and will fail grade A assertions.
+2. **`sources.test.ts`** — mock all APIs using real API response shapes (copy from live curl).
+   Verify 200/429/500 handling, verify parallel fetching runs concurrently, verify Helius
+   always called for authority flags, verify Jupiter list returns exempt=true for stablecoin tags.
+   RugCheck mock must include `score: 5909` and `risks: [{name: "Single holder ownership", level: "danger"}]`.
+   Birdeye OHLCV mock must include `data.items` array with `h` field on each candle.
 3. **`deepDive.test.ts`** — `recommendation` never undefined, `momentum_score` always 0–100,
    protocol addresses not flagged as suspicious
 4. **`circuitBreaker.test.ts`** — CLOSED→OPEN after 5 failures, OPEN rejects immediately,
    OPEN→HALF_OPEN after cooldown, HALF_OPEN→CLOSED on success
+5. **`marketIntel.test.ts`** (new) — verify token_health classification rules, verify signal
+   override (DEAD → BEARISH regardless of buy/sell ratio), verify pct_from_ath calculation,
+   verify HAWK-like token (low volume + 95% below ATH) returns BEARISH + LOW confidence
 
 ---
 
@@ -1788,6 +1998,11 @@ HELIUS_API_KEY=
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 PORT=8000
 LOG_LEVEL=info
+
+# Birdeye OHLCV — for ATH detection in sol_market_intel
+# Free key at bds.birdeye.so — required for pct_from_ath field
+# Without this key, pct_from_ath returns null (service still works)
+BIRDEYE_API_KEY=
 
 # LLM narrative layer — at least one must be set or all calls fall to template
 ANTHROPIC_API_KEY=sk-ant-...   # primary provider
@@ -1849,6 +2064,11 @@ Work in this sequence. Do not skip ahead.
 - Do not share cache TTLs across services — each has a different staleness budget
 - Do not return an object from `requestPayment` — plain string only
 - Do not return a raw object from `executeJob` — must be `{ deliverable: JSON.stringify(result) }`
+- Do not write test mocks with invented field values — copy real API response shapes from live curl calls
+- Do not set `lp_burned: null` in test mocks for healthy tokens — use `lp_burned: true`; null triggers the worst-case penalty
+- Do not skip Birdeye OHLCV when `BIRDEYE_API_KEY` is missing — gracefully return null for `pct_from_ath`, do not error
+- Do not write test mocks with invented field values — copy real API response shapes from live curl calls
+- Do not set `lp_burned: null` in test mocks for healthy tokens — use `lp_burned: true`; null triggers the worst-case penalty
 - Do not suppress errors after 3 genuine retries — an honest error is correct
 - Do not modify `/root/virtuals-acp/` files unless explicitly asked
 - Do not add PM2 watchdog under the existing `solprobe` or `acp-seller` process names

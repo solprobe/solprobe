@@ -284,8 +284,12 @@ describe("parallel fetching", () => {
     const DELAY_MS = 80; // each source takes 80 ms
 
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: string) => {
-      await sleep(DELAY_MS);
       const u = String(url);
+      // LLM endpoints — return immediately so only source-fetch parallelism is measured
+      if (u.includes("anthropic.com") || u.includes("groq.com")) {
+        return fakeResponse({ content: [] });
+      }
+      await sleep(DELAY_MS);
       if (u.includes("dexscreener")) {
         return fakeResponse({ pairs: solanaPath() });
       }

@@ -2,6 +2,7 @@ import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js"
 import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://public-api.birdeye.so/defi/token_overview";
+const OHLCV_URL = "https://public-api.birdeye.so/defi/ohlcv";
 
 export interface BirdeyeTokenData {
   price_usd: number | null;
@@ -83,4 +84,47 @@ export async function getBirdeyeToken(
     price_change_1h_pct: d.priceChange1hPercent ?? null,
     price_change_24h_pct: d.priceChange24hPercent ?? null,
   };
+}
+
+export async function getTokenOHLCV(
+  address: string,
+  options: { timeout: number }
+): Promise<{ ath_price_usd: number; candles: number } | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const start = Date.now();
+  const timeFrom = Math.floor(Date.now() / 1000) - 365 * 2 * 24 * 60 * 60; // 2 years
+  const timeTo   = Math.floor(Date.now() / 1000);
+  const url = `${OHLCV_URL}?address=${encodeURIComponent(address)}&type=1D&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "X-API-KEY": apiKey, Accept: "application/json", "x-chain": "solana" },
+      signal: AbortSignal.timeout(options.timeout),
+    });
+  } catch (err) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  const data = await res.json() as { data?: { items?: Array<{ h?: number }> } };
+  const items = data?.data?.items ?? [];
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  recordSuccess("birdeye");
+
+  if (!items.length) return null;
+
+  const ath_price_usd = Math.max(...items.map((c) => c.h ?? 0));
+  return { ath_price_usd, candles: items.length };
 }

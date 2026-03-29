@@ -32,7 +32,9 @@ function makeFetchMock(overrides: {
   if (freezeAuthority !== null) mintBuf.writeUInt32LE(1, 46); // active freeze authority
   const base64Mint = mintBuf.toString("base64");
 
-  return vi.fn().mockImplementation(async (url: string) => {
+  const LP_MINT = "FakeLPMint1111111111111111111111111111111111";
+
+  return vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
     const u = String(url);
 
     if (u.includes("dexscreener")) {
@@ -49,6 +51,7 @@ function makeFetchMock(overrides: {
           liquidity: { usd: liquidity },
           txns: { h1: { buys: 200, sells: 100 }, h24: { buys: 2000, sells: 1000 } },
           pairCreatedAt: Date.now() - 400 * 86_400_000, // 400 days old
+          info: { liquidityToken: { address: LP_MINT } },
         }],
       });
     }
@@ -68,7 +71,14 @@ function makeFetchMock(overrides: {
       });
     }
 
-    // Helius / public RPC — return base64 SPL Token mint layout (Helius owns authority flags)
+    // Helius / public RPC — differentiate by method
+    const body = JSON.parse((init?.body as string) ?? "{}");
+    if (body.method === "getTokenLargestAccounts") {
+      // LP mint is burned — top holder is a burn address
+      return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
+    }
+
+    // Default: return base64 SPL Token mint layout (Helius owns authority flags)
     return fakeResponse({
       id: 1,
       result: {
