@@ -5,7 +5,7 @@ import { getBirdeyeToken } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
-import { isProtocolAddress } from "../constants.js";
+import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import {
   generateDeepDiveReport,
@@ -245,12 +245,24 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? mintAuthAddress
     : null;
 
+  // Infer launch program from dexId heuristic (no Helius getAsset call here yet).
+  // When creatorProgramId is wired from Helius getAsset, replace inferredProgramId
+  // with the real value and drop this heuristic.
+  const inferredProgramId = dexData?.pairs.some((p) =>
+    p.dexId?.toLowerCase().includes("pump")
+  ) ? PROGRAMS.PUMP_FUN : null;
+  const launchedFromLPBurnPad = inferredProgramId
+    ? isLPBurnLaunchpad(inferredProgramId)
+    : false;
+
   const [lpBurnResult, walletAgeResult] = await Promise.allSettled([
-    lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null),
+    launchedFromLPBurnPad
+      ? Promise.resolve(true as boolean | null)
+      : (lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null)),
     devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 5000 }) : Promise.resolve(null),
   ]);
 
-  const lp_burned        = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
+  const lp_burned           = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
 
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
@@ -301,9 +313,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const risk_grade = calculateRiskGrade(factors, authority_exempt);
 
   // ── Deep-only signals ─────────────────────────────────────────────────────
-  const pump_fun_launched = dexData?.pairs.some((p) =>
-    p.dexId?.toLowerCase().includes("pump")
-  ) ?? false;
+  const pump_fun_launched = inferredProgramId === PROGRAMS.PUMP_FUN;
 
   // ── Dev wallet analysis ───────────────────────────────────────────────────
   let dev_wallet_analysis: DevWalletAnalysis;

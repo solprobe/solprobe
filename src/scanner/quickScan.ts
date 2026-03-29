@@ -3,6 +3,7 @@ import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned } from "../sources/helius.js";
 import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
+import { isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateQuickScanSummary,
@@ -61,7 +62,19 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   // ── Phase 2: LP burn check — requires LP mint from phase 1 ───────────────
   const lpMint = dexData?.lp_mint_address ?? null;
-  const lp_burned = lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null;
+  // quickScan does not call Helius getAsset, so no creatorProgramId is available.
+  // Infer the launch program from the dexId heuristic and gate on LP_BURN_LAUNCHPADS.
+  // When Helius getAsset is wired up here, replace inferredProgramId with the
+  // real creatorProgramId and drop the heuristic entirely.
+  const inferredProgramId = dexData?.pairs.some((p) =>
+    p.dexId?.toLowerCase().includes("pump")
+  ) ? PROGRAMS.PUMP_FUN : null;
+  const launchedFromLPBurnPad = inferredProgramId
+    ? isLPBurnLaunchpad(inferredProgramId)
+    : false;
+  const lp_burned = launchedFromLPBurnPad
+    ? true
+    : (lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null);
 
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   // On null (RPC failure), default to false (conservative — treat as not revoked).

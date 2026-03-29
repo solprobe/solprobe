@@ -37,3 +37,30 @@ export const PROGRAMS = {
   RAYDIUM_AMM_V4:    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
   ORCA_WHIRLPOOL:    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
 } as const;
+
+// ---------------------------------------------------------------------------
+// LP-burning launchpads
+// ---------------------------------------------------------------------------
+// Programs that burn LP tokens at launch by default. Tokens created through
+// these programs always have burned LP — the -25 lp_burned penalty must not
+// apply.
+//
+// IMPORTANT: only add a program after confirming it burns LP by default.
+// Verify via Helius getAsset on a known token from that launchpad and check
+// that the LP largest-account holder is a burn address.
+// ---------------------------------------------------------------------------
+
+export const LP_BURN_LAUNCHPADS = new Set([
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  // pump.fun — confirmed
+  // "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",  // launch.coinlaunch — UNVERIFIED, do not uncomment until confirmed
+  // "BonkLaunchpadProgrm11111111111111111111111111",   // bonk launchpad    — UNVERIFIED, do not uncomment until confirmed
+  // "MoonShotTokenLaunchpad111111111111111111111111",  // moonshot           — UNVERIFIED, do not uncomment until confirmed
+]);
+
+/**
+ * Returns true if the given Solana program ID is a known launchpad that burns
+ * LP tokens at launch by default.
+ */
+export function isLPBurnLaunchpad(programId: string): boolean {
+  return LP_BURN_LAUNCHPADS.has(programId);
+}
