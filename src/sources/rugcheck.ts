@@ -102,7 +102,7 @@ export async function getRugCheckSummary(
   }
 
   // ── Risk score ─────────────────────────────────────────────────────────────
-  const rugcheck_risk_score = raw.score_normalised ?? raw.score ?? null;
+  const rugcheck_risk_score = raw.score ?? null;
 
   // ── Rug history ─────────────────────────────────────────────────────────────
   const has_rug_history = raw.rugged === true;

@@ -49,7 +49,7 @@ export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false
 
   // LP burn — only penalise when explicitly detected as not burned (false)
   // null = unknown = no penalty (conservative: don't penalise lack of data)
-  if (factors.lp_burned === false) score -= 25;
+  if (factors.lp_burned === false || factors.lp_burned === null) score -= 25;
 
   // Liquidity
   const liq = factors.liquidity_usd ?? 0;
