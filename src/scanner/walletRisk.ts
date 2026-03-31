@@ -1,5 +1,7 @@
 import { deduplicate, getOrFetch } from "../cache.js";
 import { getDexScreenerToken } from "../sources/dexscreener.js";
+import { calculateConfidence, confidenceToString } from "./riskScorer.js";
+import type { ScoringFactor } from "./types.js";
 import {
   generateWalletRiskSummary,
   fallbackWalletRiskSummary,
@@ -27,6 +29,10 @@ export interface WalletRiskResult {
   risk_score: number;
   risk_summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  /** Structured breakdown of all scoring contributors */
+  factors: ScoringFactor[];
+  /** 0.0–1.0 numeric confidence score */
+  confidence: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +328,66 @@ function computeRiskScore(
   if (whaleStatus && sniperScore > 40) score += 15;
 
   return Math.max(0, Math.min(100, score));
+}
+
+function buildWalletFactors(
+  walletAgeDays: number | null,
+  sniperScore: number,
+  winRatePct: number | null,
+  rugExitRatePct: number | null,
+  fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW",
+  isBot: boolean,
+  whaleStatus: boolean
+): ScoringFactor[] {
+  const sf: ScoringFactor[] = [];
+
+  if (sniperScore > 70) {
+    sf.push({ name: "sniper_score", value: sniperScore, impact: 25, interpretation: "high sniper score — likely insider" });
+  } else if (sniperScore > 40) {
+    sf.push({ name: "sniper_score", value: sniperScore, impact: 15, interpretation: "elevated sniper score" });
+  } else {
+    sf.push({ name: "sniper_score", value: sniperScore, impact: 0, interpretation: "low sniper activity" });
+  }
+
+  if (winRatePct !== null && winRatePct > 80) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: 10, interpretation: "suspiciously high win rate — possible insider" });
+  } else {
+    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: winRatePct !== null ? "normal win rate" : "win rate unavailable" });
+  }
+
+  if (rugExitRatePct !== null && rugExitRatePct > 80) {
+    sf.push({ name: "rug_exit_rate", value: rugExitRatePct, impact: 20, interpretation: "consistently exits before rugs" });
+  } else {
+    sf.push({ name: "rug_exit_rate", value: rugExitRatePct, impact: 0, interpretation: rugExitRatePct !== null ? "normal rug exit rate" : "rug exit rate unavailable" });
+  }
+
+  if (fundingWalletRisk === "HIGH") {
+    sf.push({ name: "funding_wallet_risk", value: fundingWalletRisk, impact: 20, interpretation: "funded by deployer or fresh wallet chain" });
+  } else {
+    sf.push({ name: "funding_wallet_risk", value: fundingWalletRisk, impact: 0, interpretation: `funding wallet risk: ${fundingWalletRisk.toLowerCase()}` });
+  }
+
+  if (walletAgeDays !== null && walletAgeDays < 7) {
+    sf.push({ name: "wallet_age", value: walletAgeDays, impact: 20, interpretation: "very fresh wallet — high risk" });
+  } else if (walletAgeDays !== null && walletAgeDays < 30) {
+    sf.push({ name: "wallet_age", value: walletAgeDays, impact: 10, interpretation: "young wallet — elevated risk" });
+  } else {
+    sf.push({ name: "wallet_age", value: walletAgeDays, impact: 0, interpretation: walletAgeDays !== null ? `aged wallet (${Math.round(walletAgeDays)}d)` : "wallet age unknown" });
+  }
+
+  if (isBot) {
+    sf.push({ name: "is_bot", value: isBot, impact: 15, interpretation: "bot-like trading detected" });
+  } else {
+    sf.push({ name: "is_bot", value: isBot, impact: 0, interpretation: "no bot pattern detected" });
+  }
+
+  if (whaleStatus && sniperScore > 40) {
+    sf.push({ name: "whale_sniper", value: true, impact: 15, interpretation: "whale + sniper — adversarial counterparty" });
+  } else {
+    sf.push({ name: "whale_sniper", value: false, impact: 0, interpretation: "no whale+sniper combination" });
+  }
+
+  return sf;
 }
 
 // ---------------------------------------------------------------------------
@@ -634,10 +700,23 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     parsedTxs !== null,
   ].filter(Boolean).length;
 
-  let data_confidence: "HIGH" | "MEDIUM" | "LOW";
-  if (callsOk >= 4 && totalTx >= 20) data_confidence = "HIGH";
-  else if (callsOk >= 2 || totalTx >= 20) data_confidence = "MEDIUM";
-  else data_confidence = "LOW";
+  const confidence = calculateConfidence({
+    sources_available: callsOk,
+    sources_total: 4,
+    data_age_ms: Date.now() - fetchStart,
+  });
+  const data_confidence = confidenceToString(confidence);
+
+  // ── Scoring factors ───────────────────────────────────────────────────────
+  const factors = buildWalletFactors(
+    walletAgeDays,
+    sniperScore,
+    winRatePct,
+    null,
+    fundingWalletRisk,
+    isBot,
+    whaleStatus
+  );
 
   // ── LLM summary ───────────────────────────────────────────────────────────
   const elapsed = Date.now() - fetchStart;
@@ -681,5 +760,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     risk_score: riskScore,
     risk_summary,
     data_confidence,
+    factors,
+    confidence,
   };
 }

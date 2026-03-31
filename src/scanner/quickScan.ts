@@ -1,7 +1,14 @@
-import { getDexScreenerToken } from "../sources/dexscreener.js";
+import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned } from "../sources/helius.js";
-import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
+import {
+  calculateRiskGrade,
+  scoreConfidence,
+  calculateConfidence,
+  confidenceToString,
+  buildHistoricalFlags,
+  type RiskFactors,
+} from "./riskScorer.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import { isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { deduplicate, getOrFetch } from "../cache.js";
@@ -10,6 +17,7 @@ import {
   fallbackQuickSummary,
   type QuickScanData,
 } from "../llm/narrativeEngine.js";
+import type { ScoringFactor, HistoricalFlag } from "./types.js";
 
 export interface QuickScanResult {
   is_honeypot: boolean;
@@ -18,10 +26,14 @@ export interface QuickScanResult {
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
   lp_burned: boolean | null;
+  lp_model: LPModel;
+  lp_status: LPStatus;
+  dex_id: string | null;
   rugcheck_risk_score: number | null;
   single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
+  /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
   rugcheck_report_age_seconds: number | null;
@@ -29,6 +41,12 @@ export interface QuickScanResult {
   authority_exempt: boolean;
   /** Human-readable reason for the exemption, or null when not exempt. */
   authority_exempt_reason: string | null;
+  /** Structured breakdown of all scoring contributors */
+  factors: ScoringFactor[];
+  /** 0.0–1.0 numeric confidence score */
+  confidence: number;
+  /** Historical event flags derived from source data */
+  historical_flags: HistoricalFlag[];
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -61,20 +79,29 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   if (mintResult.status === "rejected") logError("helius_rpc",  mintResult.reason,  address);
 
   // ── Phase 2: LP burn check — requires LP mint from phase 1 ───────────────
-  const lpMint = dexData?.lp_mint_address ?? null;
+  const lp_model = dexData?.lp_model ?? "UNKNOWN";
+  const dex_id   = dexData?.dex_id   ?? null;
+  const lpMint   = dexData?.lp_mint_address ?? null;
+
+  // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
   // quickScan does not call Helius getAsset, so no creatorProgramId is available.
   // Infer the launch program from the dexId heuristic and gate on LP_BURN_LAUNCHPADS.
   // When Helius getAsset is wired up here, replace inferredProgramId with the
   // real creatorProgramId and drop the heuristic entirely.
-  const inferredProgramId = dexData?.pairs.some((p) =>
-    p.dexId?.toLowerCase().includes("pump")
-  ) ? PROGRAMS.PUMP_FUN : null;
-  const launchedFromLPBurnPad = inferredProgramId
-    ? isLPBurnLaunchpad(inferredProgramId)
-    : false;
-  const lp_burned = launchedFromLPBurnPad
-    ? true
-    : (lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null);
+  let lp_burned: boolean | null = null;
+  if (lp_model !== "CLMM_DLMM") {
+    const inferredProgramId = dexData?.pairs.some((p) =>
+      p.dexId?.toLowerCase().includes("pump")
+    ) ? PROGRAMS.PUMP_FUN : null;
+    const launchedFromLPBurnPad = inferredProgramId
+      ? isLPBurnLaunchpad(inferredProgramId)
+      : false;
+    lp_burned = launchedFromLPBurnPad
+      ? true
+      : (lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null);
+  }
+
+  const lp_status = deriveLPStatus(lp_burned, lp_model);
 
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   // On null (RPC failure), default to false (conservative — treat as not revoked).
@@ -100,7 +127,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     token_age_days = (Date.now() - dexData.pair_created_at_ms) / (1000 * 60 * 60 * 24);
   }
 
-  const factors: RiskFactors = {
+  const riskFactors: RiskFactors = {
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
@@ -112,12 +139,15 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
     single_holder_danger: rugData?.single_holder_danger ?? false,
     lp_burned,
+    lp_model,
+    lp_status,
+    dex_id,
     dev_wallet_age_days: null, // quickScan never fetches this
   };
 
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
 
-  const risk_grade = calculateRiskGrade(factors, authority_exempt);
+  const { grade: risk_grade, scoringFactors } = calculateRiskGrade(riskFactors, authority_exempt);
 
   // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
@@ -125,7 +155,22 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     rugData  !== null ? "rugcheck"    : null,
     mintData !== null ? "helius"      : null,
   ].filter((s): s is string => s !== null);
-  const data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
+
+  const data_age_ms = Date.now() - fetchStart;
+  const confidence = calculateConfidence({
+    sources_available: sources.length,
+    sources_total: 3,
+    data_age_ms,
+    rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
+  });
+  const data_confidence = confidenceToString(confidence);
+
+  // ── Historical flags ───────────────────────────────────────────────────────
+  const historical_flags = buildHistoricalFlags({
+    has_rug_history,
+    bundled_launch: riskFactors.bundled_launch,
+    single_holder_danger: riskFactors.single_holder_danger,
+  });
 
   // ── LLM summary — sequential, after all parallel fetches complete ──────────
   const llmInputData: QuickScanData = {
@@ -139,6 +184,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     has_rug_history,
     authority_exempt,
     authority_exempt_reason,
+    factors: scoringFactors,
   };
 
   let summary: string;
@@ -158,13 +204,19 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     top_10_holder_pct,
     liquidity_usd,
     lp_burned,
-    rugcheck_risk_score: factors.rugcheck_risk_score,
-    single_holder_danger: factors.single_holder_danger,
+    lp_model,
+    lp_status,
+    dex_id,
+    rugcheck_risk_score: riskFactors.rugcheck_risk_score,
+    single_holder_danger: riskFactors.single_holder_danger,
     risk_grade,
     summary,
     data_confidence,
     rugcheck_report_age_seconds,
     authority_exempt,
     authority_exempt_reason,
+    factors: scoringFactors,
+    confidence,
+    historical_flags,
   };
 }

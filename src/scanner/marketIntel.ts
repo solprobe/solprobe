@@ -1,12 +1,13 @@
 import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
 import { getBirdeyeToken, getTokenOHLCV, type BirdeyeTokenData } from "../sources/birdeye.js";
-import { scoreConfidence } from "./riskScorer.js";
+import { scoreConfidence, calculateConfidence, confidenceToString } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateMarketIntelSummary,
   fallbackMarketIntelSummary,
   type MarketIntelData,
 } from "../llm/narrativeEngine.js";
+import type { ScoringFactor, SignalSubtype } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -23,11 +24,17 @@ export interface MarketIntelResult {
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;  // txs > $10k (estimated from volume/count)
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  signal_subtype: SignalSubtype;
   token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
   pct_from_ath: number | null;          // % below all-time high (negative = below ATH)
   ath_price_usd: number | null;         // ATH price from Birdeye OHLCV history
   market_summary: string;
+  /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  /** 0.0–1.0 numeric confidence score */
+  confidence: number;
+  /** Structured breakdown of signal contributors */
+  factors: ScoringFactor[];
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +102,33 @@ function deriveSignal(
   return rawSignal;
 }
 
+function deriveSignalSubtype(data: {
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
+  volume_24h_usd: number;
+  price_change_1h_pct: number;
+  price_change_24h_pct: number;
+  pct_from_ath: number | null;
+  buy_pressure: "HIGH" | "MEDIUM" | "LOW";
+  sell_pressure: "HIGH" | "MEDIUM" | "LOW";
+}): SignalSubtype {
+  const ch1h  = data.price_change_1h_pct;
+  const ch24h = data.price_change_24h_pct;
+  const ath   = data.pct_from_ath;
+
+  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
+    return (ath !== null && ath < -80) ? "POST_RUG_STAGNATION" : "NO_VOLUME_ACTIVITY";
+  }
+  if (data.token_health === "LOW_ACTIVITY") return "NO_VOLUME_ACTIVITY";
+  if (ch1h > 20 && data.buy_pressure === "HIGH" && data.sell_pressure === "LOW") return "EARLY_PUMP";
+  if (data.sell_pressure === "HIGH" && ch24h < -10 && data.volume_24h_usd > 10_000) return "DISTRIBUTION_PHASE";
+  if (ath !== null && ath < -80 && data.volume_24h_usd < 50_000) return "POST_RUG_STAGNATION";
+  if (Math.abs(ch1h) > 30) return "HIGH_SPECULATION";
+  if (data.signal === "BEARISH" && data.token_health === "ACTIVE") return "NORMAL_CORRECTION";
+  if (data.signal === "BULLISH" && data.buy_pressure !== "LOW") return "ORGANIC_GROWTH";
+  return "NONE";
+}
+
 /**
  * Estimate number of transactions > $10k last hour.
  * DexScreener doesn't expose individual tx sizes; we approximate using
@@ -112,6 +146,122 @@ function estimateLargeTxs(
   if (avgSize >= 10000) return totalTxns;
   if (avgSize >= 1000) return Math.floor(totalTxns * avgSize / 10000);
   return 0;
+}
+
+/**
+ * Build market intel factors array from signal contributors.
+ * Every factor that influences the signal must appear here.
+ */
+function buildMarketFactors(data: {
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  signal_subtype: SignalSubtype;
+  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
+  buy_pressure: "HIGH" | "MEDIUM" | "LOW";
+  sell_pressure: "HIGH" | "MEDIUM" | "LOW";
+  volume_1h_usd: number;
+  volume_24h_usd: number;
+  price_change_1h_pct: number;
+  price_change_24h_pct: number;
+  liquidity_usd: number;
+  pct_from_ath: number | null;
+  large_txs_last_hour: number;
+}): ScoringFactor[] {
+  const sf: ScoringFactor[] = [];
+
+  // Token health
+  const healthImpact =
+    data.token_health === "DEAD" ? -40 :
+    data.token_health === "ILLIQUID" ? -30 :
+    data.token_health === "LOW_ACTIVITY" ? -15 :
+    data.token_health === "DECLINING" ? -10 : 0;
+  sf.push({
+    name: "token_health",
+    value: data.token_health,
+    impact: healthImpact,
+    interpretation: `token health: ${data.token_health.toLowerCase().replace("_", " ")}`,
+  });
+
+  // Price momentum
+  const p1hImpact = data.price_change_1h_pct > 5 ? 10 : data.price_change_1h_pct < -5 ? -10 : 0;
+  sf.push({
+    name: "price_change_1h",
+    value: data.price_change_1h_pct,
+    impact: p1hImpact,
+    interpretation: `${data.price_change_1h_pct >= 0 ? "+" : ""}${data.price_change_1h_pct.toFixed(1)}% 1h price change`,
+  });
+
+  const p24hImpact = data.price_change_24h_pct > 10 ? 10 : data.price_change_24h_pct < -10 ? -10 : 0;
+  sf.push({
+    name: "price_change_24h",
+    value: data.price_change_24h_pct,
+    impact: p24hImpact,
+    interpretation: `${data.price_change_24h_pct >= 0 ? "+" : ""}${data.price_change_24h_pct.toFixed(1)}% 24h price change`,
+  });
+
+  // Volume
+  const volImpact =
+    data.volume_1h_usd > 500_000 ? 10 :
+    data.volume_1h_usd > 100_000 ? 5 :
+    data.volume_1h_usd < 1_000   ? -15 :
+    data.volume_1h_usd < 10_000  ? -5 : 0;
+  sf.push({
+    name: "volume_1h_usd",
+    value: data.volume_1h_usd,
+    impact: volImpact,
+    interpretation: `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume`,
+  });
+
+  // Buy/sell pressure
+  const pressureImpact =
+    data.buy_pressure === "HIGH" && data.sell_pressure === "LOW" ? 15 :
+    data.sell_pressure === "HIGH" && data.buy_pressure === "LOW" ? -15 :
+    data.buy_pressure === "HIGH" ? 5 :
+    data.sell_pressure === "HIGH" ? -5 : 0;
+  sf.push({
+    name: "buy_sell_pressure",
+    value: `buy=${data.buy_pressure} sell=${data.sell_pressure}`,
+    impact: pressureImpact,
+    interpretation: `${data.buy_pressure.toLowerCase()} buy pressure, ${data.sell_pressure.toLowerCase()} sell pressure`,
+  });
+
+  // ATH distance
+  if (data.pct_from_ath !== null) {
+    const athImpact =
+      data.pct_from_ath < -90 ? -20 :
+      data.pct_from_ath < -80 ? -15 :
+      data.pct_from_ath < -50 ? -5 : 0;
+    sf.push({
+      name: "pct_from_ath",
+      value: data.pct_from_ath,
+      impact: athImpact,
+      interpretation: `${data.pct_from_ath.toFixed(0)}% from ATH`,
+    });
+  }
+
+  // Large tx activity
+  if (data.large_txs_last_hour > 0) {
+    sf.push({
+      name: "large_txs_last_hour",
+      value: data.large_txs_last_hour,
+      impact: data.large_txs_last_hour > 5 ? 10 : 5,
+      interpretation: `${data.large_txs_last_hour} large txs (>$10k) last hour`,
+    });
+  }
+
+  // Signal subtype context
+  if (data.signal_subtype !== "NONE") {
+    const subtypeImpact =
+      data.signal_subtype === "EARLY_PUMP" || data.signal_subtype === "ORGANIC_GROWTH" ? 10 :
+      data.signal_subtype === "POST_RUG_STAGNATION" || data.signal_subtype === "DISTRIBUTION_PHASE" ? -15 : 0;
+    sf.push({
+      name: "signal_subtype",
+      value: data.signal_subtype,
+      impact: subtypeImpact,
+      interpretation: data.signal_subtype.toLowerCase().replace(/_/g, " "),
+    });
+  }
+
+  return sf;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -175,6 +325,18 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const rawSignal = computeRawSignal(buy_sell_ratio, price_change_1h_pct || null);
   const signal = deriveSignal(rawSignal, token_health, pct_from_ath);
 
+  // Signal subtype — deterministic rules, not LLM
+  const signal_subtype = deriveSignalSubtype({
+    signal,
+    token_health,
+    volume_24h_usd,
+    price_change_1h_pct,
+    price_change_24h_pct,
+    pct_from_ath,
+    buy_pressure,
+    sell_pressure,
+  });
+
   // Large tx estimate (DexScreener h1 txns only)
   const h1Txns = dexData?.pair?.txns?.h1;
   const large_txs_last_hour = estimateLargeTxs(
@@ -188,14 +350,39 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     dexData !== null ? "dexscreener" : null,
     birdData !== null ? "birdeye" : null,
   ].filter((s): s is string => s !== null);
-  let data_confidence = scoreConfidence(sources, Date.now() - fetchStart);
 
-  // Health-based confidence cap
+  const data_age_ms = Date.now() - fetchStart;
+  const rawConfidence = calculateConfidence({
+    sources_available: sources.length,
+    sources_total: 2,
+    data_age_ms,
+    token_health,
+  });
+  const confidence = rawConfidence;
+  let data_confidence = confidenceToString(confidence);
+
+  // Health-based confidence cap (backwards-compat string field)
   if (token_health === "DEAD" || token_health === "ILLIQUID") {
     data_confidence = "LOW";
   } else if (token_health === "LOW_ACTIVITY" && data_confidence === "HIGH") {
     data_confidence = "MEDIUM";
   }
+
+  // Build structured factors
+  const factors = buildMarketFactors({
+    signal,
+    signal_subtype,
+    token_health,
+    buy_pressure,
+    sell_pressure,
+    volume_1h_usd,
+    volume_24h_usd,
+    price_change_1h_pct,
+    price_change_24h_pct,
+    liquidity_usd,
+    pct_from_ath,
+    large_txs_last_hour,
+  });
 
   // LLM summary — skip if SLA headroom exhausted
   const llmInput: MarketIntelData = {
@@ -210,6 +397,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     signal,
     token_health,
     pct_from_ath,
+    factors,
   };
 
   let market_summary: string;
@@ -232,10 +420,13 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     sell_pressure,
     large_txs_last_hour,
     signal,
+    signal_subtype,
     token_health,
     pct_from_ath,
     ath_price_usd,
     market_summary,
     data_confidence,
+    confidence,
+    factors,
   };
 }

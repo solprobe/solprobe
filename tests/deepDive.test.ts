@@ -126,7 +126,7 @@ describe("deepDive", () => {
     const result = await deepDive(TOKEN);
 
     expect(result.recommendation).toBeDefined();
-    expect(result.data_confidence).toBe("MEDIUM");
+    expect(result.data_confidence).toBe("LOW");
   });
 
   it("recommendation is AVOID when rug history is flagged", async () => {

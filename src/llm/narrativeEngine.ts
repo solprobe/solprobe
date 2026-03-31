@@ -7,6 +7,8 @@
 // string, even when all API keys are absent or every call fails.
 // ---------------------------------------------------------------------------
 
+import type { ScoringFactor } from "../scanner/types.js";
+
 // ---------------------------------------------------------------------------
 // Provider definitions
 // ---------------------------------------------------------------------------
@@ -59,6 +61,7 @@ export interface QuickScanData {
   has_rug_history?: boolean;
   authority_exempt?: boolean;
   authority_exempt_reason?: string | null;
+  factors?: ScoringFactor[];
 }
 
 export interface DeepDiveData {
@@ -79,6 +82,8 @@ export interface DeepDiveData {
   insider_flags?: boolean;
   authority_exempt?: boolean;
   authority_exempt_reason?: string | null;
+  factors?: ScoringFactor[];
+  historical_flags?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -250,12 +255,20 @@ export function fallbackDeepReport(data: DeepDiveData): string {
  */
 export async function generateQuickScanSummary(data: QuickScanData): Promise<string> {
   const system =
-    "You are a concise on-chain security analyst. Write one short sentence (under 30 words) summarising the risk profile of this Solana token. Be direct and specific — mention the most important risk signal. Do not start with 'This token'.";
+    "You are a concise on-chain security analyst. Write one short sentence (under 30 words) explaining WHY this Solana token received its risk grade. Reference the most impactful scoring factor from the factors list. If grade is F, lead with the primary failure reason. Do not start with 'This token'. Never use qualifiers like 'appears to'.";
+
+  const topFactors = [...(data.factors ?? [])]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 3);
+
+  const factorLines = topFactors.length > 0
+    ? `\n\nTop scoring factors:\n${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join("\n")}`
+    : "";
 
   const liq = data.liquidity_usd !== null
     ? `$${data.liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
     : "unknown";
-  const userMsg = `Risk grade: ${data.risk_grade}. Liquidity: ${liq}. Mint revoked: ${data.mint_authority_revoked}. Freeze revoked: ${data.freeze_authority_revoked}. Honeypot: ${data.is_honeypot}. Rug history: ${data.has_rug_history ?? false}. Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}. Confidence: ${data.data_confidence}.`;
+  const userMsg = `Risk grade: ${data.risk_grade}. Liquidity: ${liq}. Mint revoked: ${data.mint_authority_revoked}. Freeze revoked: ${data.freeze_authority_revoked}. Honeypot: ${data.is_honeypot}. Rug history: ${data.has_rug_history ?? false}. Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}. Confidence: ${data.data_confidence}.${factorLines}`;
 
   const result = await callWithFallback("fast", 80, system, userMsg);
   return result || fallbackQuickSummary(data);
@@ -275,6 +288,7 @@ export interface WalletRiskData {
   risk_score: number;
   is_bot: boolean;
   pnl_estimate_30d_usdc: number | null;
+  factors?: ScoringFactor[];
 }
 
 export function fallbackWalletRiskSummary(data: WalletRiskData): string {
@@ -286,7 +300,15 @@ export function fallbackWalletRiskSummary(data: WalletRiskData): string {
 
 export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
   const system =
-    "You are a DeFi counterparty risk analyst. Output exactly one sentence assessing wallet risk. Never hedge or use qualifiers like 'appears to' or 'may be'. Be specific and direct.";
+    "You are a DeFi counterparty risk analyst. Output exactly one sentence assessing wallet risk. Reference the most impactful risk factor from the factors list when available. Never hedge or use qualifiers like 'appears to' or 'may be'. Be specific and direct.";
+
+  const topFactors = [...(data.factors ?? [])]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 3);
+
+  const factorLines = topFactors.length > 0
+    ? `\n\nTop risk factors:\n${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join("\n")}`
+    : "";
 
   const userMsg = [
     `Wallet age: ${data.wallet_age_days != null ? Math.round(data.wallet_age_days) + " days" : "unknown"}.`,
@@ -298,7 +320,8 @@ export async function generateWalletRiskSummary(data: WalletRiskData): Promise<s
     `Risk score: ${data.risk_score}/100.`,
     `Is bot: ${data.is_bot}.`,
     `30d PnL estimate: ${data.pnl_estimate_30d_usdc != null ? "$" + data.pnl_estimate_30d_usdc.toFixed(0) : "unknown"}.`,
-  ].join(" ");
+    factorLines,
+  ].filter(Boolean).join(" ");
 
   const result = await callWithFallback("fast", 80, system, userMsg);
   return result || fallbackWalletRiskSummary(data);
@@ -320,6 +343,8 @@ export interface MarketIntelData {
   signal: string;
   token_health?: string;
   pct_from_ath?: number | null;
+  signal_subtype?: string;
+  factors?: ScoringFactor[];
 }
 
 export function fallbackMarketIntelSummary(data: MarketIntelData): string {
@@ -330,7 +355,15 @@ export function fallbackMarketIntelSummary(data: MarketIntelData): string {
 
 export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
   const system =
-    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. If the token is DEAD or ILLIQUID, lead with that fact. If pct_from_ath is worse than -80%, flag this as a likely rugged token. Never hedge. Be specific with numbers.";
+    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. Reference the most significant signal factor from the factors list when available. If the token is DEAD or ILLIQUID, lead with that fact. If pct_from_ath is worse than -80%, flag this as a likely rugged token. Never hedge. Be specific with numbers.";
+
+  const topFactors = [...(data.factors ?? [])]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 3);
+
+  const factorLines = topFactors.length > 0
+    ? `\n\nTop signal factors:\n${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join("\n")}`
+    : "";
 
   const athLine = data.pct_from_ath != null
     ? `Down ${Math.abs(data.pct_from_ath).toFixed(0)}% from ATH.`
@@ -345,8 +378,10 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
     `Buy pressure: ${data.buy_pressure}. Sell pressure: ${data.sell_pressure}.`,
     `Large txs (>$10k) last hour: ${data.large_txs_last_hour}.`,
     `Signal: ${data.signal}.`,
+    data.signal_subtype ? `Signal subtype: ${data.signal_subtype}.` : "",
     data.token_health ? `Token health: ${data.token_health}.` : "",
     athLine,
+    factorLines,
   ].filter(Boolean).join(" ");
 
   const result = await callWithFallback("fast", 80, system, userMsg);
@@ -363,7 +398,15 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
  */
 export async function generateDeepDiveReport(data: DeepDiveData): Promise<string> {
   const system =
-    "You are a professional on-chain security analyst. Write a 3–5 sentence risk report for this Solana token. Cover: authority status, liquidity/volume health, key risk signals, and your recommendation. Be specific, factual, and concise. Do not use bullet points.";
+    "You are a professional on-chain security analyst. Write a 3–5 sentence risk report for this Solana token. Use the scoring factors list as your primary evidence — explain which factors drove the score and how they combine. Connect related risks into patterns rather than listing fields independently. State the recommendation and the single strongest reason for it in the final sentence. Be specific, factual, and concise. Do not use bullet points.";
+
+  const topFactors = [...(data.factors ?? [])]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 5);
+
+  const factorLines = topFactors.length > 0
+    ? `\n\nTop scoring factors:\n${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join("\n")}`
+    : "";
 
   const liq = data.liquidity_usd !== null
     ? `$${data.liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
@@ -380,7 +423,11 @@ export async function generateDeepDiveReport(data: DeepDiveData): Promise<string
     `Pump.fun: ${data.pump_fun_launched}. Bundled launch: ${data.bundled_launch_detected}. Insider flags: ${data.insider_flags ?? false}.`,
     `Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}.`,
     `RugCheck score: ${data.rugcheck_risk_score ?? "n/a"}. Data confidence: ${data.data_confidence}.`,
-  ].join(" ");
+    data.historical_flags && data.historical_flags.length > 0
+      ? `Historical flags: ${data.historical_flags.join(", ")}.`
+      : "",
+    factorLines,
+  ].filter(Boolean).join(" ");
 
   const result = await callWithFallback("deep", 300, system, userMsg);
   return result || fallbackDeepReport(data);

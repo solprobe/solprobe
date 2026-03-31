@@ -259,9 +259,25 @@ describe("marketIntel", () => {
       sell_pressure:        expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       large_txs_last_hour:  expect.any(Number),
       signal:               expect.stringMatching(/^(BULLISH|BEARISH|NEUTRAL)$/),
+      signal_subtype:       expect.any(String),
       token_health:         expect.stringMatching(/^(ACTIVE|LOW_ACTIVITY|DECLINING|ILLIQUID|DEAD)$/),
       market_summary:       expect.any(String),
       data_confidence:      expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      confidence:           expect.any(Number),
+      factors:              expect.any(Array),
     });
+
+    // confidence is 0.0–1.0
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(1);
+
+    // factors[] must be non-empty and well-shaped
+    expect(result.factors.length).toBeGreaterThan(0);
+    for (const f of result.factors) {
+      expect(f).toHaveProperty("name");
+      expect(f).toHaveProperty("impact");
+      expect(f).toHaveProperty("interpretation");
+      expect(typeof f.impact).toBe("number");
+    }
   });
 });

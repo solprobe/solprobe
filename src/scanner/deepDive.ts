@@ -1,9 +1,16 @@
-import { getDexScreenerToken } from "../sources/dexscreener.js";
+import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned, getWalletAgeDays } from "../sources/helius.js";
 import { getBirdeyeToken } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
-import { calculateRiskGrade, scoreConfidence, type RiskFactors } from "./riskScorer.js";
+import {
+  calculateRiskGrade,
+  calculateConfidence,
+  confidenceToString,
+  buildHistoricalFlags,
+  type RiskFactors,
+} from "./riskScorer.js";
+import type { ScoringFactor, HistoricalFlag } from "./types.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
@@ -46,6 +53,9 @@ export interface DeepDiveResult {
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
   lp_burned: boolean | null;
+  lp_model: LPModel;
+  lp_status: LPStatus;
+  dex_id: string | null;
   rugcheck_risk_score: number | null;
   single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
@@ -67,6 +77,12 @@ export interface DeepDiveResult {
   authority_exempt: boolean;
   /** Human-readable reason for the exemption, or null when not exempt. */
   authority_exempt_reason: string | null;
+  /** Structured breakdown of all scoring contributors */
+  factors: ScoringFactor[];
+  /** 0.0–1.0 numeric confidence score */
+  confidence: number;
+  /** Historical event flags derived from source data */
+  historical_flags: HistoricalFlag[];
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +256,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   // ── Phase 2: LP burn check + dev wallet age ──────────────────────────────
   // Both depend on phase 1 results; run in parallel to minimise latency.
-  const lpMint = dexData?.lp_mint_address ?? null;
+  const lp_model = dexData?.lp_model ?? "UNKNOWN";
+  const dex_id   = dexData?.dex_id   ?? null;
+  const lpMint   = dexData?.lp_mint_address ?? null;
   const devWalletForAge = (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
     ? mintAuthAddress
     : null;
@@ -255,15 +273,22 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? isLPBurnLaunchpad(inferredProgramId)
     : false;
 
+  // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
+  const lpBurnPromise: Promise<boolean | null> =
+    lp_model === "CLMM_DLMM"
+      ? Promise.resolve(null)
+      : launchedFromLPBurnPad
+        ? Promise.resolve(true as boolean | null)
+        : (lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null));
+
   const [lpBurnResult, walletAgeResult] = await Promise.allSettled([
-    launchedFromLPBurnPad
-      ? Promise.resolve(true as boolean | null)
-      : (lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null)),
+    lpBurnPromise,
     devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 5000 }) : Promise.resolve(null),
   ]);
 
   const lp_burned           = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
+  const lp_status           = deriveLPStatus(lp_burned, lp_model);
 
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
@@ -307,10 +332,13 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
     single_holder_danger: rugData?.single_holder_danger ?? false,
     lp_burned,
+    lp_model,
+    lp_status,
+    dex_id,
     dev_wallet_age_days,
   };
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
-  const risk_grade = calculateRiskGrade(factors, authority_exempt);
+  const { grade: risk_grade, scoringFactors } = calculateRiskGrade(factors, authority_exempt);
 
   // ── Deep-only signals ─────────────────────────────────────────────────────
   const pump_fun_launched = inferredProgramId === PROGRAMS.PUMP_FUN;
@@ -364,11 +392,22 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     mintData !== null ? "helius"      : null,
     birdData !== null ? "birdeye"     : null,
   ].filter((s): s is string => s !== null);
-  const data_confidence = scoreConfidence(
-    sources,
-    Date.now() - fetchStart,
-    rugcheck_report_age_seconds !== null ? rugcheck_report_age_seconds : undefined
-  );
+  const data_age_ms = Date.now() - fetchStart;
+  const confidence = calculateConfidence({
+    sources_available: sources.length,
+    sources_total: 4,
+    data_age_ms,
+    rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
+  });
+  const data_confidence = confidenceToString(confidence);
+
+  // ── Historical flags ───────────────────────────────────────────────────────
+  const historical_flags: HistoricalFlag[] = buildHistoricalFlags({
+    has_rug_history,
+    bundled_launch: bundled_launch_detected,
+    single_holder_danger: rugData?.single_holder_danger ?? false,
+    dev_wallet_analysis: { previous_rugs: has_rug_history },
+  });
 
   const recommendation = deriveRecommendation(risk_grade, is_honeypot, has_rug_history, momentum_score, data_confidence);
 
@@ -404,6 +443,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     insider_flags: rugData?.insider_flags ?? false,
     authority_exempt,
     authority_exempt_reason,
+    factors: scoringFactors,
+    historical_flags,
   };
 
   const llmStart = Date.now();
@@ -424,6 +465,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     top_10_holder_pct,
     liquidity_usd,
     lp_burned,
+    lp_model,
+    lp_status,
+    dex_id,
     rugcheck_risk_score: factors.rugcheck_risk_score,
     single_holder_danger: factors.single_holder_danger,
     risk_grade,
@@ -442,5 +486,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     rugcheck_report_age_seconds,
     authority_exempt,
     authority_exempt_reason,
+    factors: scoringFactors,
+    confidence,
+    historical_flags,
   };
 }

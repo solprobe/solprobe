@@ -162,7 +162,29 @@ describe("quickScan", () => {
       risk_grade:              expect.stringMatching(/^[ABCDF]$/),
       summary:                 expect.any(String),
       data_confidence:         expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      confidence:              expect.any(Number),
+      factors:                 expect.any(Array),
+      historical_flags:        expect.any(Array),
     });
+
+    // confidence is 0.0–1.0
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(1);
+
+    // factors[] must be non-empty and well-shaped
+    expect(result.factors.length).toBeGreaterThan(0);
+    for (const f of result.factors) {
+      expect(f).toHaveProperty("name");
+      expect(f).toHaveProperty("impact");
+      expect(f).toHaveProperty("interpretation");
+      expect(typeof f.impact).toBe("number");
+    }
+
+    // historical_flags must be a valid HistoricalFlag[]
+    const validFlags = ["PAST_RUG", "BUNDLED_LAUNCH", "SINGLE_HOLDER_DANGER", "DEV_EXITED", "LIQUIDITY_REMOVAL_EVENT", "INSIDER_ACTIVITY"];
+    for (const flag of result.historical_flags) {
+      expect(validFlags).toContain(flag);
+    }
 
     // Authorities revoked (null = revoked in RugCheck), big liquidity → grade A
     expect(result.mint_authority_revoked).toBe(true);
@@ -206,8 +228,28 @@ describe("quickScan", () => {
 
     const result = await quickScan(USDC);
 
-    expect(result.data_confidence).toBe("MEDIUM");
+    expect(result.data_confidence).toBe("LOW");
     expect(["A", "B", "C", "D", "F"]).toContain(result.risk_grade);
+  });
+
+  it("factors[] contains an entry for every checked condition including passes", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+
+    const result = await quickScan(RUG);
+
+    // All key checks must appear in factors[] whether penalty or not
+    const factorNames = result.factors.map(f => f.name);
+    expect(factorNames).toContain("mint_authority");
+    expect(factorNames).toContain("freeze_authority");
+    expect(factorNames).toContain("lp_status");
+    expect(factorNames).toContain("liquidity_usd");
+    expect(factorNames).toContain("rugcheck_score");
+    expect(factorNames).toContain("single_holder_danger");
+    expect(factorNames).toContain("token_age_days");
+
+    // Zero-impact entries must exist for passing checks (grade A means most passed)
+    const zeroImpact = result.factors.filter(f => f.impact === 0);
+    expect(zeroImpact.length).toBeGreaterThan(0);
   });
 
   it("applies LP burn penalty when lp_burned is false", async () => {

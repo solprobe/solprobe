@@ -4,6 +4,71 @@ import { recordSourceResult } from "./resolver.js";
 
 const BASE_URL = "https://api.dexscreener.com/latest/dex/tokens";
 
+// ---------------------------------------------------------------------------
+// LP model classification
+// ---------------------------------------------------------------------------
+
+/** Whether the DEX uses a traditional fungible LP token (burnable) or a
+ *  concentrated/dynamic liquidity model (no LP mint to burn). */
+export type LPModel = "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
+
+/** Interpreted LP burn state, accounting for whether the DEX model even has
+ *  an LP token to burn. */
+export type LPStatus = "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
+
+/** DexScreener dexId values known to use traditional fungible LP tokens. */
+const TRADITIONAL_AMM_DEXES = new Set([
+  "raydium",    // Raydium AMM v4
+  "pumpfun",    // pump.fun (alternate dexId)
+  "pump",       // pump.fun
+  "fluxbeam",   // FluxBeam
+  "saber",      // Saber
+  "aldrin",     // Aldrin
+  "crema",      // Crema
+]);
+
+/** DexScreener dexId values that use concentrated or dynamic liquidity —
+ *  no fungible LP mint exists, so LP burn checks are not applicable. */
+const CLMM_DLMM_DEXES = new Set([
+  "raydiumclmm",  // Raydium CLMM
+  "meteora",      // Meteora DLMM
+  "meteoradlmm",  // Meteora DLMM (alternate dexId)
+  "orca",         // Orca Whirlpool (all Orca pools are Whirlpool/CLMM)
+  "whirlpool",    // Orca Whirlpool (alternate dexId)
+  "orcawhirlpool", // Orca Whirlpool (alternate dexId)
+]);
+
+/**
+ * Classify a DexScreener dexId into an LP model category.
+ * Unknown dexIds return "UNKNOWN" — callers apply a mild penalty rather
+ * than treating them as confirmed TRADITIONAL_AMM.
+ */
+export function classifyLPModel(dexId: string | null | undefined): LPModel {
+  if (!dexId) return "UNKNOWN";
+  const id = dexId.toLowerCase();
+  if (TRADITIONAL_AMM_DEXES.has(id) || id.includes("pump")) return "TRADITIONAL_AMM";
+  if (CLMM_DLMM_DEXES.has(id) || id.startsWith("meteora") || id.startsWith("orca"))
+    return "CLMM_DLMM";
+  return "UNKNOWN";
+}
+
+/**
+ * Derive the semantic LP status from a raw burn check result and the
+ * DEX model classification.
+ *
+ * CLMM/DLMM pools have no LP mint — always NOT_APPLICABLE regardless of
+ * what the burn check returned.
+ */
+export function deriveLPStatus(
+  lp_burned: boolean | null,
+  lp_model: LPModel,
+): LPStatus {
+  if (lp_model === "CLMM_DLMM") return "NOT_APPLICABLE";
+  if (lp_burned === true)  return "BURNED";
+  if (lp_burned === false) return "UNBURNED";
+  return "UNKNOWN"; // null — burn check was skipped or failed
+}
+
 export interface DexScreenerPair {
   chainId: string;
   dexId: string;
@@ -63,6 +128,10 @@ export interface DexScreenerTokenData {
   pair_created_at_ms: number | null;
   /** LP token mint address from the best pair; null if unavailable */
   lp_mint_address: string | null;
+  /** DEX model of the best pair — determines whether LP burn is meaningful */
+  lp_model: LPModel;
+  /** dexId of the best pair; null when no pair found */
+  dex_id: string | null;
 }
 
 /**
@@ -138,6 +207,8 @@ export async function getDexScreenerToken(
       buy_sell_ratio_1h: null,
       pair_created_at_ms: null,
       lp_mint_address: null,
+      lp_model: "UNKNOWN",
+      dex_id: null,
     };
   }
 
@@ -155,6 +226,8 @@ export async function getDexScreenerToken(
     buy_sell_ratio_1h = total > 0 ? txns1h.buys / total : null;
   }
 
+  const dex_id = best.dexId ?? null;
+
   return {
     pair: best,
     pairs: solanaPairs,
@@ -167,5 +240,7 @@ export async function getDexScreenerToken(
     buy_sell_ratio_1h,
     pair_created_at_ms: best.pairCreatedAt ?? null,
     lp_mint_address: best.info?.liquidityToken?.address ?? null,
+    lp_model: classifyLPModel(dex_id),
+    dex_id,
   };
 }
