@@ -249,6 +249,7 @@ describe("marketIntel", () => {
     const result = await marketIntel(TOKEN);
 
     expect(result).toMatchObject({
+      schema_version:       "2.0",
       current_price_usd:    expect.any(Number),
       price_change_1h_pct:  expect.any(Number),
       price_change_24h_pct: expect.any(Number),
@@ -263,13 +264,13 @@ describe("marketIntel", () => {
       token_health:         expect.stringMatching(/^(ACTIVE|LOW_ACTIVITY|DECLINING|ILLIQUID|DEAD)$/),
       market_summary:       expect.any(String),
       data_confidence:      expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
-      confidence:           expect.any(Number),
+      confidence:           expect.objectContaining({ model: expect.any(Number), data_completeness: expect.any(Number), signal_consensus: expect.any(Number) }),
       factors:              expect.any(Array),
     });
 
-    // confidence is 0.0–1.0
-    expect(result.confidence).toBeGreaterThanOrEqual(0);
-    expect(result.confidence).toBeLessThanOrEqual(1);
+    // confidence.model is 0.0–1.0
+    expect(result.confidence.model).toBeGreaterThanOrEqual(0);
+    expect(result.confidence.model).toBeLessThanOrEqual(1);
 
     // factors[] must be non-empty and well-shaped
     expect(result.factors.length).toBeGreaterThan(0);

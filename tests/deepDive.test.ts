@@ -83,6 +83,7 @@ describe("deepDive", () => {
     const result = await deepDive(TOKEN);
 
     expect(result).toMatchObject({
+      schema_version:           "2.0",
       is_honeypot:              expect.any(Boolean),
       mint_authority_revoked:   expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
@@ -90,7 +91,12 @@ describe("deepDive", () => {
       rugcheck_risk_score:      expect.toBeOneOf([expect.any(Number), null]),
       single_holder_danger:     expect.any(Boolean),
       risk_grade:               expect.stringMatching(/^[ABCDF]$/),
-      recommendation:           expect.stringMatching(/^(BUY|AVOID|WATCH|DYOR)$/),
+      recommendation:           expect.objectContaining({
+        action: expect.stringMatching(/^(AVOID|WATCH|CONSIDER|DYOR)$/),
+        reason: expect.any(String),
+        confidence: expect.any(Number),
+        time_horizon: expect.stringMatching(/^(SHORT_TERM|MEDIUM_TERM|LONG_TERM)$/),
+      }),
       momentum_score:           expect.any(Number),
       data_confidence:          expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       full_risk_report:         expect.any(String),
@@ -144,7 +150,7 @@ describe("deepDive", () => {
 
     const result = await deepDive(TOKEN);
 
-    expect(result.recommendation).toBe("AVOID");
+    expect(result.recommendation.action).toBe("AVOID");
   });
 
   it("fallback chain engages when RugCheck is down — Helius provides authority data", async () => {

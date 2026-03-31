@@ -153,6 +153,8 @@ describe("quickScan", () => {
     const result = await quickScan(USDC);
 
     expect(result).toMatchObject({
+      schema_version:          "2.0",
+      grade_type:              "STRUCTURAL_SAFETY",
       is_honeypot:             expect.any(Boolean),
       mint_authority_revoked:  expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
@@ -162,14 +164,14 @@ describe("quickScan", () => {
       risk_grade:              expect.stringMatching(/^[ABCDF]$/),
       summary:                 expect.any(String),
       data_confidence:         expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
-      confidence:              expect.any(Number),
+      confidence:              expect.objectContaining({ model: expect.any(Number), data_completeness: expect.any(Number), signal_consensus: expect.any(Number) }),
       factors:                 expect.any(Array),
       historical_flags:        expect.any(Array),
     });
 
-    // confidence is 0.0–1.0
-    expect(result.confidence).toBeGreaterThanOrEqual(0);
-    expect(result.confidence).toBeLessThanOrEqual(1);
+    // confidence.model is 0.0–1.0
+    expect(result.confidence.model).toBeGreaterThanOrEqual(0);
+    expect(result.confidence.model).toBeLessThanOrEqual(1);
 
     // factors[] must be non-empty and well-shaped
     expect(result.factors.length).toBeGreaterThan(0);

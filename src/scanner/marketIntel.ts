@@ -1,6 +1,6 @@
 import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
 import { getBirdeyeToken, getTokenOHLCV, type BirdeyeTokenData } from "../sources/birdeye.js";
-import { scoreConfidence, calculateConfidence, confidenceToString } from "./riskScorer.js";
+import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateMarketIntelSummary,
@@ -14,15 +14,22 @@ import type { ScoringFactor, SignalSubtype } from "./types.js";
 // ---------------------------------------------------------------------------
 
 export interface MarketIntelResult {
+  schema_version: "2.0";
   current_price_usd: number;
+  price_change_5m_pct: number | null;
+  price_change_15m_pct: number | null;
   price_change_1h_pct: number;
   price_change_24h_pct: number;
   volume_1h_usd: number;
   volume_24h_usd: number;
   liquidity_usd: number;
+  /** Numeric buy/(buy+sell) ratio e.g. 0.62 */
+  buy_sell_ratio: number;
   buy_pressure: "HIGH" | "MEDIUM" | "LOW";
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;  // txs > $10k (estimated from volume/count)
+  /** Derived from short-term price variance */
+  volatility: "LOW" | "MEDIUM" | "HIGH";
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
   signal_subtype: SignalSubtype;
   token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
@@ -31,10 +38,12 @@ export interface MarketIntelResult {
   market_summary: string;
   /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
-  /** 0.0–1.0 numeric confidence score */
-  confidence: number;
+  /** Structured confidence breakdown */
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
   /** Structured breakdown of signal contributors */
   factors: ScoringFactor[];
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +111,28 @@ function deriveSignal(
   return rawSignal;
 }
 
+function deriveVolatility(data: {
+  price_change_5m_pct: number | null;
+  price_change_15m_pct: number | null;
+  price_change_1h_pct: number | null;
+}): "LOW" | "MEDIUM" | "HIGH" {
+  const ref = data.price_change_5m_pct ?? data.price_change_15m_pct ?? data.price_change_1h_pct ?? 0;
+  const abs = Math.abs(ref);
+  if (data.price_change_5m_pct !== null) {
+    if (abs > 5) return "HIGH";
+    if (abs > 2) return "MEDIUM";
+    return "LOW";
+  }
+  if (data.price_change_15m_pct !== null) {
+    if (abs > 10) return "HIGH";
+    if (abs > 4) return "MEDIUM";
+    return "LOW";
+  }
+  if (abs > 20) return "HIGH";
+  if (abs > 8) return "MEDIUM";
+  return "LOW";
+}
+
 function deriveSignalSubtype(data: {
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
   token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
@@ -111,15 +142,28 @@ function deriveSignalSubtype(data: {
   pct_from_ath: number | null;
   buy_pressure: "HIGH" | "MEDIUM" | "LOW";
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
+  liquidity_usd: number;
+  buy_sell_ratio: number;
 }): SignalSubtype {
   const ch1h  = data.price_change_1h_pct;
   const ch24h = data.price_change_24h_pct;
   const ath   = data.pct_from_ath;
+  const liq   = data.liquidity_usd;
 
   if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
     return (ath !== null && ath < -80) ? "POST_RUG_STAGNATION" : "NO_VOLUME_ACTIVITY";
   }
   if (data.token_health === "LOW_ACTIVITY") return "NO_VOLUME_ACTIVITY";
+
+  // Low liquidity trap — signal present but too thin to trade safely
+  if (liq < 25_000 && data.signal !== "NEUTRAL") return "LOW_LIQUIDITY_TRAP";
+
+  // Sell pressure dominance — sustained numeric imbalance
+  if (data.buy_sell_ratio < 0.3 && data.sell_pressure === "HIGH") return "SELL_PRESSURE_DOMINANCE";
+
+  // Momentum breakdown — recent bullish run reversing with volume
+  if (ch1h < -10 && ch24h > 10 && data.volume_24h_usd > 50_000) return "MOMENTUM_BREAKDOWN";
+
   if (ch1h > 20 && data.buy_pressure === "HIGH" && data.sell_pressure === "LOW") return "EARLY_PUMP";
   if (data.sell_pressure === "HIGH" && ch24h < -10 && data.volume_24h_usd > 10_000) return "DISTRIBUTION_PHASE";
   if (ath !== null && ath < -80 && data.volume_24h_usd < 50_000) return "POST_RUG_STAGNATION";
@@ -325,6 +369,13 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const rawSignal = computeRawSignal(buy_sell_ratio, price_change_1h_pct || null);
   const signal = deriveSignal(rawSignal, token_health, pct_from_ath);
 
+  // Short-interval price changes — null when Birdeye key is absent
+  const price_change_5m_pct: number | null = null;
+  const price_change_15m_pct: number | null = null;
+
+  // Volatility — derived from short-term price variance
+  const volatility = deriveVolatility({ price_change_5m_pct, price_change_15m_pct, price_change_1h_pct });
+
   // Signal subtype — deterministic rules, not LLM
   const signal_subtype = deriveSignalSubtype({
     signal,
@@ -335,6 +386,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     pct_from_ath,
     buy_pressure,
     sell_pressure,
+    liquidity_usd,
+    buy_sell_ratio: buy_sell_ratio ?? 0.5,
   });
 
   // Large tx estimate (DexScreener h1 txns only)
@@ -359,7 +412,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     token_health,
   });
   const confidence = rawConfidence;
-  let data_confidence = confidenceToString(confidence);
+  let data_confidence = confidenceToString(confidence.model);
 
   // Health-based confidence cap (backwards-compat string field)
   if (token_health === "DEAD" || token_health === "ILLIQUID") {
@@ -383,6 +436,15 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     pct_from_ath,
     large_txs_last_hour,
   });
+
+  // Data quality
+  const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
+    sources.length === 2 ? "FULL" : sources.length === 1 ? "PARTIAL" : "LIMITED";
+
+  const missing_fields: string[] = [];
+  if (dexData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio");
+  if (birdData === null) missing_fields.push("birdeye_price");
+  if (ohlcvData === null) missing_fields.push("ath_price_usd", "pct_from_ath");
 
   // LLM summary — skip if SLA headroom exhausted
   const llmInput: MarketIntelData = {
@@ -410,15 +472,20 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   }
 
   return {
+    schema_version: "2.0" as const,
     current_price_usd,
+    price_change_5m_pct,
+    price_change_15m_pct,
     price_change_1h_pct,
     price_change_24h_pct,
     volume_1h_usd,
     volume_24h_usd,
     liquidity_usd,
+    buy_sell_ratio: buy_sell_ratio ?? 0.5,
     buy_pressure,
     sell_pressure,
     large_txs_last_hour,
+    volatility,
     signal,
     signal_subtype,
     token_health,
@@ -428,5 +495,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     data_confidence,
     confidence,
     factors,
+    data_quality,
+    missing_fields,
   };
 }

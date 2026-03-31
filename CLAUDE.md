@@ -64,17 +64,116 @@ Claude Code must first run:
   curl -s "https://api.rugcheck.xyz/v1/tokens/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/report/summary" | jq '{score, normalizedScore}'
 
 And confirm which field contains the real aggregate value before mapping.
- 
+
 ---
 
 ## Services
 
-| Service | Price | SLA | LLM call |
-|---|---|---|---|
-| `sol_quick_scan` | $0.05 | < 5s | Haiku — `summary` field only |
-| `sol_wallet_risk` | $0.10 | < 20s | Haiku — `risk_summary` field only |
-| `sol_market_intel` | $0.10 | < 10s | Haiku — `market_summary` field only |
-| `sol_deep_dive` | $0.50 | < 30s | Sonnet — `full_risk_report` only |
+| Service | Price | SLA | LLM call | Role |
+|---|---|---|---|---|
+| `sol_quick_scan` | $0.05 | < 5s | Haiku — `summary` field only | Structural safety gate |
+| `sol_wallet_risk` | $0.10 | < 20s | Haiku — `risk_summary` field only | Counterparty intelligence + alpha discovery |
+| `sol_market_intel` | $0.10 | < 10s | Haiku — `market_summary` field only | Real-time trading signal |
+| `sol_deep_dive` | $0.50 | < 30s | Sonnet — `full_risk_report` only | Adversarial risk engine |
+
+---
+
+## Service Boundary Rules
+
+These boundaries are strict. Do not let responsibilities bleed across services.
+
+| Signal Type | Service |
+|---|---|
+| Mint/freeze authority | Quick Scan |
+| Holder distribution | Quick Scan |
+| Liquidity + volume | Market Intel |
+| Price + momentum | Market Intel |
+| Short-term price changes | Market Intel |
+| Token age | Deep Dive |
+| Wallet clustering / insider control | Deep Dive |
+| Dev history / launch pattern | Deep Dive |
+| Wallet behavior / trading style | Wallet Risk |
+| Counterparty PnL / sniper score | Wallet Risk |
+| MEV victim/bot detection | Wallet Risk |
+| Copy-trade opportunity signal | Wallet Risk |
+| Pump.fun exit pattern | Wallet Risk |
+
+**Quick Scan must NOT imply tradability, liquidity health, or market conditions.**
+**Market Intel must NOT repeat structural safety signals from Quick Scan.**
+**Deep Dive must introduce new adversarial information — not repeat Quick Scan fields.**
+**Wallet Risk must NOT flag wallets HIGH_RISK based solely on thin history — use UNKNOWN.**
+**Wallet Risk copy_trading signals must reflect actor behaviour only — not token conditions.**
+**copy_trading.worthiness and classification are orthogonal — never merge them.**
+
+---
+
+## Global Output Standards (apply to ALL services)
+
+### 1. Schema Versioning
+Every response MUST include:
+```typescript
+schema_version: "2.0";   // increment minor on non-breaking additions, major on shape changes
+```
+Buyer agents gate on this field before parsing. Never omit it.
+
+### 2. Data Quality Layer
+Every response MUST include:
+```typescript
+data_quality: "FULL" | "PARTIAL" | "LIMITED";
+missing_fields: string[];
+```
+- `FULL` — all expected sources returned data
+- `PARTIAL` — at least one non-critical source failed
+- `LIMITED` — a critical source failed; confidence materially degraded
+- NEVER silently assume missing data.
+
+### 3. Structured Confidence Object
+```typescript
+confidence: {
+  model: number;             // 0.0–1.0
+  data_completeness: number; // 0.0–1.0
+  signal_consensus: number;  // 0.0–1.0
+};
+```
+Keep `data_confidence: "HIGH" | "MEDIUM" | "LOW"` for backwards compatibility,
+derived from `confidence.model`.
+
+```typescript
+function confidenceToString(c: number): "HIGH" | "MEDIUM" | "LOW" {
+  if (c >= 0.7) return "HIGH";
+  if (c >= 0.4) return "MEDIUM";
+  return "LOW";
+}
+```
+
+### 4. Summary / narrative rules
+- Structured fields carry the full decision weight. Summary explains — never introduces new claims.
+- Disallow: "strong", "safe", "excellent", "highly reliable"
+- Use conditional, scoped phrasing. State what this service does NOT cover.
+
+### 5. Confidence calculation
+
+```typescript
+function calculateConfidence(data: {
+  sources_available: number;
+  sources_total: number;
+  data_age_ms: number;
+  rugcheck_age_seconds?: number;
+  token_health?: string;
+  signals_agree?: boolean;
+}): { model: number; data_completeness: number; signal_consensus: number } {
+  const data_completeness = data.sources_available / data.sources_total;
+  let model = data_completeness;
+  if (data.data_age_ms > 60_000)  model -= 0.1;
+  if (data.data_age_ms > 300_000) model -= 0.2;
+  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) model -= 0.15;
+  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") model = Math.min(model, 0.3);
+  if (data.token_health === "LOW_ACTIVITY") model = Math.min(model, 0.6);
+  model = Math.max(0, Math.min(1, Math.round(model * 100) / 100));
+  const signal_consensus = data.signals_agree === false ? 0.5 : data_completeness;
+  return { model, data_completeness, signal_consensus };
+}
+```
 
 ---
 
@@ -92,22 +191,22 @@ solprobe/
 │   ├── sources/
 │   │   ├── dexscreener.ts
 │   │   ├── rugcheck.ts
-│   │   ├── helius.ts           # includes getTokenMintInfo()
+│   │   ├── helius.ts
 │   │   ├── birdeye.ts
 │   │   ├── solscan.ts
-│   │   ├── resolver.ts         # weighted source resolver
-│   │   └── jupiterTokenList.ts # authority exemption via Jupiter strict list
+│   │   ├── resolver.ts
+│   │   └── jupiterTokenList.ts
 │   ├── api/
 │   │   ├── server.ts
-│   │   └── rateLimiter.ts      # inbound per-IP rate limiter
+│   │   └── rateLimiter.ts
 │   ├── llm/
-│   │   └── narrativeEngine.ts  # Haiku/Sonnet prose generation
+│   │   └── narrativeEngine.ts
 │   ├── utils/
 │   │   └── retry.ts
 │   ├── circuitBreaker.ts
 │   ├── validate.ts
 │   ├── cache.ts
-│   └── constants.ts            # PROGRAMS, Virtuals protocol addresses
+│   └── constants.ts
 ├── scripts/
 │   ├── revenueTracker.ts
 │   ├── buyback.ts
@@ -115,6 +214,8 @@ solprobe/
 ├── tests/
 │   ├── quickScan.test.ts
 │   ├── deepDive.test.ts
+│   ├── walletRisk.test.ts
+│   ├── marketIntel.test.ts
 │   ├── sources.test.ts
 │   └── circuitBreaker.test.ts
 ├── package.json
@@ -129,120 +230,244 @@ solprobe/
 ## Response Shapes
 
 ### `sol_quick_scan`
+
+**Role: Structural safety gate only.**
+
 ```typescript
 {
+  schema_version: "2.0";
+  grade_type: "STRUCTURAL_SAFETY";
+  scope: {
+    includes: ["mint_authority", "freeze_authority", "holder_distribution"];
+    excludes: ["liquidity", "volume", "price_action", "market_behavior"];
+  };
   is_honeypot: boolean;
-  mint_authority_revoked: boolean;       // Helius only — always live on-chain
-  freeze_authority_revoked: boolean;     // Helius only — always live on-chain
-  top_10_holder_pct: number | null;      // Helius only — always live on-chain
-  liquidity_usd: number | null;
-  risk_grade: "A" | "B" | "C" | "D" | "F";
-  summary: string;                       // LLM (Haiku) grounded in factors[] — explains WHY
-  authority_exempt: boolean;             // true if Jupiter strict list exempts this token
+  mint_authority_revoked: boolean;
+  freeze_authority_revoked: boolean;
+  top_10_holder_pct: number | null;
+  authority_exempt: boolean;
   authority_exempt_reason: string | null;
   lp_burned: boolean | null;
   lp_status: "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
   lp_model: "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
   dex_id: string | null;
+  liquidity_check: "PRESENT" | "LOW" | "UNKNOWN";
+  risk_grade: "A" | "B" | "C" | "D" | "F";
   rugcheck_report_age_seconds: number | null;
-  // ── Agent-native intelligence fields ─────────────────────────
-  factors: ScoringFactor[];             // structured breakdown of all scoring contributors
-  confidence: number;                   // 0.0–1.0 numeric confidence (replaces data_confidence)
-  historical_flags: HistoricalFlag[];   // ["PAST_RUG", "DEV_EXITED", ...]
-  data_confidence: "HIGH" | "MEDIUM" | "LOW"; // kept for backwards compat, derived from confidence
+  factors: ScoringFactor[];
+  historical_flags: HistoricalFlag[];
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
+  data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
+  summary: string;
+  // Example: "Grade reflects on-chain token structure only — mint authority revoked,
+  //  holder distribution within normal range; liquidity and market conditions are
+  //  outside the scope of this check."
+}
+```
+
+### `sol_market_intel`
+
+**Role: Real-time trading signal.**
+
+```typescript
+{
+  schema_version: "2.0";
+  current_price_usd: number;
+  price_change_5m_pct: number | null;
+  price_change_15m_pct: number | null;
+  price_change_1h_pct: number;
+  price_change_24h_pct: number;
+  pct_from_ath: number | null;
+  ath_price_usd: number | null;
+  volume_1h_usd: number;
+  volume_24h_usd: number;
+  liquidity_usd: number;
+  buy_sell_ratio: number;
+  buy_pressure: "HIGH" | "MEDIUM" | "LOW";
+  sell_pressure: "HIGH" | "MEDIUM" | "LOW";
+  large_txs_last_hour: number;
+  volatility: "LOW" | "MEDIUM" | "HIGH";
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  signal_subtype: SignalSubtype;
+  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
+  factors: ScoringFactor[];
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
+  data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
+  market_summary: string;
 }
 ```
 
 ### `sol_deep_dive`
+
+**Role: Adversarial risk engine.**
+
 ```typescript
 {
-  // all quick_scan fields, plus:
-  authority_exempt: boolean;             // inherited from quick_scan fields
+  schema_version: "2.0";
+  // Inherited structural (re-fetched fresh)
+  is_honeypot: boolean;
+  mint_authority_revoked: boolean;
+  freeze_authority_revoked: boolean;
+  top_10_holder_pct: number | null;
+  authority_exempt: boolean;
   authority_exempt_reason: string | null;
+  lp_burned: boolean | null;
+  lp_status: "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
+  lp_model: "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
+  dex_id: string | null;
+  risk_grade: "A" | "B" | "C" | "D" | "F";
+  // Adversarial layers
+  risk_breakdown: {
+    contract_risk: "LOW" | "MEDIUM" | "HIGH";
+    liquidity_risk: "LOW" | "MEDIUM" | "HIGH";
+    market_risk: "LOW" | "MEDIUM" | "HIGH";
+    behavioral_risk: "LOW" | "MEDIUM" | "HIGH";
+  };
+  wallet_analysis: {
+    clustered_wallets: number;
+    insider_control_percent: number | null;
+    dev_wallet_linked: boolean;
+  };
   dev_wallet_analysis: {
     address: string;
-    is_protocol_address?: boolean;       // true if Virtuals protocol address
+    is_protocol_address?: boolean;
     sol_balance: number | null;
     created_tokens_count: number | null;
     previous_rugs: boolean;
   };
-  liquidity_lock_status: {
-    locked: boolean;
-    lock_duration_days: number;
-    locked_pct: number;
-  };
-  trading_pattern: {
-    buy_sell_ratio_1h: number;
-    unique_buyers_24h: number;
-    wash_trading_score: number;          // 0–100
-  };
+  launch_pattern: "STEALTH_LAUNCH" | "FAIR_LAUNCH" | "UNKNOWN";
+  sniper_activity: "LOW" | "MEDIUM" | "HIGH";
+  liquidity_lock_status: { locked: boolean; lock_duration_days: number; locked_pct: number };
+  trading_pattern: { buy_sell_ratio_1h: number; unique_buyers_24h: number; wash_trading_score: number };
   pump_fun_launched: boolean;
-  bundled_launch_detected: boolean;      // RugCheck
+  bundled_launch_detected: boolean;
   volume_24h: number;
   price_change_24h_pct: number;
-  momentum_score: number;               // 0–100, on-chain signals only — no social API
-  full_risk_report: string;             // LLM (Sonnet) grounded in factors[] — explains WHY
-  recommendation: "BUY" | "AVOID" | "WATCH" | "DYOR";
+  momentum_score: number;
+  factors: ScoringFactor[];
+  historical_flags: HistoricalFlag[];
+  key_drivers: KeyDriver[];
+  recommendation: {
+    action: "AVOID" | "WATCH" | "CONSIDER" | "DYOR";
+    reason: string;
+    confidence: number;
+    time_horizon: "SHORT_TERM" | "MEDIUM_TERM" | "LONG_TERM";
+  };
   rugcheck_report_age_seconds: number | null;
-  // ── Agent-native intelligence fields ─────────────────────────
-  factors: ScoringFactor[];             // structured breakdown of all scoring contributors
-  confidence: number;                   // 0.0–1.0 numeric confidence
-  historical_flags: HistoricalFlag[];   // ["PAST_RUG", "DEV_EXITED", "LIQUIDITY_REMOVAL_EVENT"]
-  data_confidence: "HIGH" | "MEDIUM" | "LOW"; // derived from confidence
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
+  data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
+  full_risk_report: string;
 }
 ```
 
 ### `sol_wallet_risk`
 
-> **Rebuilt service** — $0.10 / 20s SLA. Real behavioural signals derived from
-> actual transaction history, not shallow RPC metadata.
+**Role: Counterparty intelligence AND alpha discovery primitive.**
+
+Two orthogonal dimensions in one call:
+- `classification` — is this wallet dangerous to trade against?
+- `copy_trading` — is this wallet worth following?
+
+These are independent. A wallet can be LOW_RISK and a poor copy. A wallet can be
+HIGH_RISK and highly profitable to follow. Never merge or conflate them.
 
 ```typescript
 {
+  schema_version: "2.0";
+
+  // ── Risk dimension ────────────────────────────────────────────────
+  classification: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN";
+  // UNKNOWN when total_trades < 10 OR wallet_age_days < 7
+  // HIGH_RISK requires >= 2 strong positive risk signals
+  // LOW_RISK — sufficient history, no strong risk signals
+
+  activity: {
+    wallet_age_days: number;
+    total_trades: number;
+    active_days: number;
+    last_active_hours_ago: number | null;
+  };
+
+  // Legacy flat fields (backwards compat)
   wallet_age_days: number;
   total_transactions: number;
-  tokens_traded_30d: number;            // unique tokens traded in last 30 days
-  win_rate_pct: number | null;          // % of closed positions with profitable exit
-  avg_hold_time_hours: number | null;   // mean hold time across closed positions
-  sniper_score: number;                 // 0–100: how often in first 20 buyers at launch
-  rug_exit_rate_pct: number | null;     // % of dead tokens they sold before collapse
-  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW"; // was wallet funded from deployer/mixer?
-  pnl_estimate_30d_usdc: number | null; // rough realised PnL last 30 days
+  tokens_traded_30d: number;
+
+  win_rate_pct: number | null;
+  avg_hold_time_hours: number | null;
+  sniper_score: number;
+  rug_exit_rate_pct: number | null;
+  pnl_estimate_30d_usdc: number | null;
   largest_single_loss_usdc: number | null;
-  is_bot: boolean;                      // high-frequency, uniform amounts
-  whale_status: boolean;                // >$50k portfolio or >$10k single trades
+  is_bot: boolean;
+  whale_status: boolean;
+  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";
+
+  behavior: {
+    style: "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT" | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE";
+    consistency: "LOW" | "MEDIUM" | "HIGH";
+  };
+
+  // Legacy flat field (backwards compat)
   trading_style: "sniper" | "hodler" | "flipper" | "bot" | "degen" | "unknown";
-  risk_score: number;                   // 0–100 counterparty risk
-  risk_summary: string;                 // LLM (Haiku) grounded in factors[] — explains WHY
-  // ── Agent-native intelligence fields ─────────────────────────
-  factors: ScoringFactor[];             // structured breakdown of all scoring contributors
-  confidence: number;                   // 0.0–1.0 numeric confidence
-  data_confidence: "HIGH" | "MEDIUM" | "LOW"; // derived from confidence
-}
-```
 
-### `sol_market_intel`
-```typescript
-{
-  current_price_usd: number;
-  price_change_1h_pct: number;
-  price_change_24h_pct: number;
-  volume_1h_usd: number;
-  volume_24h_usd: number;
-  liquidity_usd: number;
-  buy_pressure: "HIGH" | "MEDIUM" | "LOW";
-  sell_pressure: "HIGH" | "MEDIUM" | "LOW";
-  large_txs_last_hour: number;          // txs > $10k
-  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
-  signal_subtype: SignalSubtype;        // e.g. "NO_VOLUME_ACTIVITY", "EARLY_PUMP"
-  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
-  pct_from_ath: number | null;
-  ath_price_usd: number | null;
-  market_summary: string;               // LLM (Haiku) grounded in factors[] — explains WHY
-  // ── Agent-native intelligence fields ─────────────────────────
-  factors: ScoringFactor[];             // structured breakdown of signal contributors
-  confidence: number;                   // 0.0–1.0 numeric confidence
-  data_confidence: "HIGH" | "MEDIUM" | "LOW"; // derived from confidence
+  score: {
+    overall: number;
+    components: {
+      history_depth: number;
+      behavioral_risk: number;
+      counterparty_exposure: number;
+    };
+  };
+
+  // Legacy flat field (backwards compat)
+  risk_score: number;
+
+  risk_signals: Array<{
+    name: string;
+    impact: "LOW" | "MEDIUM" | "HIGH";
+    reason: string;
+  }>;
+
+  // No cap — scan all tokens traded in last 30 days.
+  // Reflect partial Helius data in data_quality and missing_fields.
+  historical_exposure: {
+    rug_interactions: number;
+    high_risk_tokens_traded: number;
+  };
+
+  // ── MEV intelligence (NEW) ─────────────────────────────────────
+  mev_victim_score: number;          // 0–100
+  is_mev_bot: boolean;
+  mev_bot_confidence: number;        // 0.0–1.0
+
+  // ── Pump.fun intelligence (NEW) ────────────────────────────────
+  pumpfun_graduation_exit_rate_pct: number | null;
+  early_entry_rate_pct: number | null;
+
+  // ── Copy-trade opportunity layer (NEW) ─────────────────────────
+  // Orthogonal to classification. Answers: "is this wallet worth following?"
+  // MUST be "UNKNOWN" when total_trades < 20. No exceptions.
+  copy_trading: {
+    worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+    confidence: number;        // 0.0–1.0; capped at 0.5 when sample_size < 50
+    sample_size: number;
+    key_signals: string[];     // e.g. ["high_win_rate", "consistent_sizing"]
+    reason: string | null;     // always populated when worthiness === "UNKNOWN"
+  };
+
+  factors: ScoringFactor[];
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
+  data_confidence: "HIGH" | "MEDIUM" | "LOW";
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
+  risk_summary: string;
 }
 ```
 
@@ -250,355 +475,79 @@ solprobe/
 
 ## Agent-Native Intelligence Types
 
-These types are shared across all four services. Define them in
-`src/scanner/types.ts` and import everywhere.
+Define all shared types in `src/scanner/types.ts` and import everywhere.
 
 ### ScoringFactor
 
 ```typescript
 interface ScoringFactor {
-  name: string;           // machine-readable key, e.g. "mint_authority"
-  value: number | string | boolean | null; // raw value from source
-  impact: number;         // score change: negative = penalty, 0 = neutral, positive = bonus
-  interpretation: string; // short human-readable explanation, max 60 chars
+  name: string;
+  value: number | string | boolean | null;
+  impact: number;
+  interpretation: string; // max 60 chars
 }
 ```
 
-Every factor that contributes to the deterministic score MUST appear in
-the `factors[]` array. The array must reflect actual scoring logic — not
-be generated by the LLM.
+Push a factor for EVERY condition checked — include `impact: 0` for passing checks.
 
-**Example for `sol_quick_scan`:**
-```json
-"factors": [
-  { "name": "mint_authority", "value": true, "impact": 0, "interpretation": "mint authority revoked — safe" },
-  { "name": "freeze_authority", "value": false, "impact": -15, "interpretation": "freeze authority active — risk" },
-  { "name": "top_10_holders", "value": 40.3, "impact": 0, "interpretation": "healthy distribution" },
-  { "name": "lp_status", "value": "NOT_APPLICABLE", "impact": 0, "interpretation": "Meteora CLMM — LP burn N/A" },
-  { "name": "liquidity_usd", "value": 85000000, "impact": 0, "interpretation": "deep liquidity" },
-  { "name": "rugcheck_score", "value": 101, "impact": 0, "interpretation": "low risk score" },
-  { "name": "token_age_days", "value": 743, "impact": 0, "interpretation": "established token" }
-]
-```
-
-**Build factors[] in `src/scanner/riskScorer.ts`** alongside the existing
-`calculateRiskGrade()` function. Return both the grade AND the factors array:
+### KeyDriver (Deep Dive only)
 
 ```typescript
-export function calculateRiskGrade(
-  factors: RiskFactors,
-  exempt: boolean = false
-): { grade: RiskGrade; scoringFactors: ScoringFactor[]; rawScore: number } {
-  if (factors.has_rug_history) {
-    return {
-      grade: "F",
-      rawScore: 0,
-      scoringFactors: [{ name: "rug_history", value: true, impact: -100, interpretation: "confirmed rug pull history" }],
-    };
-  }
+interface KeyDriver {
+  factor: string;
+  impact: "LOW" | "MEDIUM" | "HIGH";
+  direction: "POSITIVE" | "NEGATIVE" | "NEUTRAL";
+}
 
-  const scoringFactors: ScoringFactor[] = [];
-  let score = 100;
-
-  // Authority penalties
-  if (!exempt) {
-    if (!factors.mint_authority_revoked) {
-      score -= 25;
-      scoringFactors.push({ name: "mint_authority", value: false, impact: -25, interpretation: "mint authority not revoked — inflation risk" });
-    } else {
-      scoringFactors.push({ name: "mint_authority", value: true, impact: 0, interpretation: "mint authority revoked — safe" });
-    }
-    if (!factors.freeze_authority_revoked) {
-      score -= 15;
-      scoringFactors.push({ name: "freeze_authority", value: false, impact: -15, interpretation: "freeze authority active — funds can be frozen" });
-    } else {
-      scoringFactors.push({ name: "freeze_authority", value: true, impact: 0, interpretation: "freeze authority revoked — safe" });
-    }
-  }
-
-  // ... same pattern for all penalties — always push to scoringFactors
-  // Include impact: 0 entries for factors that pass — agents need the full picture
-
-  score = Math.max(0, score);
-  const grade: RiskGrade = score >= 80 ? "A" : score >= 60 ? "B" : score >= 40 ? "C" : score >= 20 ? "D" : "F";
-  return { grade, rawScore: score, scoringFactors };
+function buildKeyDrivers(factors: ScoringFactor[]): KeyDriver[] {
+  return [...factors]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 5)
+    .map(f => ({
+      factor: f.name,
+      impact: Math.abs(f.impact) >= 20 ? "HIGH" : Math.abs(f.impact) >= 10 ? "MEDIUM" : "LOW",
+      direction: f.impact < 0 ? "NEGATIVE" : f.impact > 0 ? "POSITIVE" : "NEUTRAL",
+    }));
 }
 ```
-
-**Important:** push a factor entry for EVERY condition checked, whether
-it triggers a penalty or not. Impact: 0 means "checked and passed".
-Agents need to see that a check was performed, not just that it failed.
-
----
 
 ### SignalSubtype
 
 ```typescript
 type SignalSubtype =
-  | "NO_VOLUME_ACTIVITY"    // near-zero volume, token is dead or illiquid
-  | "EARLY_PUMP"            // sharp price rise + high buy pressure + young token
-  | "DISTRIBUTION_PHASE"    // high sell pressure + declining price + active volume
-  | "POST_RUG_STAGNATION"   // dead volume + deep ATH drawdown (likely rugged)
-  | "HIGH_SPECULATION"      // extreme price volatility + low liquidity
-  | "ORGANIC_GROWTH"        // steady volume + balanced pressure + rising price
-  | "NORMAL_CORRECTION"     // price decline from ATH but healthy volume
-  | "NONE";                 // no specific subtype applies
+  | "NO_VOLUME_ACTIVITY"
+  | "EARLY_PUMP"
+  | "DISTRIBUTION_PHASE"
+  | "POST_RUG_STAGNATION"
+  | "HIGH_SPECULATION"
+  | "ORGANIC_GROWTH"
+  | "NORMAL_CORRECTION"
+  | "LOW_LIQUIDITY_TRAP"
+  | "SELL_PRESSURE_DOMINANCE"
+  | "MOMENTUM_BREAKDOWN"
+  | "NONE";
 ```
 
-**Derive `signal_subtype` deterministically in `src/scanner/marketIntel.ts`**
-after token_health and signal are computed. No ML — pure rules:
+Derive deterministically — never via LLM.
 
 ```typescript
 function deriveSignalSubtype(data: {
-  signal: string;
-  token_health: string;
-  volume_24h_usd: number;
-  price_change_1h_pct: number | null;
-  price_change_24h_pct: number | null;
-  pct_from_ath: number | null;
-  token_age_days?: number | null;
-  buy_pressure: string;
-  sell_pressure: string;
+  signal: string; token_health: string; volume_24h_usd: number;
+  price_change_1h_pct: number | null; price_change_24h_pct: number | null;
+  pct_from_ath: number | null; buy_pressure: string; sell_pressure: string;
+  liquidity_usd: number | null; buy_sell_ratio: number;
 }): SignalSubtype {
-  const vol   = data.volume_24h_usd;
-  const ch1h  = data.price_change_1h_pct ?? 0;
+  const ch1h = data.price_change_1h_pct ?? 0;
   const ch24h = data.price_change_24h_pct ?? 0;
-  const ath   = data.pct_from_ath;
+  const ath = data.pct_from_ath;
+  const liq = data.liquidity_usd ?? 0;
 
-  // Dead / no activity
-  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
-    if (ath !== null && ath < -80) return "POST_RUG_STAGNATION";
-    return "NO_VOLUME_ACTIVITY";
-  }
-  if (data.token_health === "LOW_ACTIVITY") return "NO_VOLUME_ACTIVITY";
-
-  // Early pump — sharp rise + high buy pressure + young token
-  if (ch1h > 20 && data.buy_pressure === "HIGH" && data.sell_pressure === "LOW") {
-    return "EARLY_PUMP";
-  }
-
-  // Distribution — selling into price decline
-  if (data.sell_pressure === "HIGH" && ch24h < -10 && vol > 10_000) {
-    return "DISTRIBUTION_PHASE";
-  }
-
-  // Post-rug stagnation — way below ATH, low activity
-  if (ath !== null && ath < -80 && vol < 50_000) return "POST_RUG_STAGNATION";
-
-  // High speculation — extreme moves + thin liquidity
-  if (Math.abs(ch1h) > 30 && data.token_health !== "ACTIVE") return "HIGH_SPECULATION";
-
-  // Normal correction — healthy token in pullback
-  if (data.signal === "BEARISH" && data.token_health === "ACTIVE" && ch24h > -30) {
-    return "NORMAL_CORRECTION";
-  }
-
-  // Organic growth
-  if (data.signal === "BULLISH" && data.buy_pressure !== "LOW" && vol > 100_000) {
-    return "ORGANIC_GROWTH";
-  }
-
-  return "NONE";
-}
-```
-
----
-
-### HistoricalFlag
-
-```typescript
-type HistoricalFlag =
-  | "PAST_RUG"                // has_rug_history true from RugCheck
-  | "DEV_EXITED"              // dev wallet sold all holdings (deep dive only)
-  | "LIQUIDITY_REMOVAL_EVENT" // large LP withdrawal detected
-  | "BUNDLED_LAUNCH"          // bundled_launch_detected from RugCheck
-  | "INSIDER_ACTIVITY"        // insider_flags from RugCheck
-  | "SINGLE_HOLDER_DANGER";   // single_holder_danger from RugCheck risks[]
-```
-
-**Build `historical_flags[]` in the scanner** (not the LLM):
-
-```typescript
-function buildHistoricalFlags(data: {
-  has_rug_history: boolean;
-  bundled_launch: boolean;
-  single_holder_danger: boolean;
-  dev_wallet_analysis?: { previous_rugs: boolean; sol_balance: number | null };
-}): HistoricalFlag[] {
-  const flags: HistoricalFlag[] = [];
-  if (data.has_rug_history)     flags.push("PAST_RUG");
-  if (data.bundled_launch)      flags.push("BUNDLED_LAUNCH");
-  if (data.single_holder_danger) flags.push("SINGLE_HOLDER_DANGER");
-  if (data.dev_wallet_analysis?.previous_rugs) flags.push("DEV_EXITED");
-  return flags;
-}
-```
-
----
-
-### Confidence Score (numeric)
-
-Replace the string `data_confidence` with a numeric `confidence` field.
-Keep `data_confidence` as a derived string for backwards compatibility.
-
-```typescript
-function calculateConfidence(data: {
-  sources_available: number;   // how many sources returned data
-  sources_total: number;       // total sources attempted
-  data_age_ms: number;
-  rugcheck_age_seconds?: number;
-  token_health?: string;
-}): number {
-  let score = 1.0;
-
-  // Source completeness
-  const completeness = data.sources_available / data.sources_total;
-  score *= completeness;
-
-  // Data freshness
-  if (data.data_age_ms > 60_000) score -= 0.1;
-  if (data.data_age_ms > 300_000) score -= 0.2;
-
-  // RugCheck staleness (historical data only)
-  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) score -= 0.15;
-
-  // Token health caps
-  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") score = Math.min(score, 0.3);
-  if (data.token_health === "LOW_ACTIVITY") score = Math.min(score, 0.6);
-
-  return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
-}
-
-// Derive string for backwards compat
-function confidenceToString(c: number): "HIGH" | "MEDIUM" | "LOW" {
-  if (c >= 0.7) return "HIGH";
-  if (c >= 0.4) return "MEDIUM";
-  return "LOW";
-}
-```
-
----
-
-## Agent-Native Intelligence Types
-
-These types are shared across all four services. Define them in
-`src/scanner/types.ts` and import everywhere.
-
-### ScoringFactor
-
-```typescript
-interface ScoringFactor {
-  name: string;           // machine-readable key, e.g. "mint_authority"
-  value: number | string | boolean | null; // raw value from source
-  impact: number;         // score change: negative=penalty, 0=neutral, positive=bonus
-  interpretation: string; // short human-readable explanation, max 60 chars
-}
-```
-
-Every factor that contributes to the deterministic score MUST appear in
-`factors[]`. Include impact: 0 entries for checks that passed — agents need
-to see that a check was performed, not just that it failed.
-
-**Example `factors[]` output for BONK:**
-```json
-"factors": [
-  { "name": "mint_authority", "value": true, "impact": 0, "interpretation": "mint authority revoked — safe" },
-  { "name": "freeze_authority", "value": true, "impact": 0, "interpretation": "freeze authority revoked — safe" },
-  { "name": "top_10_holders", "value": 40.3, "impact": 0, "interpretation": "healthy holder distribution" },
-  { "name": "lp_status", "value": "NOT_APPLICABLE", "impact": 0, "interpretation": "Meteora CLMM — LP burn not applicable" },
-  { "name": "liquidity_usd", "value": 85000000, "impact": 0, "interpretation": "deep liquidity" },
-  { "name": "rugcheck_score", "value": 101, "impact": 0, "interpretation": "low risk score" },
-  { "name": "token_age_days", "value": 743, "impact": 0, "interpretation": "established token" }
-]
-```
-
-**Example `factors[]` output for HAWK:**
-```json
-"factors": [
-  { "name": "mint_authority", "value": true, "impact": 0, "interpretation": "mint authority revoked — safe" },
-  { "name": "freeze_authority", "value": true, "impact": 0, "interpretation": "freeze authority revoked — safe" },
-  { "name": "top_10_holders", "value": 71.7, "impact": -20, "interpretation": "high concentration — dump risk" },
-  { "name": "lp_status", "value": "BURNED", "impact": 0, "interpretation": "LP burned at pump.fun launch" },
-  { "name": "rugcheck_score", "value": 5909, "impact": -30, "interpretation": "extreme rug risk score" },
-  { "name": "single_holder_danger", "value": true, "impact": -25, "interpretation": "single wallet holds dangerous supply pct" },
-  { "name": "liquidity_usd", "value": 76000, "impact": 0, "interpretation": "adequate liquidity" }
-]
-```
-
-**Build factors[] in `src/scanner/riskScorer.ts`** alongside the existing
-`calculateRiskGrade()`. Refactor to return both grade and factors:
-
-```typescript
-export function calculateRiskGrade(
-  factors: RiskFactors,
-  exempt: boolean = false
-): { grade: RiskGrade; scoringFactors: ScoringFactor[]; rawScore: number } {
-  if (factors.has_rug_history) {
-    return {
-      grade: "F", rawScore: 0,
-      scoringFactors: [{ name: "rug_history", value: true, impact: -100,
-        interpretation: "confirmed rug pull history — automatic F" }],
-    };
-  }
-
-  const sf: ScoringFactor[] = [];
-  let score = 100;
-
-  // Authority — skipped for exempt tokens
-  if (!exempt) {
-    if (!factors.mint_authority_revoked) {
-      score -= 25;
-      sf.push({ name: "mint_authority", value: false, impact: -25, interpretation: "mint authority active — inflation risk" });
-    } else {
-      sf.push({ name: "mint_authority", value: true, impact: 0, interpretation: "mint authority revoked — safe" });
-    }
-    // ... same pattern for all other penalties
-  }
-
-  score = Math.max(0, score);
-  const grade = score >= 80 ? "A" : score >= 60 ? "B" : score >= 40 ? "C" : score >= 20 ? "D" : "F";
-  return { grade, rawScore: score, scoringFactors: sf };
-}
-```
-
----
-
-### SignalSubtype
-
-```typescript
-type SignalSubtype =
-  | "NO_VOLUME_ACTIVITY"    // near-zero volume — token dead or illiquid
-  | "EARLY_PUMP"            // sharp price rise + high buy pressure + young token
-  | "DISTRIBUTION_PHASE"    // high sell pressure + declining price + active volume
-  | "POST_RUG_STAGNATION"   // dead volume + >80% below ATH (likely rugged)
-  | "HIGH_SPECULATION"      // extreme price volatility + thin liquidity
-  | "ORGANIC_GROWTH"        // steady volume + balanced pressure + rising price
-  | "NORMAL_CORRECTION"     // healthy token in pullback from ATH
-  | "NONE";                 // no specific subtype detected
-```
-
-**Derive `signal_subtype` deterministically in `src/scanner/marketIntel.ts`**
-after token_health and signal are resolved. No ML — pure rule logic:
-
-```typescript
-function deriveSignalSubtype(data: {
-  signal: string;
-  token_health: string;
-  volume_24h_usd: number;
-  price_change_1h_pct: number | null;
-  price_change_24h_pct: number | null;
-  pct_from_ath: number | null;
-  buy_pressure: string;
-  sell_pressure: string;
-}): SignalSubtype {
-  const ch1h  = data.price_change_1h_pct ?? 0;
-  const ch24h = data.price_change_24h_pct ?? 0;
-  const ath   = data.pct_from_ath;
-
-  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
+  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID")
     return (ath !== null && ath < -80) ? "POST_RUG_STAGNATION" : "NO_VOLUME_ACTIVITY";
-  }
   if (data.token_health === "LOW_ACTIVITY") return "NO_VOLUME_ACTIVITY";
+  if (liq < 25_000 && data.signal !== "NEUTRAL") return "LOW_LIQUIDITY_TRAP";
+  if (data.buy_sell_ratio < 0.3 && data.sell_pressure === "HIGH") return "SELL_PRESSURE_DOMINANCE";
+  if (ch1h < -10 && ch24h > 10 && data.volume_24h_usd > 50_000) return "MOMENTUM_BREAKDOWN";
   if (ch1h > 20 && data.buy_pressure === "HIGH" && data.sell_pressure === "LOW") return "EARLY_PUMP";
   if (data.sell_pressure === "HIGH" && ch24h < -10 && data.volume_24h_usd > 10_000) return "DISTRIBUTION_PHASE";
   if (ath !== null && ath < -80 && data.volume_24h_usd < 50_000) return "POST_RUG_STAGNATION";
@@ -609,82 +558,344 @@ function deriveSignalSubtype(data: {
 }
 ```
 
-**Apply to `sol_quick_scan` too** — the quick scan signal can also carry a subtype
-using the same rule logic (volume, price change, token age). Build a simpler variant
-without the market_intel-specific fields.
-
----
-
 ### HistoricalFlag
 
 ```typescript
 type HistoricalFlag =
-  | "PAST_RUG"                // has_rug_history from RugCheck
-  | "DEV_EXITED"              // dev wallet sold all holdings (deep dive only)
-  | "LIQUIDITY_REMOVAL_EVENT" // large LP withdrawal on-chain
-  | "BUNDLED_LAUNCH"          // bundled_launch_detected from RugCheck
-  | "INSIDER_ACTIVITY"        // insider_flags from RugCheck
-  | "SINGLE_HOLDER_DANGER";   // single_holder_danger from RugCheck risks[]
-```
+  | "PAST_RUG" | "DEV_EXITED" | "LIQUIDITY_REMOVAL_EVENT" | "BUNDLED_LAUNCH"
+  | "INSIDER_ACTIVITY" | "SINGLE_HOLDER_DANGER"
+  | "DEV_ASSOCIATED_WITH_PREVIOUS_RUG" | "SUSPICIOUS_LAUNCH_PATTERN";
 
-**Build `historical_flags[]` in the scanner — never in the LLM:**
-
-```typescript
 function buildHistoricalFlags(data: {
-  has_rug_history: boolean;
-  bundled_launch: boolean;
-  single_holder_danger: boolean;
+  has_rug_history: boolean; bundled_launch: boolean; single_holder_danger: boolean;
   dev_wallet_analysis?: { previous_rugs: boolean };
+  sniper_activity?: string; launch_pattern?: string;
 }): HistoricalFlag[] {
   const flags: HistoricalFlag[] = [];
-  if (data.has_rug_history)             flags.push("PAST_RUG");
-  if (data.bundled_launch)              flags.push("BUNDLED_LAUNCH");
-  if (data.single_holder_danger)        flags.push("SINGLE_HOLDER_DANGER");
-  if (data.dev_wallet_analysis?.previous_rugs) flags.push("DEV_EXITED");
+  if (data.has_rug_history)                    flags.push("PAST_RUG");
+  if (data.bundled_launch)                     flags.push("BUNDLED_LAUNCH");
+  if (data.single_holder_danger)               flags.push("SINGLE_HOLDER_DANGER");
+  if (data.dev_wallet_analysis?.previous_rugs) flags.push("DEV_ASSOCIATED_WITH_PREVIOUS_RUG");
+  if (data.launch_pattern === "STEALTH_LAUNCH" && data.sniper_activity === "HIGH")
+    flags.push("SUSPICIOUS_LAUNCH_PATTERN");
   return flags;
 }
 ```
 
 ---
 
-### Confidence Score (0.0–1.0)
-
-Replace the string `data_confidence` with numeric `confidence`.
-Keep `data_confidence` as a derived string for backwards compatibility.
+## Wallet Risk: Classification Logic
 
 ```typescript
-function calculateConfidence(data: {
-  sources_available: number;
-  sources_total: number;
-  data_age_ms: number;
-  rugcheck_age_seconds?: number;
-  token_health?: string;
-}): number {
-  let score = data.sources_available / data.sources_total; // completeness
+function classifyWallet(data: {
+  total_trades: number; wallet_age_days: number;
+  risk_score_overall: number; strong_signals: number;
+}): "LOW_RISK" | "HIGH_RISK" | "UNKNOWN" {
+  if (data.total_trades < 10 || data.wallet_age_days < 7) return "UNKNOWN";
+  if (data.risk_score_overall >= 70 && data.strong_signals >= 2) return "HIGH_RISK";
+  if (data.risk_score_overall < 40) return "LOW_RISK";
+  return "UNKNOWN";
+}
+```
 
-  if (data.data_age_ms > 60_000)  score -= 0.1;
-  if (data.data_age_ms > 300_000) score -= 0.2;
-  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) score -= 0.15;
+## Wallet Risk: Copy-Trade Classification Logic
 
-  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID")
-    score = Math.min(score, 0.3);
-  if (data.token_health === "LOW_ACTIVITY") score = Math.min(score, 0.6);
+This function is the sole source of truth for `copy_trading`. Never derive it elsewhere.
+The confidence cap below 0.5 for small samples is intentional — it signals to buyer
+agents that the worthiness rating should not be acted upon with high conviction.
 
-  return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+```typescript
+interface CopyTradingResult {
+  worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+  confidence: number;
+  sample_size: number;
+  key_signals: string[];
+  reason: string | null;
 }
 
-function confidenceToString(c: number): "HIGH" | "MEDIUM" | "LOW" {
-  if (c >= 0.7) return "HIGH";
-  if (c >= 0.4) return "MEDIUM";
-  return "LOW";
+function classifyCopyTrading(data: {
+  total_trades: number;
+  win_rate_pct: number | null;
+  avg_hold_time_hours: number | null;
+  consistency: "HIGH" | "MEDIUM" | "LOW";
+  sniper_score: number;
+  rug_exit_rate_pct: number | null;
+  is_bot: boolean;
+}): CopyTradingResult {
+  // Bots: their edge does not transfer to a human copying their trades
+  if (data.is_bot) {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "wallet classified as bot — copy-trade signal not applicable",
+    };
+  }
+
+  // Hard gate: 20 trades minimum. Below this, any rating is statistically meaningless.
+  // 3 good trades looks amazing but tells us nothing about skill vs luck.
+  if (data.total_trades < 20 || data.win_rate_pct === null) {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "insufficient trading history — minimum 20 closed trades required",
+    };
+  }
+
+  const signals: string[] = [];
+  let score = 0;
+
+  if (data.win_rate_pct >= 60)      { score += 30; signals.push("high_win_rate"); }
+  else if (data.win_rate_pct >= 45) { score += 15; }
+
+  if (data.consistency === "HIGH")        { score += 25; signals.push("consistent_sizing"); }
+  else if (data.consistency === "MEDIUM") { score += 10; }
+
+  // 1h–72h sweet spot: deliberate entry/exit discipline
+  if (data.avg_hold_time_hours !== null &&
+      data.avg_hold_time_hours >= 1 && data.avg_hold_time_hours <= 72) {
+    score += 15; signals.push("disciplined_hold_time");
+  }
+
+  // Low sniper score = entries don't depend on front-running — more copyable
+  if (data.sniper_score < 30) { score += 10; signals.push("non_sniper_entries"); }
+
+  if (data.rug_exit_rate_pct !== null && data.rug_exit_rate_pct > 60) {
+    score += 20; signals.push("strong_rug_exit_discipline");
+  }
+
+  // Confidence scales with sample size.
+  // Intentionally capped at 0.5 below 50 trades — signal is real but fragile.
+  const raw_confidence = Math.min(1, data.total_trades / 100);
+  const confidence = data.total_trades < 50
+    ? Math.min(0.5, raw_confidence)
+    : raw_confidence;
+
+  const worthiness: "HIGH" | "MEDIUM" | "LOW" =
+    score >= 60 ? "HIGH" : score >= 35 ? "MEDIUM" : "LOW";
+
+  return {
+    worthiness,
+    confidence: Math.round(confidence * 100) / 100,
+    sample_size: data.total_trades,
+    key_signals: signals,
+    reason: null,
+  };
+}
+```
+
+## Wallet Risk: MEV Detection Logic
+
+Derived from Helius parsed transactions. No external API required.
+
+```typescript
+// Victim: sandwich triplets where this wallet sits between two txs from
+// the same sender in the same slot with worse-than-oracle execution price.
+function calculateMevVictimScore(data: {
+  total_swaps: number; sandwich_victim_count: number;
+}): number {
+  if (data.total_swaps === 0) return 0;
+  return Math.min(100, Math.round((data.sandwich_victim_count / data.total_swaps) * 100));
+}
+
+// Bot: wallet is itself a sandwich attacker.
+// Signals: consistent Jito tip payments, swap triplet authorship, consistent tip ratio.
+function detectMevBot(data: {
+  jito_tip_tx_count: number; total_tx_count: number;
+  swap_triplet_author_count: number; consistent_tip_ratio: boolean;
+}): { is_mev_bot: boolean; mev_bot_confidence: number } {
+  let score = 0;
+  if (data.jito_tip_tx_count / Math.max(data.total_tx_count, 1) > 0.3) score += 40;
+  if (data.swap_triplet_author_count > 5) score += 35;
+  if (data.consistent_tip_ratio) score += 25;
+  return {
+    is_mev_bot: score >= 50,
+    mev_bot_confidence: Math.min(1, Math.round(score) / 100),
+  };
+}
+```
+
+## Wallet Risk: Pump.fun Intelligence Logic
+
+```typescript
+// % of pump.fun tokens exited within 10 minutes of Raydium migration.
+// null when no pump.fun activity found in history.
+function calculatePumpfunGraduationExitRate(data: {
+  pumpfun_tokens_bought: number; pumpfun_tokens_exited_at_graduation: number;
+}): number | null {
+  if (data.pumpfun_tokens_bought === 0) return null;
+  return Math.round((data.pumpfun_tokens_exited_at_graduation / data.pumpfun_tokens_bought) * 100);
+}
+
+// % of ALL tokens bought within 60 seconds of the token's first on-chain tx.
+// null when fewer than 5 tokens have timing data.
+function calculateEarlyEntryRate(data: {
+  tokens_with_timing_data: number; tokens_entered_within_60s: number;
+}): number | null {
+  if (data.tokens_with_timing_data < 5) return null;
+  return Math.round((data.tokens_entered_within_60s / data.tokens_with_timing_data) * 100);
+}
+```
+
+## Wallet Risk: Score Calculation
+
+```typescript
+function calculateWalletScore(data: WalletRiskData): {
+  overall: number;
+  components: { history_depth: number; behavioral_risk: number; counterparty_exposure: number };
+} {
+  let behavioral_risk = 0;
+  if (data.sniper_score > 70) behavioral_risk += 25;
+  else if (data.sniper_score > 40) behavioral_risk += 15;
+  if (data.win_rate_pct !== null && data.win_rate_pct > 80) behavioral_risk += 10;
+  if (data.rug_exit_rate_pct !== null && data.rug_exit_rate_pct > 80) behavioral_risk += 20;
+  if (data.is_bot) behavioral_risk += 15;
+  behavioral_risk = Math.min(100, behavioral_risk);
+
+  let history_depth = 0;
+  if (data.wallet_age_days < 7) history_depth += 20;
+  else if (data.wallet_age_days < 30) history_depth += 10;
+  history_depth = Math.min(100, history_depth);
+
+  let counterparty_exposure = 0;
+  if (data.funding_wallet_risk === "HIGH") counterparty_exposure += 20;
+  if (data.whale_status && data.sniper_score > 40) counterparty_exposure += 15;
+  counterparty_exposure = Math.min(100, counterparty_exposure);
+
+  const overall = Math.min(100, Math.max(0, behavioral_risk + history_depth + counterparty_exposure));
+  return { overall, components: { history_depth, behavioral_risk, counterparty_exposure } };
 }
 ```
 
 ---
 
-## Input Validation (`src/validate.ts`)
+## Wallet Risk Scanner (`src/scanner/walletRisk.ts`)
 
-Always validate before hitting any external API.
+### Data sources
+
+| Source | Call | Data extracted |
+|---|---|---|
+| Helius RPC | `getSignaturesForAddress` (last 200 txs) | Total tx count, wallet age, MEV signals |
+| Helius Enhanced API | `getAssetsByOwner` | Token holdings, portfolio value |
+| Helius Enhanced API | parsed transactions | Buy/sell events, Jito tips, pump.fun events |
+| DexScreener | price lookups on traded tokens | PnL per position |
+| Public RPC | `getAccountInfo` | SOL balance, funding wallet trace |
+
+All calls run in parallel via `Promise.allSettled()`. Timeout per call: 8000ms.
+
+`historical_exposure.high_risk_tokens_traded` scans ALL tokens traded in the last 30
+days — no cap. If Helius returns partial data, set `data_quality: "PARTIAL"` and add
+`"historical_exposure_partial"` to `missing_fields`. Never silently truncate.
+
+### Behaviour classification
+
+```
+"BOT"          → >500 txs/day avg OR uniform trade amounts within 1% variance
+"SNIPER"       → sniper_score > 60 AND avg_hold_time_hours < 2
+"FLIPPER"      → avg_hold_time_hours < 24 AND tokens_traded_30d > 20
+"HODLER"       → avg_hold_time_hours > 168 AND tokens_traded_30d < 5
+"DEGEN"        → high tx count, diverse tokens, low win rate (<40%)
+"LOW_ACTIVITY" → total_trades < 10
+"INCONCLUSIVE" → insufficient data (<10 closed positions)
+```
+
+### SLA budget (20s total)
+
+```
+0–8s:   Parallel Helius + DexScreener calls
+8–13s:  Signal calculation (MEV, pump.fun, copy-trade, classification)
+13–15s: historical_exposure scan (all tokens, no cap)
+15–18s: Haiku LLM call (or Groq fallback)
+18–20s: Response assembly
+```
+
+If Helius enhanced tx parsing takes >12s, fall back to basic metadata
+and set `data_quality: "LIMITED"`.
+
+---
+
+## Volatility Calculation (`src/scanner/marketIntel.ts`)
+
+```typescript
+function deriveVolatility(data: {
+  price_change_5m_pct: number | null;
+  price_change_15m_pct: number | null;
+  price_change_1h_pct: number | null;
+}): "LOW" | "MEDIUM" | "HIGH" {
+  const ref = data.price_change_5m_pct ?? data.price_change_15m_pct ?? data.price_change_1h_pct ?? 0;
+  const abs = Math.abs(ref);
+  if (data.price_change_5m_pct !== null) {
+    return abs > 5 ? "HIGH" : abs > 2 ? "MEDIUM" : "LOW";
+  }
+  if (data.price_change_15m_pct !== null) {
+    return abs > 10 ? "HIGH" : abs > 4 ? "MEDIUM" : "LOW";
+  }
+  return abs > 20 ? "HIGH" : abs > 8 ? "MEDIUM" : "LOW";
+}
+```
+
+---
+
+## Deep Dive: Recommendation Engine
+
+```typescript
+function buildRecommendation(data: {
+  risk_grade: string;
+  risk_breakdown: { contract_risk: string; liquidity_risk: string; market_risk: string; behavioral_risk: string };
+  historical_flags: HistoricalFlag[];
+  confidence_model: number;
+}): { action: "AVOID" | "WATCH" | "CONSIDER" | "DYOR"; reason: string; confidence: number; time_horizon: "SHORT_TERM" | "MEDIUM_TERM" | "LONG_TERM" } {
+  const highRisks = Object.entries(data.risk_breakdown)
+    .filter(([, v]) => v === "HIGH")
+    .map(([k]) => k.replace("_risk", "").toUpperCase());
+
+  if (data.risk_grade === "F" || highRisks.length >= 3)
+    return { action: "AVOID", reason: highRisks.join(" + ") || "CRITICAL_GRADE", confidence: 0.9, time_horizon: "SHORT_TERM" };
+  if (data.historical_flags.includes("PAST_RUG") || data.historical_flags.includes("DEV_ASSOCIATED_WITH_PREVIOUS_RUG"))
+    return { action: "AVOID", reason: "CONFIRMED_RUG_HISTORY", confidence: 0.95, time_horizon: "SHORT_TERM" };
+  if (data.risk_grade === "D" || highRisks.length >= 1)
+    return { action: "WATCH", reason: highRisks.join(" + ") || "ELEVATED_RISK", confidence: data.confidence_model, time_horizon: "SHORT_TERM" };
+  if (data.risk_grade === "A" || data.risk_grade === "B")
+    return { action: "CONSIDER", reason: "ACCEPTABLE_STRUCTURAL_RISK", confidence: data.confidence_model, time_horizon: "MEDIUM_TERM" };
+  return { action: "DYOR", reason: "INCONCLUSIVE_SIGNALS", confidence: Math.min(data.confidence_model, 0.5), time_horizon: "SHORT_TERM" };
+}
+```
+
+---
+
+## Token Health Classification
+
+```typescript
+function classifyTokenHealth(data: {
+  volume_24h_usd: number | null; liquidity_usd: number | null;
+  price_change_1h_pct: number | null; price_change_24h_pct: number | null;
+}): "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD" {
+  const vol = data.volume_24h_usd ?? 0;
+  const liq = data.liquidity_usd ?? 0;
+  const ch1h = data.price_change_1h_pct ?? 0;
+  const ch24h = data.price_change_24h_pct ?? 0;
+  if (vol < 1_000 || liq < 1_000) return "DEAD";
+  if (liq < 5_000)                return "ILLIQUID";
+  if (vol < 10_000)               return "LOW_ACTIVITY";
+  if (ch1h < -5 && ch24h < -20)  return "DECLINING";
+  return "ACTIVE";
+}
+
+function deriveSignal(
+  rawSignal: "BULLISH" | "BEARISH" | "NEUTRAL",
+  health: string, pct_from_ath: number | null
+): "BULLISH" | "BEARISH" | "NEUTRAL" {
+  if (health === "DEAD" || health === "ILLIQUID") return "BEARISH";
+  if (health === "LOW_ACTIVITY" && pct_from_ath !== null && pct_from_ath < -80) return "BEARISH";
+  if (health === "DECLINING" && rawSignal === "NEUTRAL") return "BEARISH";
+  return rawSignal;
+}
+```
+
+`data_quality` caps: DEAD/ILLIQUID → `LIMITED`, LOW_ACTIVITY → `PARTIAL` at best.
+
+---
+
+## Input Validation (`src/validate.ts`)
 
 ```typescript
 import { PublicKey } from "@solana/web3.js";
@@ -692,427 +903,46 @@ import { PublicKey } from "@solana/web3.js";
 export function isValidSolanaAddress(address: string): boolean {
   if (typeof address !== "string") return false;
   if (address.length < 32 || address.length > 44) return false;
-  try {
-    new PublicKey(address);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function isValidSolanaWallet(address: string): boolean {
-  return isValidSolanaAddress(address);
+  try { new PublicKey(address); return true; } catch { return false; }
 }
 ```
 
-All four ACP handlers and all four Hono endpoints must call `isValidSolanaAddress()`
-before any downstream work. Return HTTP 400 immediately on failure:
-
-```typescript
-app.post("/scan/quick", async (c) => {
-  const body = await c.req.json().catch(() => null);
-  if (!body || !isValidSolanaAddress(body?.token_address)) {
-    return c.json(
-      { error: "INVALID_ADDRESS", message: "token_address must be a valid Solana base58 address (32–44 chars)", data_confidence: "LOW" },
-      400
-    );
-  }
-  // scanner logic...
-});
-```
-
-For `sol_wallet_risk` the field is `wallet_address` — adjust the message accordingly.
-Never return 500 for a bad address. The review team explicitly tests rejection behaviour.
+All four ACP handlers and all four Hono endpoints must call this before any downstream work.
+Return HTTP 400 immediately on failure. Never return 500 for a bad address.
 
 ---
 
 ## Source Responsibility Split
 
-Each source owns specific fields exclusively. No field is fetched from two sources
-and merged. This eliminates the RugCheck cache staleness problem entirely for
-safety-critical fields.
-
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  HELIUS — live on-chain, always fresh (~400ms)              │
-│                                                             │
-│  mint_authority_revoked     ← getAccountInfo (MintLayout)   │
-│  freeze_authority_revoked   ← getAccountInfo (MintLayout)   │
-│  top_10_holder_pct          ← getTokenLargestAccounts       │
-│  lp_burned                  ← getTokenLargestAccounts on LP │
-│                               (TRADITIONAL_AMM only)        │
-│  dev_wallet_address         ← getAsset (Metaplex DAS)       │
-│  dev_wallet_age_days        ← getSignaturesForAddress       │
-│  dev_wallet_sol_balance     ← getBalance                    │
-│  dev_token_count            ← getSignaturesForAddress       │
-│  pump_fun_launched          ← creator program ID check      │
-│  token_age_days             ← first tx signature            │
-└─────────────────────────────────────────────────────────────┘
+HELIUS — live on-chain
+  mint_authority_revoked, freeze_authority_revoked, top_10_holder_pct, lp_burned,
+  dev_wallet_address, dev_wallet_age_days, dev_wallet_sol_balance, dev_token_count,
+  pump_fun_launched, token_age_days,
+  mev_victim_score (parsed txs), is_mev_bot (parsed txs),
+  pumpfun_graduation_exit_rate_pct, early_entry_rate_pct
 
-┌─────────────────────────────────────────────────────────────┐
-│  RUGCHECK — historical pattern data, staleness acceptable   │
-│                                                             │
-│  has_rug_history            ← cross-token flagged DB        │
-│  bundled_launch_detected    ← proprietary launch analysis   │
-│  rugcheck_risk_score        ← aggregate score (not rugged!) │
-│  single_holder_danger       ← parsed from risks[] array     │
-│  insider_flags              ← insider trading detection     │
-│  report_age_seconds         ← tracked for confidence only   │
-│                                                             │
-│  NOTE: .rugged boolean is null on free tier — use .score    │
-│  NOTE: parse risks[] for danger-level single holder signals │
-└─────────────────────────────────────────────────────────────┘
+RUGCHECK — historical pattern data (staleness acceptable)
+  has_rug_history, bundled_launch_detected, rugcheck_risk_score,
+  single_holder_danger, insider_flags, report_age_seconds
+  NOTE: .rugged boolean is null on free tier — use .score
 
-┌─────────────────────────────────────────────────────────────┐
-│  DEXSCREENER — market data (Birdeye as fallback)            │
-│                                                             │
-│  liquidity_usd    price_usd    volume_24h                   │
-│  price_change_24h_pct    buy_sell_ratio    large_txs        │
-│  dexId  (→ used to classify lp_model)                       │
-└─────────────────────────────────────────────────────────────┘
+DEXSCREENER — market data (Birdeye fallback)
+  liquidity_usd, price_usd, volume_24h, price_change_24h_pct,
+  buy_sell_ratio, large_txs, dexId
 
-> **NEW — Birdeye OHLCV** is now also used as a primary source for ATH
-> detection in `sol_market_intel`. This requires a Birdeye API key set as
-> `BIRDEYE_API_KEY` in `.env`. Without the key, `pct_from_ath` returns null.
-
-## Birdeye OHLCV (`src/sources/birdeye.ts`)
-
-Used in `sol_market_intel` to fetch all-time high price and detect dead/rugged tokens.
-
-**Endpoint:** `GET https://public-api.birdeye.so/defi/ohlcv`
-
-**Required header:** `X-API-KEY: {BIRDEYE_API_KEY}`
-
-**Parameters:**
-
-| Param | Value | Notes |
-|---|---|---|
-| `address` | token mint address | base58 |
-| `type` | `1D` | daily candles — covers full token history |
-| `time_from` | unix timestamp | token creation or 2 years ago, whichever is later |
-| `time_to` | `Math.floor(Date.now() / 1000)` | current time |
-| `chain` | `solana` | always solana for SolProbe |
-
-**Response shape** (what matters for ATH detection):
-```typescript
-{
-  success: boolean,
-  data: {
-    items: Array<{
-      o: number,          // open
-      h: number,          // high — use this for ATH calculation
-      l: number,          // low
-      c: number,          // close
-      v: number,          // volume
-      unixTime: number,   // candle timestamp
-      address: string,
-    }>
-  }
-}
-```
-
-**Implementation in `src/sources/birdeye.ts`:**
-
-```typescript
-export async function getTokenOHLCV(
-  address: string,
-  options: { timeout: number }
-): Promise<{ ath_price_usd: number; candles: number } | null> {
-  const apiKey = process.env.BIRDEYE_API_KEY;
-  if (!apiKey) return null; // graceful degradation — no key, skip ATH
-
-  if (!isAvailable("birdeye")) return null;
-
-  try {
-    const timeFrom = Math.floor(Date.now() / 1000) - (365 * 2 * 24 * 60 * 60); // 2 years
-    const timeTo   = Math.floor(Date.now() / 1000);
-
-    const url = `https://public-api.birdeye.so/defi/ohlcv` +
-      `?address=${address}&type=1D&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
-
-    const res = await fetch(url, {
-      headers: { "X-API-KEY": apiKey },
-      signal: AbortSignal.timeout(options.timeout),
-    });
-
-    if (!res.ok) throw new Error(`Birdeye OHLCV ${res.status}`);
-
-    const data = await res.json();
-    const items = data?.data?.items ?? [];
-
-    if (!items.length) {
-      recordSuccess("birdeye");
-      return null;
-    }
-
-    // ATH = highest "h" (high) value across all daily candles
-    const ath_price_usd = Math.max(...items.map((c: any) => c.h ?? 0));
-    recordSuccess("birdeye");
-    return { ath_price_usd, candles: items.length };
-  } catch (err) {
-    recordFailure("birdeye");
-    return null;
-  }
-}
-```
-
-**Circuit breaker:** wrap with existing `isAvailable("birdeye")` and
-`recordSuccess/recordFailure("birdeye")` — already defined in circuitBreaker.ts.
-
-**Rate limit:** Birdeye free tier allows 100 req/min on OHLCV. Add to token bucket:
-```typescript
-birdeye: 100 req/min
-```
-
-**Timeout:** 4000ms. Runs in parallel with DexScreener in marketIntel.ts.
-If Birdeye fails or key is missing, `pct_from_ath` and `ath_price_usd` return null.
-This is graceful degradation — market intel still works without Birdeye.
-
-**Environment variable to add to `.env`:**
-```
-BIRDEYE_API_KEY=   # get free key at bds.birdeye.so
+BIRDEYE OHLCV — ATH detection (sol_market_intel only)
+  ath_price_usd, pct_from_ath, price_change_5m_pct, price_change_15m_pct
+  Requires BIRDEYE_API_KEY — graceful null if missing
 ```
 
 ---
 
-## Token Health Classification (`src/scanner/marketIntel.ts`)
-
-Applied after all sources settle. These rules override the buy/sell ratio signal
-when volume or liquidity conditions make the ratio statistically meaningless.
+## Helius: Authority Flags
 
 ```typescript
-function classifyTokenHealth(data: {
-  volume_24h_usd: number | null;
-  liquidity_usd: number | null;
-  price_change_1h_pct: number | null;
-  price_change_24h_pct: number | null;
-}): "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD" {
-  const vol   = data.volume_24h_usd ?? 0;
-  const liq   = data.liquidity_usd  ?? 0;
-  const ch1h  = data.price_change_1h_pct  ?? 0;
-  const ch24h = data.price_change_24h_pct ?? 0;
-
-  if (vol < 1_000 || liq < 1_000)  return "DEAD";
-  if (liq < 5_000)                  return "ILLIQUID";
-  if (vol < 10_000)                 return "LOW_ACTIVITY";
-  if (ch1h < -5 && ch24h < -20)    return "DECLINING";
-  return "ACTIVE";
-}
-```
-
-**Signal override rules** — applied after `classifyTokenHealth()`:
-
-```typescript
-function deriveSignal(
-  rawSignal: "BULLISH" | "BEARISH" | "NEUTRAL",
-  health: string,
-  pct_from_ath: number | null
-): "BULLISH" | "BEARISH" | "NEUTRAL" {
-  // Dead/illiquid tokens are always BEARISH — buy/sell ratio is noise
-  if (health === "DEAD" || health === "ILLIQUID") return "BEARISH";
-
-  // Low activity + sustained price decline = BEARISH regardless of ratio
-  if (health === "LOW_ACTIVITY" && pct_from_ath !== null && pct_from_ath < -80) {
-    return "BEARISH";
-  }
-
-  // Declining tokens override NEUTRAL to BEARISH
-  if (health === "DECLINING" && rawSignal === "NEUTRAL") return "BEARISH";
-
-  return rawSignal;
-}
-```
-
-**data_confidence override:**
-
-| token_health | data_confidence cap |
-|---|---|
-| `DEAD` | `LOW` — always, regardless of source count |
-| `ILLIQUID` | `LOW` |
-| `LOW_ACTIVITY` | `MEDIUM` at best |
-| `DECLINING` | no cap — real data |
-| `ACTIVE` | no cap |
-
-**pct_from_ath calculation:**
-```typescript
-const pct_from_ath = (ath_price_usd !== null && current_price_usd > 0)
-  ? ((current_price_usd - ath_price_usd) / ath_price_usd) * 100  // always negative
-  : null;
-```
-
-A token 95% below ATH with LOW_ACTIVITY is almost certainly rugged.
-A token 30% below ATH with ACTIVE health is in a normal correction.
-
----
-
-## DEX LP Model Classification (`src/sources/dexscreener.ts`)
-
-LP burn is only a meaningful signal on traditional AMMs. On concentrated liquidity
-DEXes (Meteora DLMM, Orca Whirlpool), there is no LP token to burn — the concept
-does not apply. Penalising null LP burn on these DEXes is wrong.
-
-```typescript
-export type LPModel = "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
-
-const TRADITIONAL_AMM_DEXES = new Set([
-  "raydium", "pumpfun", "pump", "fluxbeam", "saber", "aldrin", "crema",
-]);
-
-const CLMM_DLMM_DEXES = new Set([
-  "meteora", "meteoradlmm", "orca", "whirlpool", "orcawhirlpool",
-]);
-
-export function classifyLPModel(dexId: string | null | undefined): LPModel {
-  if (!dexId) return "UNKNOWN";
-  const id = dexId.toLowerCase();
-  if (TRADITIONAL_AMM_DEXES.has(id) || id.includes("pump")) return "TRADITIONAL_AMM";
-  if (CLMM_DLMM_DEXES.has(id) || id.includes("meteora") || id.includes("orca"))
-    return "CLMM_DLMM";
-  return "UNKNOWN";
-}
-```
-
-Call `classifyLPModel(pairs[0]?.dexId)` in the DexScreener result and expose
-`lp_model` alongside existing fields. Wire into RiskFactors in both quickScan.ts
-and deepDive.ts.
-
-**LP check logic in quickScan.ts:**
-```typescript
-const lpModel = classifyLPModel(dexData?.pairs?.[0]?.dexId);
-const lpMint  = dexData?.lp_mint_address ?? null;
-
-// Only attempt LP burn check on traditional AMMs
-// On CLMM/DLMM there is no LP mint — null is expected and carries no penalty
-const lp_burned = lpModel === "TRADITIONAL_AMM"
-  ? (lpMint ? await checkLPBurned(lpMint, { timeout: 2_000 }) : null)
-  : null;
-```
-
-**Known DEX examples:**
-| DEX | Model | LP burn applicable |
-|---|---|---|
-| Raydium AMM V4 | TRADITIONAL_AMM | ✅ yes |
-| pump.fun | TRADITIONAL_AMM | ✅ yes (always burned) |
-| Meteora DLMM | CLMM_DLMM | ❌ no — no LP mint |
-| Orca Whirlpool | CLMM_DLMM | ❌ no — no LP mint |
-
----
-
-## DEX LP Model Classification (`src/sources/dexscreener.ts`)
-
-LP burn is only meaningful on traditional AMMs with fungible LP tokens.
-On concentrated liquidity DEXes (Meteora DLMM, Orca Whirlpool) there is no
-LP token to burn — the concept does not apply, and null LP burn data is expected.
-Penalising null on these DEXes incorrectly penalises the DEX architecture.
-
-UNKNOWN is treated as cautious but not as dangerous as confirmed TRADITIONAL_AMM
-with missing data. New DEXes or unrecognised IDs get a mild penalty.
-
-```typescript
-export type LPModel = "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
-
-// Fungible LP token AMMs — LP burn is applicable and meaningful
-const TRADITIONAL_AMM_DEXES = new Set([
-  "raydium", "pumpfun", "pump", "fluxbeam", "saber", "aldrin", "crema",
-]);
-
-// Concentrated/position-based liquidity — NO LP mint, burn concept does not apply
-// NOTE: raydiumclmm belongs here, NOT in TRADITIONAL_AMM
-const CLMM_DLMM_DEXES = new Set([
-  "meteora", "meteoradlmm", "orca", "whirlpool", "orcawhirlpool",
-  "raydiumclmm",  // Raydium CLMM ≠ traditional LP — behaves like Orca Whirlpool
-]);
-
-export function classifyLPModel(dexId: string | null | undefined): LPModel {
-  if (!dexId) return "UNKNOWN";
-  const id = dexId.toLowerCase();
-  if (TRADITIONAL_AMM_DEXES.has(id) || id.includes("pump")) return "TRADITIONAL_AMM";
-  // Use startsWith for prefix matching — safer than includes() which can over-match
-  if (CLMM_DLMM_DEXES.has(id) || id.startsWith("meteora") || id.startsWith("orca"))
-    return "CLMM_DLMM";
-  return "UNKNOWN";
-}
-```
-
-**Primary pair selection — use highest liquidity, not first indexed:**
-```typescript
-// pairs[0] is NOT guaranteed to be highest liquidity or primary market
-// Always select by highest liquidity to avoid misclassification
-const primaryPair = dexData?.pairs
-  ?.slice()
-  .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-
-const lpModel = classifyLPModel(primaryPair?.dexId);
-const dex_id  = primaryPair?.dexId ?? null; // expose raw dexId for debugging
-```
-
-**LP check logic in quickScan.ts and deepDive.ts:**
-```typescript
-// Only attempt LP burn check on traditional AMMs
-// On CLMM/DLMM there is no LP mint — null is expected and carries NO penalty
-// On UNKNOWN, attempt check but apply only mild penalty if null
-const lpMint = primaryPair?.lp_mint_address ?? null;
-
-const lp_burned =
-  lpModel === "CLMM_DLMM"
-    ? null  // not applicable — no penalty in scorer
-    : (lpMint ? await checkLPBurned(lpMint, { timeout: 2_000 }) : null);
-```
-
-**Expose `lp_status` for downstream clarity (response field):**
-
-Instead of exposing only `lp_burned: boolean | null`, also expose a human-readable
-`lp_status` field so buyer agents understand the distinction:
-
-```typescript
-type LPStatus = "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
-
-function deriveLPStatus(lp_burned: boolean | null, lp_model: LPModel): LPStatus {
-  if (lp_model === "CLMM_DLMM") return "NOT_APPLICABLE";
-  if (lp_burned === true)  return "BURNED";
-  if (lp_burned === false) return "UNBURNED";
-  return "UNKNOWN";
-}
-```
-
-Add `lp_status` and `dex_id` to both `sol_quick_scan` and `sol_deep_dive` responses.
-
-**Known DEX LP model examples:**
-
-| DEX | DexScreener dexId | Model | LP burn applicable |
-|---|---|---|---|
-| Raydium AMM V4 | `raydium` | TRADITIONAL_AMM | ✅ yes |
-| pump.fun | `pump` / `pumpfun` | TRADITIONAL_AMM | ✅ yes (always burned at launch) |
-| Raydium CLMM | `raydiumclmm` | CLMM_DLMM | ❌ no — position-based |
-| Meteora DLMM | `meteora` | CLMM_DLMM | ❌ no — no LP mint exists |
-| Orca Whirlpool | `orca` / `whirlpool` | CLMM_DLMM | ❌ no — no LP mint exists |
-| Unknown / new DEX | any unrecognised | UNKNOWN | cautious — mild penalty |
-
-BONK’s primary pair is on Meteora (CLMM_DLMM) — confirmed from live DexScreener
-data (`dexId: "meteora"`). `lp_burned: null` on BONK is correct and expected.
-`lp_status` will return `"NOT_APPLICABLE"` which is unambiguous to buyer agents.
-
----
-
-RugCheck staleness is acceptable for its owned fields because rug history,
-bundled launches, and insider flags are historical events — they do not change
-after the fact. The RugCheck paid tier (fresh reports, websocket stream) is
-currently listed as "coming soon" and is not available.
-
----
-
-## Helius: Authority Flags (`src/sources/helius.ts`)
-
-Add `getTokenMintInfo()` if not already present. This is the canonical implementation
-for authority checks — called on every scan, unconditionally.
-
-```typescript
-import { Connection, PublicKey } from "@solana/web3.js";
-import { MintLayout } from "@solana/spl-token";
-
 export async function getTokenMintInfo(
-  mintAddress: string,
-  connection: Connection
+  mintAddress: string, connection: Connection
 ): Promise<{ mint_authority_revoked: boolean; freeze_authority_revoked: boolean } | null> {
   try {
     const pubkey = new PublicKey(mintAddress);
@@ -1123,1262 +953,224 @@ export async function getTokenMintInfo(
       mint_authority_revoked: !mint.mintAuthorityOption,
       freeze_authority_revoked: !mint.freezeAuthorityOption,
     };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 ```
 
-Use the Helius RPC URL from `process.env.SOLANA_RPC_URL`. Wrap with the existing
-RPC rotation logic. On null return, default both flags to `false` (conservative —
-not revoked). Never default to `true`.
-
-The `RugCheckResult` interface must NOT contain `mint_authority_revoked` or
-`freeze_authority_revoked`. These fields must never come from RugCheck.
-
-### LP Burn Check (`src/sources/helius.ts`)
-
-Checks whether the liquidity pool tokens have been burned. An unburned LP means
-the creator can rug at any moment. Pump.fun burns LP by default; Raydium does not.
-
-The check: call `getTokenLargestAccounts` on the LP mint address. If the single
-largest holder is a known burn/dead address, the LP is burned. If it is the creator
-wallet or any non-burn address, it is not burned.
-
-Known Solana burn addresses:
-```typescript
-const BURN_ADDRESSES = new Set([
-  "1nc1nerator11111111111111111111111111111111",
-  "11111111111111111111111111111111",          // system program (zero address)
-  "So11111111111111111111111111111111111111112", // sometimes used as burn
-]);
-```
-
-```typescript
-export async function checkLPBurned(
-  lpMintAddress: string,
-  connection: Connection
-): Promise<boolean | null> {
-  try {
-    const pubkey = new PublicKey(lpMintAddress);
-    const holders = await connection.getTokenLargestAccounts(pubkey);
-    if (!holders.value.length) return null;
-
-    // LP is burned if the top holder is a burn/dead address
-    const topHolder = holders.value[0];
-    const ownerInfo = await connection.getAccountInfo(topHolder.address);
-    // If account has no data or is owned by system program it's effectively burned
-    return BURN_ADDRESSES.has(topHolder.address.toBase58()) ||
-           (ownerInfo === null);
-  } catch {
-    return null;
-  }
-}
-```
-
-**On null return:** treat LP as not burned (conservative — worst case). Apply penalty.
-**This call runs in parallel** with other Helius calls in `Promise.allSettled()`.
-**LP mint address source:** DexScreener returns the LP mint in pool data. Extract it
-from `pairs[0].liquidity.base` or equivalent. If not available, skip the check.
-
-### Creator Wallet Age (`src/sources/helius.ts`)
-
-A fresh wallet creating a token is one of the strongest rug predictors. Check when
-the creator wallet first appeared on-chain using `getSignaturesForAddress` with a
-`limit: 1` and `before: undefined` to get the oldest transaction.
-
-```typescript
-export async function getWalletAgeDays(
-  walletAddress: string,
-  connection: Connection
-): Promise<number | null> {
-  try {
-    const pubkey = new PublicKey(walletAddress);
-    // Get the very last (oldest) signature — use 'before' pagination
-    // Fetch in batches until we hit the end
-    let before: string | undefined;
-    let oldestSig: string | null = null;
-
-    // Limit to 2 batches max to stay within SLA — good enough approximation
-    for (let i = 0; i < 2; i++) {
-      const sigs = await connection.getSignaturesForAddress(pubkey, {
-        limit: 1000,
-        before,
-      });
-      if (!sigs.length) break;
-      oldestSig = sigs[sigs.length - 1].signature;
-      if (sigs.length < 1000) break; // reached the beginning
-      before = sigs[sigs.length - 1].signature;
-    }
-
-    if (!oldestSig) return null;
-    const tx = await connection.getTransaction(oldestSig, { maxSupportedTransactionVersion: 0 });
-    if (!tx?.blockTime) return null;
-
-    const ageMs = Date.now() - tx.blockTime * 1000;
-    return Math.floor(ageMs / (1000 * 60 * 60 * 24));
-  } catch {
-    return null;
-  }
-}
-```
-
-**SLA note:** This call is only used in `sol_deep_dive` (30s SLA). Do NOT call
-`getWalletAgeDays` in `sol_quick_scan` (5s SLA) — it is too slow for the quick path.
-For quick scan, use only the signals already available in parallel (RugCheck, DexScreener,
-Helius mint info, top holders).
+On null return, default both to `false` (conservative). RugCheckResult must NEVER
+contain authority flags.
 
 ---
 
-## Wallet Risk Scanner (`src/scanner/walletRisk.ts`)
-
-> **Rebuilt service** — $0.10 / 20s SLA. Real behavioural signals from parsed
-> transaction history. Not shallow RPC metadata heuristics.
-
-### Data sources
-
-| Source | Call | Data extracted |
-|---|---|---|
-| Helius RPC | `getSignaturesForAddress` (last 200 txs) | Total tx count, wallet age |
-| Helius Enhanced API | `getAssetsByOwner` | Current token holdings, portfolio value |
-| Helius Enhanced API | parsed transactions | Buy/sell events, amounts, tokens |
-| DexScreener | price lookups on traded tokens | PnL estimation per position |
-| Public RPC | `getAccountInfo` | SOL balance, funding wallet trace |
-
-All calls run in parallel via `Promise.allSettled()`. Timeout per call: 8000ms.
-Total budget: 18s (leaving 2s for LLM prose generation).
-
-### Signal definitions
-
-**`win_rate_pct`**
-Percentage of closed token positions (bought then sold) where the exit price
-exceeded the entry price. Only calculated when ≥5 closed positions exist.
-Null when insufficient history.
-
-**`sniper_score` (0–100)**
-How frequently this wallet appears in the first 20 buyers of a new token launch.
-Derived by cross-referencing buy timestamps against token creation time from
-DexScreener. 0 = never sniped, 100 = always among first buyers.
-High sniper score is a red flag for counterparty risk — snipers dump on retail.
-
-**`rug_exit_rate_pct`**
-Of all tokens this wallet traded that subsequently died (liquidity < $100 within
-30 days of the wallet's last trade), what % did the wallet sell before collapse.
-High rate = experienced rug trader. Low rate = victim. Null when insufficient data.
-
-**`funding_wallet_risk`**
-Checks the wallet that initially funded this wallet (SOL transfer chain).
-HIGH = funded by a known token deployer or fresh wallet chain
-MEDIUM = funded by an exchange withdrawal or aged wallet
-LOW = funded by a well-established wallet with long history
-
-**`trading_style` classification rules**
-```
-"bot"     → >500 txs/day avg OR uniform trade amounts within 1% variance
-"sniper"  → sniper_score > 60 AND avg_hold_time_hours < 2
-"flipper" → avg_hold_time_hours < 24 AND tokens_traded_30d > 20
-"hodler"  → avg_hold_time_hours > 168 (7 days) AND tokens_traded_30d < 5
-"degen"   → high tx count, diverse tokens, low win rate (<40%)
-"unknown" → insufficient data (<10 closed positions)
-```
-
-**`risk_score` (0–100, higher = riskier counterparty)**
-
-| Signal | Impact |
-|---|---|
-| `sniper_score > 70` | +25 |
-| `sniper_score > 40` | +15 |
-| `win_rate_pct > 80` | +10 (suspiciously good — likely insider) |
-| `rug_exit_rate_pct > 80` | +20 (consistently exits before rugs) |
-| `funding_wallet_risk === HIGH` | +20 |
-| `wallet_age_days < 7` | +20 |
-| `wallet_age_days < 30` | +10 |
-| `is_bot === true` | +15 |
-| `whale_status && sniper_score > 40` | +15 |
-
-Score floored at 0, capped at 100.
-
-### LLM prompt (Haiku)
+## DEX LP Model Classification
 
 ```typescript
-export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
-  const prompt = `Summarise the counterparty risk profile of this Solana wallet 
-in exactly one sentence. Be direct and specific. Use the data below.
+const TRADITIONAL_AMM_DEXES = new Set(["raydium","pumpfun","pump","fluxbeam","saber","aldrin","crema"]);
+const CLMM_DLMM_DEXES = new Set(["meteora","meteoradlmm","orca","whirlpool","orcawhirlpool","raydiumclmm"]);
 
-Wallet age: ${data.wallet_age_days ?? "unknown"} days
-Trading style: ${data.trading_style}
-Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}
-Sniper score: ${data.sniper_score}/100
-Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "unknown"}
-Funding risk: ${data.funding_wallet_risk}
-Risk score: ${data.risk_score}/100
-Is bot: ${data.is_bot}
-30d PnL estimate: ${data.pnl_estimate_30d_usdc != null ? "$" + data.pnl_estimate_30d_usdc.toFixed(0) : "unknown"}
-
-Output one sentence only. Example: "High-conviction sniper with 73% win rate 
-and consistent pre-rug exits — treat as informed adversary, not organic trader."`;
-
-  return callWithFallback("fast", WALLET_RISK_SYSTEM, prompt, 80);
+export function classifyLPModel(dexId: string | null | undefined): LPModel {
+  if (!dexId) return "UNKNOWN";
+  const id = dexId.toLowerCase();
+  if (TRADITIONAL_AMM_DEXES.has(id) || id.includes("pump")) return "TRADITIONAL_AMM";
+  if (CLMM_DLMM_DEXES.has(id) || id.startsWith("meteora") || id.startsWith("orca")) return "CLMM_DLMM";
+  return "UNKNOWN";
 }
 
-const WALLET_RISK_SYSTEM = `You are a DeFi counterparty risk analyst. 
-Output exactly one sentence assessing wallet risk. Never hedge or use 
-qualifiers like "appears to" or "may be". Be specific and direct.`;
+// Always highest-liquidity pair — never pairs[0]
+const primaryPair = dexData?.pairs?.slice()
+  .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
 ```
-
-### Deterministic fallback
-
-```typescript
-export function fallbackWalletRiskSummary(data: WalletRiskData): string {
-  const style = data.trading_style;
-  const risk = data.risk_score > 70 ? "high" : data.risk_score > 40 ? "moderate" : "low";
-  const age = data.wallet_age_days != null ? `${data.wallet_age_days}d old` : "age unknown";
-  return `${style.charAt(0).toUpperCase() + style.slice(1)} wallet (${age}) — ${risk} counterparty risk score ${data.risk_score}/100.`;
-}
-```
-
-### SLA budget (20s total)
-
-```
-0–8s:   Parallel Helius + DexScreener calls (all via Promise.allSettled)
-8–16s:  Signal calculation (synchronous, fast)
-16–18s: Haiku LLM call (or Groq fallback)
-18–20s: Response assembly and return
-```
-
-If Helius enhanced transaction parsing takes >12s (large wallet), fall back
-to basic metadata only and set `data_confidence: "LOW"`. Never blow the SLA.
 
 ---
 
-## Jupiter Token List (`src/sources/jupiterTokenList.ts`)
+## Jupiter Token List
 
-The Jupiter verified token list is the authoritative source for identifying tokens
-with legitimately retained authorities — stablecoins, wrapped assets, and bridge
-tokens. This replaces any static token whitelist. The list is fetched once at
-startup and refreshed every 24 hours in the background.
+```typescript
+const EXEMPT_TAGS = new Set(["stable","stablecoin","wormhole","wrapped"]);
+// "verified" and "strict" excluded — apply to memecoins like BONK
+```
 
-**Why Jupiter:** Actively maintained by the most authoritative source in Solana
-DeFi, covers thousands of verified tokens, has semantic tags built in, and
-requires no guesswork. USDC, USDT, wETH, wBTC, mSOL, JitoSOL and any future
-verified tokens are handled automatically without manual list maintenance.
+Only bypassed for exempt: mint authority (-25), freeze authority (-15), concentration (-20/-35).
+All other penalties apply regardless. Load fire-and-forget at startup.
 
-**API details:**
-- Endpoint: `https://lite-api.jup.ag/tokens/v2/tag?query=verified`
-- No API key required — free public endpoint
-- Response: array of token objects where each token has `id` (the mint address),
-  `symbol`, `name`, `tags[]`
-- The v2 API uses `id` not `address` for the mint — important for map population
+---
 
-**Confirmed working tags in v2 response (verified from live API):**
+## Risk Scorer
 
-| Tag | Meaning | In EXEMPT_TAGS |
+Deterministic, no ML. Score 100, penalties subtracted. `has_rug_history` → instant F.
+
+### Penalty table
+
+| Condition | Penalty | Exempt |
 |---|---|---|
-| `"stable"` | Stablecoins (USDC, USDT etc) — primary tag in v2 | ✅ yes |
-| `"stablecoin"` | Legacy tag — seed list compatibility | ✅ yes |
-| `"wormhole"` | Wormhole bridge-wrapped assets | ✅ yes |
-| `"wrapped"` | Other wrapped assets and liquid staking tokens | ✅ yes |
-| `"verified"` | Jupiter identity verification — applies to memecoins too | ❌ NO |
-| `"strict"` | Jupiter strict list membership — applies to memecoins too | ❌ NO |
-| `"community"` | Community-submitted token | ❌ NO |
+| `mint_authority_revoked === false` or null | -25 | ✅ |
+| `freeze_authority_revoked === false` or null | -15 | ✅ |
+| `top_10_holder_pct > 90%` or null | -35 | ✅ |
+| `top_10_holder_pct > 60%` | -20 | ✅ |
+| `lp_burned === false` (TRADITIONAL_AMM) | -25 | ❌ |
+| `lp_burned === null` (TRADITIONAL_AMM) | -10 | ❌ |
+| `lp_burned === false` (UNKNOWN DEX) | -25 | ❌ |
+| `lp_burned === null` (UNKNOWN DEX) | -5 | ❌ |
+| CLMM_DLMM | 0 | n/a |
+| `rugcheck_risk_score > 5000` | -30 | ❌ |
+| `rugcheck_risk_score > 2000` | -20 | ❌ |
+| `rugcheck_risk_score > 1000` | -10 | ❌ |
+| `single_holder_danger` | -25 | ❌ |
+| `liquidity_usd < $1k` or null | -35 | ❌ |
+| `liquidity_usd < $10k` | -20 | ❌ |
+| `bundled_launch` | -20 | ❌ |
+| `buy_sell_ratio < 0.5` | -10 | ❌ |
+| `token_age_days === null` | -10 | ❌ |
+| `token_age_days < 1` | -15 | ❌ |
+| `dev_wallet_age_days < 7` | -20 | ❌ deep only |
+| `dev_wallet_age_days < 1` | -30 | ❌ deep only |
 
-> **Critical:** `"verified"` and `"strict"` must NEVER be in EXEMPT_TAGS.
-> These tags confirm a token's identity but say nothing about whether retained
-> authority is legitimate. BONK, WIF, and thousands of memecoins carry these
-> tags — including them incorrectly exempts memecoins from authority penalties,
-> which are the most important safety signal SolProbe provides.
->
-> Only `"stable"`, `"stablecoin"`, `"wormhole"`, and `"wrapped"` indicate that
-> retained mint/freeze authority is by institutional design rather than rug risk.
-
-```typescript
-// src/sources/jupiterTokenList.ts
-
-interface JupiterToken {
-  address: string;
-  symbol: string;
-  name: string;
-  tags: string[];
-}
-
-// Tags that indicate legitimately retained authority — not a rug risk
-// "verified" and "strict" intentionally excluded — they apply to memecoins like BONK
-const EXEMPT_TAGS = new Set([
-  "stable",       // v2 API tag for stablecoins (USDC, USDT etc)
-  "stablecoin",   // seed list compatibility
-  "wormhole",     // Wormhole-wrapped assets
-  "wrapped",      // other wrapped assets and liquid staking
-]);
-
-const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-// Seed list — always populated at module load, no network cost
-// Ensures known majors work even if the Jupiter API fetch fails
-const SEED_LIST: JupiterToken[] = [
-  { address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", symbol: "USDC",    name: "USD Coin",           tags: ["stablecoin"] },
-  { address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  symbol: "USDT",    name: "Tether USD",          tags: ["stablecoin"] },
-  { address: "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX",   symbol: "USDH",    name: "USDH",                tags: ["stablecoin"] },
-  { address: "UXPhBoR3qG4UCiGNJfV7MqhHyFqKN68g45GoYvAeL2m",  symbol: "UXD",     name: "UXD Stablecoin",      tags: ["stablecoin"] },
-  { address: "So11111111111111111111111111111111111111112",    symbol: "SOL",     name: "Wrapped SOL",         tags: ["wrapped"] },
-  { address: "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  symbol: "WETH",    name: "Wrapped Ether",       tags: ["wormhole"] },
-  { address: "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  symbol: "WBTC",    name: "Wrapped Bitcoin",     tags: ["wormhole"] },
-  { address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  symbol: "mSOL",    name: "Marinade staked SOL", tags: ["wrapped"] },
-  { address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  symbol: "JitoSOL", name: "Jito Staked SOL",     tags: ["wrapped"] },
-  { address: "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",   symbol: "bSOL",    name: "BlazeStake SOL",      tags: ["wrapped"] },
-];
-
-// Populate from seed at module load — synchronous, zero network cost
-let tokenMap = new Map<string, JupiterToken>();
-for (const t of SEED_LIST) tokenMap.set(t.address, t);
-console.info(`[jupiter] seed list loaded (${tokenMap.size} tokens)`);
-
-let lastFetched = 0;
-
-export async function loadJupiterTokenList(): Promise<void> {
-  try {
-    const res = await fetch(
-      "https://lite-api.jup.ag/tokens/v2/tag?query=verified",
-      { signal: AbortSignal.timeout(10_000) }
-    );
-    if (!res.ok) throw new Error(`Jupiter list HTTP ${res.status}`);
-
-    // v2 response: array of objects with "id" (mint address), not "address"
-    const tokens: Array<{ id: string; name: string; symbol: string; tags: string[] }> =
-      await res.json();
-
-    // Merge fetched tokens on top of seed — API wins on conflict
-    // Seed entries remain even if the API fetch fails
-    for (const t of tokens) {
-      tokenMap.set(t.id, {
-        address: t.id,
-        name: t.name,
-        symbol: t.symbol,
-        tags: t.tags ?? [],
-      });
-    }
-
-    lastFetched = Date.now();
-    console.info(`[jupiter] loaded ${tokenMap.size} tokens (API + seed)`);
-  } catch (err) {
-    console.warn("[jupiter] fetch failed — serving from seed list only", err);
-  }
-}
-
-export async function ensureFresh(): Promise<void> {
-  if (Date.now() - lastFetched > REFRESH_INTERVAL_MS) {
-    await loadJupiterTokenList();
-  }
-}
-
-export function isAuthorityExempt(address: string): boolean {
-  const token = tokenMap.get(address);
-  if (!token) return false;
-  return token.tags.some(tag => EXEMPT_TAGS.has(tag));
-}
-
-export function getExemptReason(address: string): string | null {
-  const token = tokenMap.get(address);
-  if (!token) return null;
-  const matchedTag = token.tags.find(tag => EXEMPT_TAGS.has(tag));
-  if (!matchedTag) return null;
-  const reasons: Record<string, string> = {
-    stable:     `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
-    stablecoin: `${token.symbol} is a verified stablecoin — mint authority retained by regulated issuer`,
-    wormhole:   `${token.symbol} is a Wormhole-wrapped asset — authority retained by bridge program`,
-    wrapped:    `${token.symbol} is a wrapped asset — authority retained by wrapping protocol`,
-  };
-  return reasons[matchedTag] ?? `${token.symbol} is a verified token with legitimate retained authority`;
-}
-```
-
-**On fetch failure:** the seed list remains in the map and all known majors
-continue to work. The API fetch is additive — it never clears the seed.
-
-**Integration in `src/api/server.ts`:**
-
-Load at startup (fire-and-forget — does not block server start):
-```typescript
-import { loadJupiterTokenList, ensureFresh } from "../sources/jupiterTokenList.js";
-
-loadJupiterTokenList().catch(err =>
-  console.warn("[startup] Jupiter token list unavailable:", err)
-);
-```
-
-Call `ensureFresh()` inside the `/health` endpoint so the list refreshes
-automatically every 24h without a server restart:
-```typescript
-app.get("/health", async (c) => {
-  await ensureFresh();
-  // ... rest of handler unchanged
-});
-```
-
-**Integration in `src/scanner/riskScorer.ts`:**
-
-Check `isAuthorityExempt()` before applying authority penalties. Only these
-two penalties are bypassed for exempt tokens:
-- `mint_authority_revoked === false`: skip the -25 penalty
-- `freeze_authority_revoked === false`: skip the -15 penalty
-
-All other penalties still apply (concentration, liquidity, bundled launch, etc).
-
-```typescript
-import { isAuthorityExempt } from "../sources/jupiterTokenList.js";
-
-export function calculateRiskScore(factors: RiskFactors, tokenAddress?: string) {
-  const exempt = tokenAddress ? isAuthorityExempt(tokenAddress) : false;
-  let score = 100;
-
-  // Authority penalties — skipped for exempt tokens (stablecoins, wrapped assets)
-  if (!exempt) {
-    if (!factors.mint_authority_revoked)  score -= 25;
-    if (!factors.freeze_authority_revoked) score -= 15;
-  }
-
-  // All other penalties apply regardless of exempt status
-  // ... concentration, liquidity, bundled launch, etc
-}
-```
-
-**Integration in `src/scanner/quickScan.ts` and `src/scanner/deepDive.ts`:**
-
-```typescript
-import { isAuthorityExempt, getExemptReason } from "../sources/jupiterTokenList.js";
-
-const exempt = isAuthorityExempt(address);
-const exemptReason = getExemptReason(address);
-
-// Include in response
-const result = {
-  ...scanData,
-  authority_exempt: exempt,
-  authority_exempt_reason: exemptReason,
-};
-
-// Include in LLM prompt so narrative reflects it correctly
-const llmInput = {
-  ...result,
-  ...(exempt ? { note: `This token is authority-exempt: ${exemptReason}` } : {}),
-};
-```
+Grades: 80–100 A | 60–79 B | 40–59 C | 20–39 D | 0–19 F | rug → F
 
 ---
 
 ## Parallel Data Fetching
 
-All sources must be fetched in parallel. Never make sequential calls.
-Use `Promise.allSettled()` — never `Promise.all()`.
-Every source call must have its own `AbortSignal.timeout()`.
+`Promise.allSettled()` always. Every call needs its own `AbortSignal.timeout()`.
 
-### Per-source timeout budget
-
-| Source | Timeout | Notes |
-|---|---|---|
-| DexScreener | 4000ms | Usually <500ms |
-| RugCheck | 3000ms | Can be slow |
-| Helius/RPC | 3000ms | Wraps RPC rotation |
-| Birdeye | 4000ms | Fallback only |
-| Solscan | 4000ms | Fallback only |
-
-### Pattern
-
-```typescript
-async function fetchQuickScanData(address: string) {
-  const results = await Promise.allSettled([
-    dexscreener.getToken(address, { timeout: 4000 }),
-    rugcheck.getSummary(address, { timeout: 3000 }),
-    helius.getTokenMintInfo(address, { timeout: 3000 }),  // always runs
-    helius.getTopHolders(address, { timeout: 3000 }),     // always runs
-  ]);
-
-  const [dexResult, rugResult, mintResult, holdersResult] = results;
-
-  // Log any failures
-  if (dexResult.status === "rejected") logError("dexscreener", dexResult.reason, address);
-  if (rugResult.status === "rejected") logError("rugcheck", rugResult.reason, address);
-  if (mintResult.status === "rejected") logError("helius_rpc", mintResult.reason, address);
-
-  const dexData     = dexResult.status === "fulfilled" ? dexResult.value : null;
-  const rugData     = rugResult.status === "fulfilled" ? rugResult.value : null;
-  const mintData    = mintResult.status === "fulfilled" ? mintResult.value : null;
-  const holdersData = holdersResult.status === "fulfilled" ? holdersResult.value : null;
-
-  // Authority flags — Helius only, conservative default on null
-  const mint_authority_revoked  = mintData?.mint_authority_revoked  ?? false;
-  const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
-}
-```
+| Source | Timeout |
+|---|---|
+| DexScreener | 4000ms |
+| RugCheck | 3000ms |
+| Helius/RPC | 3000ms |
+| Birdeye | 4000ms |
+| Solscan | 4000ms |
 
 ---
 
-## In-Flight Request Deduplication (`src/cache.ts`)
+## Circuit Breaker
 
-```typescript
-const inFlight = new Map<string, Promise<any>>();
-
-export async function deduplicate<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  if (inFlight.has(key)) return inFlight.get(key)! as Promise<T>;
-  const promise = fn().finally(() => inFlight.delete(key));
-  inFlight.set(key, promise);
-  return promise;
-}
-```
-
-Usage:
-```typescript
-const cacheKey = `quick:${address}`;
-return deduplicate(cacheKey, () => cache.getOrFetch(cacheKey, () => fetchQuickScanData(address)));
-```
-
----
-
-## Circuit Breaker (`src/circuitBreaker.ts`)
-
-After 5 consecutive failures, fail-fast for 60 seconds before retrying.
+5 consecutive failures → fail-fast for 60s before retrying.
 
 ```typescript
 type SourceName = "dexscreener" | "rugcheck" | "helius_rpc" | "birdeye" | "solscan";
-
 const FAILURE_THRESHOLD = 5;
 const COOLDOWN_MS = 60_000;
-
-export function isAvailable(source: SourceName): boolean { ... }
-export function recordSuccess(source: SourceName): void { ... }
-export function recordFailure(source: SourceName): void { ... }
-```
-
-Every source client wraps its fetch:
-```typescript
-if (!isAvailable("dexscreener")) return null;
-try {
-  const data = await fetchWithTimeout(url, 4000);
-  recordSuccess("dexscreener");
-  return data;
-} catch (err) {
-  recordFailure("dexscreener");
-  throw err;
-}
 ```
 
 ---
 
 ## Error Handling Rules
 
-- Never return an error to the calling agent. Always return a degraded but valid response.
-- `recommendation` in `sol_deep_dive` must never be undefined — default to `"DYOR"` on LOW confidence.
-- Log all API failures to `errors.log`: timestamp, source, status_code, token_address, error_message.
-- Log every job to `jobs.log`: timestamp, service, address, response_time_ms, data_confidence, sources_used.
-- Treat null authority flags as not-revoked (worst-case / most conservative).
+- Never return a hard error to calling agent — always a degraded valid response.
+- `recommendation.action` must never be undefined — default `"DYOR"`.
+- `classification` must never be undefined — default `"UNKNOWN"`.
+- `copy_trading.worthiness` must never be undefined — default `"UNKNOWN"`.
+- `copy_trading.reason` must never be null when `worthiness === "UNKNOWN"`.
+- `data_quality` must reflect reality — never upgrade to FULL when sources failed.
+- Log failures to `errors.log`, every job to `jobs.log`.
 
 ---
 
-## Caching & Rate Limiting (`src/cache.ts`)
+## Caching
 
-### Per-service TTLs
-
-| Service | TTL | Rationale |
-|---|---|---|
-| `sol_quick_scan` | 30s | Memecoin focus — tighter staleness budget |
-| `sol_market_intel` | 15s | Signals product — tightest staleness |
-| `sol_wallet_risk` | 300s | Wallet history is slow-moving |
-| `sol_deep_dive` | 60s | Expensive to recompute |
-
-```typescript
-export const CACHE_TTL: Record<string, number> = {
-  sol_quick_scan:   30_000,
-  sol_market_intel: 15_000,
-  sol_wallet_risk:  300_000,
-  sol_deep_dive:    60_000,
-};
-```
-
-Cache key: `{service}:{address}`. Never share cache entries across services.
-
-### Outbound token bucket limits (self-implemented)
-
-| Source | Limit |
+| Service | TTL |
 |---|---|
-| DexScreener | 300 req/min |
-| RugCheck | 100 req/min |
+| `sol_quick_scan` | 30s |
+| `sol_market_intel` | 15s |
+| `sol_wallet_risk` | 300s |
+| `sol_deep_dive` | 60s |
 
-Fail immediately when bucket is empty — do not queue or wait.
-
----
-
-## Inbound Rate Limiter (`src/api/rateLimiter.ts`)
-
-Per-IP continuous token bucket. Applied to all scanner routes, not to `/health`.
-
-```typescript
-const buckets = new Map<string, { tokens: number; last: number }>();
-const RATE_LIMIT = 60;
-const WINDOW_MS  = 60_000;
-
-export function checkRateLimit(ip: string): boolean {
-  const now    = Date.now();
-  const bucket = buckets.get(ip) ?? { tokens: RATE_LIMIT, last: now };
-  const elapsed = now - bucket.last;
-  bucket.tokens = Math.min(RATE_LIMIT, bucket.tokens + (elapsed / WINDOW_MS) * RATE_LIMIT);
-  bucket.last = now;
-  if (bucket.tokens < 1) { buckets.set(ip, bucket); return false; }
-  bucket.tokens -= 1;
-  buckets.set(ip, bucket);
-  if (buckets.size > 10_000) buckets.clear();
-  return true;
-}
-```
-
-Middleware order in `server.ts` — strictly in this order:
-1. Body size cap (`app.use("*")`) — 1024 byte limit, returns 413
-2. Rate limiter (`app.use("/scan/*")`, `/wallet/*`, `/market/*`) — returns 429
-3. Route handlers
+Cache key: `{service}:{address}`. Never share entries across services.
 
 ---
 
-## RPC Rotation & Retry Logic (`src/sources/helius.ts`)
+## LLM Narrative Engine
+
+| Service | Field | Model |
+|---|---|---|
+| `sol_quick_scan` | `summary` | Haiku |
+| `sol_wallet_risk` | `risk_summary` | Haiku |
+| `sol_market_intel` | `market_summary` | Haiku |
+| `sol_deep_dive` | `full_risk_report` | Sonnet |
+
+Provider cascade: Anthropic → Groq → deterministic template.
 
 ```typescript
-const RPC_ENDPOINTS = [
-  process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com",
-  "https://rpc.ankr.com/solana",
-  "https://api.mainnet-beta.solana.com",
-] as const;
-```
-
-- Max 3 retries, rotating endpoints on each attempt
-- Delays: 500ms → 1000ms → 2000ms (exponential)
-- Respect `Retry-After` header on 429 (capped at 5s)
-- Do not retry on 400/404 — invalid address, not transient
-
----
-
-## Retry Logic (`src/utils/retry.ts`)
-
-Used by all four ACP handlers. Retry up to 3 times before returning any error.
-
-```typescript
-export async function withRetry<T>(
-  fn: () => Promise<T>,
-  options: { attempts?: number; delayMs?: number; backoff?: "linear" | "exponential"; label?: string } = {}
-): Promise<T> {
-  const { attempts = 3, delayMs = 400, backoff = "exponential", label = "operation" } = options;
-  let lastError: unknown;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      const wait = backoff === "exponential" ? delayMs * 2 ** (i - 1) : delayMs * i;
-      console.warn(`[retry] ${label} attempt ${i}/${attempts} failed — waiting ${wait}ms`);
-      if (i < attempts) await new Promise(res => setTimeout(res, wait));
-    }
-  }
-  throw lastError;
-}
-```
-
----
-
-## Weighted Source Resolver (`src/sources/resolver.ts`)
-
-Tracks rolling success rates and re-ranks sources every 100 requests.
-
-```typescript
-type SourceName = "dexscreener" | "rugcheck" | "helius" | "birdeye" | "solscan";
-
-interface SourceStats {
-  priority: number;
-  successRate: number;
-  avgLatencyMs: number;
-  totalCalls: number;
-  failures: number;
-}
-
-const SOURCE_STATS: Record<SourceName, SourceStats> = {
-  dexscreener: { priority: 1, successRate: 0.97, avgLatencyMs: 800,  totalCalls: 0, failures: 0 },
-  rugcheck:    { priority: 2, successRate: 0.94, avgLatencyMs: 1200, totalCalls: 0, failures: 0 },
-  helius:      { priority: 3, successRate: 0.91, avgLatencyMs: 400,  totalCalls: 0, failures: 0 },
-  birdeye:     { priority: 4, successRate: 0.88, avgLatencyMs: 1100, totalCalls: 0, failures: 0 },
-  solscan:     { priority: 5, successRate: 0.85, avgLatencyMs: 900,  totalCalls: 0, failures: 0 },
-};
-
-export function recordSourceResult(source: SourceName, success: boolean, latencyMs: number): void {
-  const s = SOURCE_STATS[source];
-  s.totalCalls++;
-  if (!success) s.failures++;
-  s.avgLatencyMs = s.avgLatencyMs * 0.9 + latencyMs * 0.1;
-  if (s.totalCalls % 100 === 0) s.successRate = 1 - s.failures / s.totalCalls;
-}
-
-export function rankSources(candidates?: SourceName[]): SourceName[] {
-  const pool = candidates ?? (Object.keys(SOURCE_STATS) as SourceName[]);
-  return [...pool].sort((a, b) => SOURCE_STATS[b].successRate - SOURCE_STATS[a].successRate);
-}
-
-export function getSourceStats(): Record<SourceName, SourceStats> {
-  return { ...SOURCE_STATS };
-}
-```
-
-Call `recordSourceResult()` in every source client after each fetch.
-
----
-
-## Risk Scorer (`src/scanner/riskScorer.ts`)
-
-Deterministic, no ML. Score starts at 100, penalties subtracted. `has_rug_history`
-is an instant F regardless of score.
-
-### Penalty table
-
-Penalties marked **[exempt skip]** are bypassed entirely for authority-exempt tokens
-(stablecoins and wrapped assets identified by Jupiter tags). All other
-penalties apply regardless of exempt status.
-
-| Condition | Penalty | Exempt skip | Service |
-|---|---|---|---|
-| `mint_authority_revoked === false` or null | -25 | ✅ yes | both |
-| `freeze_authority_revoked === false` or null | -15 | ✅ yes | both |
-| `top_10_holder_pct > 90%` or null | -35 | ✅ yes | both |
-| `top_10_holder_pct > 60%` | -20 | ✅ yes | both |
-| `lp_burned === false` (TRADITIONAL_AMM) | -25 | ❌ no | both |
-| `lp_burned === null` (TRADITIONAL_AMM) | -10 | ❌ no | both |
-| `lp_burned === false` (UNKNOWN DEX) | -25 | ❌ no | both |
-| `lp_burned === null` (UNKNOWN DEX) | -5 | ❌ no | both |
-| `lp_burned` on CLMM_DLMM | 0 | n/a | both |
-| `rugcheck_risk_score > 5000` | -30 | ❌ no | both |
-| `rugcheck_risk_score > 2000` | -20 | ❌ no | both |
-| `rugcheck_risk_score > 1000` | -10 | ❌ no | both |
-| `single_holder_danger === true` | -25 | ❌ no | both |
-| `liquidity_usd < $1k` or null | -35 | ❌ no | both |
-| `liquidity_usd < $10k` | -20 | ❌ no | both |
-| `bundled_launch === true` | -20 | ❌ no | both |
-| `buy_sell_ratio < 0.5` | -10 | ❌ no | both |
-| `token_age_days === null` | -10 | ❌ no | both |
-| `token_age_days < 1` | -15 | ❌ no | both |
-| `dev_wallet_age_days < 7` | -20 | ❌ no | deep only |
-| `dev_wallet_age_days < 1` | -30 | ❌ no | deep only |
-
-**Why concentration thresholds are lower than standard:**
-Memecoin trading is the primary use case. A token where a single wallet holds 70%
-is dangerous regardless of whether that wallet is the dev — it can dump at any time.
-The original 80% threshold missed real rugs like HAWK (71.7% concentration, grade A).
-60% and 90% thresholds are more appropriate for the memecoin risk profile.
-
-**Why RugCheck risk score is used as a penalty:**
-RugCheck’s `rugged` boolean field is unreliable on the free tier — it is null for
-most tokens including confirmed rugs, as it requires manual review. The numeric
-`score` field is always populated and reflects the aggregate of all risk signals
-RugCheck detects (insider ownership, bundled launch, concentration etc).
-A score above 5000 is extreme danger territory. HAWK scored 5909.
-
-Note: RugCheck risk score penalties stack with concentration penalties.
-
-**Why concentration is also exempt-skipped:** For stablecoins and wrapped assets,
-large holdings by institutional custodians (Circle treasury, Tether reserves, bridge
-programs) are by design and carry no rug risk. When `top_10_holder_pct` is null for
-USDC, the null-defaults-to-100% worst-case assumption is incorrect.
-
-**Implementation:**
-
-```typescript
-export function calculateRiskGrade(factors: RiskFactors, exempt: boolean = false): RiskGrade {
-  if (factors.has_rug_history) return "F";
-
-  let score = 100;
-
-  // Authority penalties — skipped for exempt tokens (stablecoins, wrapped assets)
-  if (!exempt) {
-    if (!factors.mint_authority_revoked)  score -= 25;
-    if (!factors.freeze_authority_revoked) score -= 15;
-  }
-
-  // Concentration penalty — skipped for exempt tokens
-  // Thresholds: 60%/90% (lower than standard to catch memecoin risk like HAWK)
-  if (!exempt) {
-    const holderPct = factors.top_10_holder_pct ?? 100;
-    if (holderPct > 90) score -= 35;
-    else if (holderPct > 60) score -= 20;
-  }
-
-  // LP burn penalty — DEX-model-aware
-  // LP burn is ONLY meaningful on traditional fungible LP AMMs (Raydium, pump.fun)
-  // On CLMM/DLMM (Meteora, Orca, raydiumclmm), there is no LP mint — null is
-  // expected and must NEVER be penalised. Penalising the DEX architecture is wrong.
-  // UNKNOWN is treated as cautious (mild penalty) — new DEX, not confirmed safe.
-  if (factors.lp_model === "TRADITIONAL_AMM") {
-    if (factors.lp_burned === false) score -= 25;     // confirmed unburned = strong risk
-    else if (factors.lp_burned === null) score -= 10; // unknown on trad AMM = caution
-    // lp_burned === true = no penalty (LP safely burned)
-  } else if (factors.lp_model === "UNKNOWN") {
-    if (factors.lp_burned === false) score -= 25;     // confirmed unburned = strong risk
-    else if (factors.lp_burned === null) score -= 5;  // mild uncertainty penalty
-  }
-  // CLMM_DLMM: lp penalty never applies
-  // Liquidity safety covered by: liquidity_usd depth, concentration, authority flags
-
-  // RugCheck risk score penalty — never skipped
-  // Use numeric score, not the unreliable rugged boolean (null on free tier)
-  if (factors.rugcheck_risk_score !== null && factors.rugcheck_risk_score !== undefined) {
-    if (factors.rugcheck_risk_score > 5_000) score -= 30;
-    else if (factors.rugcheck_risk_score > 2_000) score -= 20;
-    else if (factors.rugcheck_risk_score > 1_000) score -= 10;
-  }
-
-  // Single holder danger from RugCheck risks array — never skipped
-  if (factors.single_holder_danger) score -= 25;
-
-  // Liquidity penalties — never skipped
-  const liq = factors.liquidity_usd ?? 0;
-  if (liq < 1_000) score -= 35;
-  else if (liq < 10_000) score -= 20;
-
-  // Launch and trading penalties — never skipped
-  if (factors.bundled_launch) score -= 20;
-  if (factors.buy_sell_ratio !== null && factors.buy_sell_ratio < 0.5) score -= 10;
-
-  // Token age penalties — never skipped
-  if (factors.token_age_days === null) score -= 10;
-  else if (factors.token_age_days < 1) score -= 15;
-
-  // Creator wallet age penalties — deep dive only (null for quick scan)
-  if (factors.dev_wallet_age_days !== null) {
-    if (factors.dev_wallet_age_days < 1) score -= 30;
-    else if (factors.dev_wallet_age_days < 7) score -= 20;
-  }
-
-  // Floor at 0 — score cannot go negative
-  score = Math.max(0, score);
-
-  // Grade bands
-  if (score >= 80) return "A";
-  if (score >= 60) return "B";
-  if (score >= 40) return "C";
-  if (score >= 20) return "D";
-  return "F";
-}
-```
-
-**`RiskFactors` interface — complete:**
-
-```typescript
-interface RiskFactors {
-  // Authority flags (Helius only)
-  mint_authority_revoked: boolean | null;
-  freeze_authority_revoked: boolean | null;
-
-  // Concentration (Helius only)
-  top_10_holder_pct: number | null;
-
-  // LP burn status + DEX model (Helius via LP mint + DexScreener dexId)
-  lp_burned: boolean | null;            // true=burned, false=unburned, null=not applicable/unknown
-  lp_status: "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
-  lp_model: "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN"; // DEX architecture
-  dex_id: string | null;                // raw dexId from highest-liquidity pair
-
-  // RugCheck signals (historical, staleness acceptable)
-  has_rug_history: boolean;
-  bundled_launch: boolean;
-  rugcheck_risk_score: number | null;    // .score field — always populated
-  single_holder_danger: boolean;         // parsed from risks[] — "danger" level
-
-  // Market data (DexScreener)
-  liquidity_usd: number | null;
-  buy_sell_ratio: number | null;
-
-  // Time signals (Helius)
-  token_age_days: number | null;
-
-  // Creator wallet signals (Helius — deep dive only, null for quick scan)
-  dev_wallet_age_days: number | null;
-}
-```
-
-**Field sources:**
-- `rugcheck_risk_score` → RugCheck response `.score` (always a number)
-- `single_holder_danger` → parse `.risks[]`, true if any entry has
-  `name === "Single holder ownership"` and `level === "danger"`
-- `lp_burned` → Helius `checkLPBurned()` on the LP mint from DexScreener pool data
-  (only called when `lp_model === "TRADITIONAL_AMM"` — skip entirely for CLMM/DLMM)
-- `lp_model` → `classifyLPModel(dexData?.pairs?.[0]?.dexId)` from DexScreener
-  TRADITIONAL_AMM: raydium, pump.fun, fluxbeam, saber, aldrin
-  CLMM_DLMM: meteora, meteoradlmm, orca, whirlpool
-  UNKNOWN: unrecognised dexId or null
-  (only called when `lp_model === "TRADITIONAL_AMM"` — skip entirely for CLMM/DLMM)
-- `lp_model` → `classifyLPModel(dexData?.pairs?.[0]?.dexId)` from DexScreener
-  TRADITIONAL_AMM: raydium, pump.fun, fluxbeam, saber, aldrin
-  CLMM_DLMM: meteora, meteoradlmm, orca, whirlpool
-  UNKNOWN: unrecognised dexId or null (applies -10 uncertainty on lp_burned if null)
-  (only called when `lp_model === "TRADITIONAL_AMM"` — skip entirely for CLMM/DLMM)
-- `lp_model` → `classifyLPModel(dexData?.pairs?.[0]?.dexId)` from DexScreener
-  TRADITIONAL_AMM: raydium, pump.fun, fluxbeam, saber, aldrin
-  CLMM_DLMM: meteora, meteoradlmm, orca, whirlpool
-  UNKNOWN: unrecognised dexId or null
-- `dev_wallet_age_days` → Helius `getWalletAgeDays()` on creator wallet address
-  (deep dive only — too slow for 5s quick scan SLA)
-
-### Grade bands
-80–100 → A | 60–79 → B | 40–59 → C | 20–39 → D | 0–19 → F | rug history → F
-
-### Confidence scoring
-
-```typescript
-export function scoreConfidence(
-  sources: string[],
-  dataAgeMs: number,
-  rugCheckAgeSeconds?: number
-): "HIGH" | "MEDIUM" | "LOW" {
-  const corroborated = sources.length >= 2;
-  const fresh = dataAgeMs < 60_000;
-  // RugCheck age only caps deep_dive (bundled, insider fields)
-  // Authority flags now come from Helius — not affected by RugCheck staleness
-  const historicalDataStale = rugCheckAgeSeconds !== undefined && rugCheckAgeSeconds > 86_400;
-
-  if (historicalDataStale) return "MEDIUM";
-  if (corroborated && fresh) return "HIGH";
-  if (corroborated || fresh) return "MEDIUM";
-  return "LOW";
-}
-```
-
----
-
-## LLM Narrative Engine (`src/llm/narrativeEngine.ts`)
-
-All four services now include an LLM-generated prose field. Data collection and
-scoring always completes first — the LLM only synthesises results into prose.
-
-| Service | LLM field | Model | Rationale |
-|---|---|---|---|
-| `sol_quick_scan` | `summary` | Haiku | Fast safety verdict, 5s SLA requires small model |
-| `sol_wallet_risk` | `risk_summary` | Haiku | Synthesises 8+ behavioural signals into counterparty verdict |
-| `sol_market_intel` | `market_summary` | Haiku | Turns structured signals into actionable trading context |
-| `sol_deep_dive` | `full_risk_report` | Sonnet | Full analyst narrative, 30s SLA allows premium model |
-
-**Why LLM for wallet_risk:** Eight numeric signals (win rate, sniper score, PnL,
-hold time, rug exit rate, funding risk, bot flag, trading style) are hard for a
-buyer agent to synthesise from raw numbers. A one-sentence verdict like
-"High-conviction sniper with 73% win rate and no rug involvement — low counterparty
-risk" is directly actionable. Haiku cost is ~$0.0003, acceptable at $0.10 price.
-
-**Why LLM for market_intel:** "BULLISH, HIGH buy_pressure, LOW sell_pressure,
-$2.3M 1h volume" requires the buyer agent to synthesise signals itself. Haiku
-converts this to "Strong buying momentum with elevated volume — 3× above 24h
-average, large wallet accumulation detected" which plugs directly into a trading
-agent's decision context without extra processing.
-
-The LLM receives the fully assembled result including `factors[]`. All data
-collection and scoring happens first — the LLM only explains the decisions
-that the deterministic scorer already made. The LLM is grounded in
-`factors[]` — it must reference actual penalty contributors, not restate
-raw metrics. A summary that contradicts the scoring factors is wrong.
-
-### Provider cascade
-
-Failures fall through in order. The deterministic template is the last resort, not
-the first fallback. A $0.50 deep dive returning a two-sentence template is not
-acceptable — the cascade exists to prevent that.
-
-```
-Anthropic (primary) → Groq (fallback) → deterministic template (last resort)
-```
-
-Quality hierarchy by tier:
-```
-Sonnet 4.6 > Mixtral 8x7B > Haiku > Llama 3.1 8B > template
-```
-
-Groq is chosen as the fallback provider because it is free, has an
-OpenAI-compatible API, and has the fastest inference of any free provider
-(~600 tokens/second). Ollama on the VPS is not viable — the CCX23 has no GPU
-and a quantised 7B model on CPU takes 3–8s, which blows both SLAs.
-
-### Full implementation
-
-```typescript
-// src/llm/narrativeEngine.ts
-
-interface Provider {
-  name: string;
-  baseUrl: string;
-  apiKey: () => string;
-  models: { fast: string; deep: string };
-  format: "anthropic" | "openai";
-}
-
-const PROVIDERS: Provider[] = [
-  {
-    name: "anthropic",
-    baseUrl: "https://api.anthropic.com/v1/messages",
-    apiKey: () => process.env.ANTHROPIC_API_KEY ?? "",
-    models: {
-      fast: "claude-haiku-4-5-20251001",
-      deep: "claude-sonnet-4-6",
-    },
-    format: "anthropic",
-  },
-  {
-    name: "groq",
-    baseUrl: "https://api.groq.com/openai/v1/chat/completions",
-    apiKey: () => process.env.GROQ_API_KEY ?? "",
-    models: {
-      fast: "llama-3.1-8b-instant",  // fast enough for one-sentence summary
-      deep: "mixtral-8x7b-32768",    // stronger reasoning for deep dive
-    },
-    format: "openai",
-  },
+const PROVIDERS = [
+  { name: "anthropic", models: { fast: "claude-haiku-4-5-20251001", deep: "claude-sonnet-4-6" } },
+  { name: "groq", models: { fast: "llama-3.1-8b-instant", deep: "mixtral-8x7b-32768" } },
 ];
+```
 
+### Quick scan prompt (Haiku)
+```typescript
 const QUICK_SCAN_SYSTEM = `You are a Solana token security analyst writing
-one-sentence risk summaries for AI trading agents. You will receive a
-structured factors[] array showing exactly what penalties were applied and
-why. Explain the most important factor, not just the outcome. Never hedge.
-Never use the word "ensure". Output only the sentence.`;
-
-const DEEP_DIVE_SYSTEM = `You are a Solana token security analyst writing
-risk reports for AI trading agents. You receive a structured factors[] array
-showing all scoring contributors. Explain the top 3 risk factors and how they
-combine. Connect patterns — do not list fields independently. Ground every
-claim in the factors data.`;
-
-export async function generateQuickScanSummary(scanResult: QuickScanData): Promise<string> {
-  // Sort factors by absolute impact descending — most impactful first
-  const topFactors = [...(scanResult.factors ?? [])]
-    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
-    .slice(0, 3);
-
-  const prompt = `Write a single sentence explaining why this token received grade ${scanResult.risk_grade}.
-Reference the most impactful scoring factor from the list below.
-If grade is F, lead with the primary failure reason.
-Output only the sentence, under 30 words, no preamble.
-
-Top scoring factors:
-${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join('
-')}
-
-Full result: ${JSON.stringify(scanResult, null, 2)}`;
-
-  const result = await callWithFallback("fast", QUICK_SCAN_SYSTEM, prompt, 80);
-  return result || fallbackQuickSummary(scanResult);
-}
-
-export async function generateDeepDiveReport(scanResult: DeepDiveData): Promise<string> {
-  const topFactors = [...(scanResult.factors ?? [])]
-    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
-    .slice(0, 5);
-
-  const prompt = `Write a 3–5 sentence risk report explaining this token's score.
-Use the factors list below as your primary evidence. Connect related factors.
-State the recommendation and the single strongest reason for it in the final sentence.
-Output only the report, no preamble or sign-off.
-
-Top scoring factors:
-${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join('
-')}
-
-Historical flags: ${JSON.stringify(scanResult.historical_flags)}
-
-Full result: ${JSON.stringify(scanResult, null, 2)}`;
-
-  const result = await callWithFallback("deep", DEEP_DIVE_SYSTEM, prompt, 300);
-  return result || fallbackDeepReport(scanResult);
-}
-
-async function callWithFallback(
-  tier: "fast" | "deep",
-  system: string,
-  userPrompt: string,
-  maxTokens: number
-): Promise<string> {
-  for (const provider of PROVIDERS) {
-    const key = provider.apiKey();
-    if (!key) {
-      console.warn(`[llm] ${provider.name} skipped — API key not set`);
-      continue;
-    }
-    try {
-      const result = await callProvider(provider, tier, system, userPrompt, maxTokens);
-      if (result) {
-        if (provider.name !== "anthropic") {
-          console.info(`[llm] served by fallback provider: ${provider.name}`);
-        }
-        return result;
-      }
-    } catch (err) {
-      console.warn(`[llm] ${provider.name} failed — trying next provider`, err);
-    }
-  }
-  return ""; // caller falls through to deterministic template
-}
-
-async function callProvider(
-  provider: Provider,
-  tier: "fast" | "deep",
-  system: string,
-  userPrompt: string,
-  maxTokens: number
-): Promise<string> {
-  const model = provider.models[tier];
-
-  const body =
-    provider.format === "anthropic"
-      ? JSON.stringify({
-          model,
-          max_tokens: maxTokens,
-          system,                                              // top-level — enables prompt caching
-          messages: [{ role: "user", content: userPrompt }],
-        })
-      : JSON.stringify({
-          model,
-          max_tokens: maxTokens,
-          messages: [
-            { role: "system", content: system },              // OpenAI format
-            { role: "user", content: userPrompt },
-          ],
-        });
-
-  const headers: Record<string, string> =
-    provider.format === "anthropic"
-      ? {
-          "Content-Type": "application/json",
-          "x-api-key": provider.apiKey(),
-          "anthropic-version": "2023-06-01",
-        }
-      : {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${provider.apiKey()}`,
-        };
-
-  const response = await fetch(provider.baseUrl, {
-    method: "POST",
-    headers,
-    body,
-    signal: AbortSignal.timeout(8_000),
-  });
-
-  if (!response.ok) {
-    throw new Error(`${provider.name} API ${response.status}: ${await response.text()}`);
-  }
-
-  const data = await response.json();
-
-  // Anthropic: data.content[0].text — OpenAI: data.choices[0].message.content
-  return provider.format === "anthropic"
-    ? (data.content?.[0]?.text?.trim() ?? "")
-    : (data.choices?.[0]?.message?.content?.trim() ?? "");
-}
-
-// Deterministic last-resort fallbacks
-export function fallbackQuickSummary(r: QuickScanData): string {
-  const topRisk =
-    r.risk_grade === "F" ? "failed critical safety checks"
-    : r.risk_grade === "D" ? `top-10 holders control ${r.top_10_holder_pct?.toFixed(0) ?? "?"}% of supply`
-    : `liquidity is ${r.liquidity_usd != null ? `$${(r.liquidity_usd / 1000).toFixed(0)}k` : "unknown"}`;
-  return `Grade ${r.risk_grade}: ${topRisk}.`;
-}
-
-export function fallbackDeepReport(r: DeepDiveData): string {
-  return `Risk grade ${r.risk_grade} with ${r.top_10_holder_pct?.toFixed(0) ?? "?"}% top-10 concentration ` +
-    `and ${r.liquidity_usd != null ? `$${(r.liquidity_usd / 1000).toFixed(0)}k` : "unknown"} liquidity. ` +
-    `Recommendation: ${r.recommendation}.`;
-}
+one-sentence structural safety summaries for AI trading agents. You will
+receive a structured factors[] array. Explain the most important factor.
+Always state explicitly what this check does NOT cover (liquidity, market
+conditions, price action). Never use "strong", "safe", or "excellent".
+Output only the sentence.`;
 ```
 
-### Market Intel LLM prompt (Haiku)
-
+### Wallet risk prompt (Haiku)
 ```typescript
-export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
-  const prompt = `Summarise market conditions for this Solana token in one sentence.
-Be direct and actionable for a trading agent making a pre-trade decision.
-
-Price: $${data.current_price_usd}
-1h change: ${data.price_change_1h_pct?.toFixed(2) ?? "?"}%
-24h change: ${data.price_change_24h_pct?.toFixed(2) ?? "?"}%
-1h volume: $${(data.volume_1h_usd / 1000).toFixed(0)}k
-24h volume: $${(data.volume_24h_usd / 1000).toFixed(0)}k
-Buy pressure: ${data.buy_pressure}
-Sell pressure: ${data.sell_pressure}
-Large txs (>$10k) last hour: ${data.large_txs_last_hour}
-Signal: ${data.signal}
-
-Output one sentence only. Example: "Bullish momentum with $2.3M 1h volume 
-(3× daily average) and large wallet accumulation — strong pre-breakout setup."`;
-
-  return callWithFallback("fast", MARKET_INTEL_SYSTEM, prompt, 80);
-}
-
-const MARKET_INTEL_SYSTEM = `You are a crypto market analyst. Output exactly 
-one sentence summarising market conditions and their implication for a trade. 
-Never hedge. Be specific with numbers.`;
+const WALLET_RISK_SYSTEM = `You are a Solana counterparty intelligence analyst.
+Write one paragraph covering both dimensions: (1) risk classification and its
+primary driver, (2) copy_trading worthiness and confidence. If worthiness is
+UNKNOWN, state the reason exactly as provided. Never claim certainty about
+future performance. Past performance does not predict future returns. Never
+use "strong", "safe", or "excellent". Output only the paragraph.`;
 ```
 
-Deterministic fallback for market_intel:
+### Deep dive prompt (Sonnet)
 ```typescript
-export function fallbackMarketIntelSummary(data: MarketIntelData): string {
-  const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
-  const vol = data.volume_1h_usd != null ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
-  return `${dir} signal — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure.`;
-}
+const DEEP_DIVE_SYSTEM = `You are a Solana token adversarial risk analyst.
+Write 3–5 sentences grounded in key_drivers[] and factors[]. Connect related
+factors — do not list them independently. State recommendation and reason in
+the final sentence. Never use "strong", "safe", or "excellent". Never
+introduce claims not in the structured data.`;
 ```
 
 ### SLA rules
+- Quick scan 5s: skip LLM if elapsed > 4.2s
+- Wallet risk 20s: LLM budget is 18s from start
+- Market intel 10s: skip LLM if elapsed > 9s
+- Deep dive 30s: comfortable for Sonnet
 
-- `sol_quick_scan` 5s SLA: LLM runs sequentially after all parallel fetches.
-  If elapsed time exceeds 4.2s before the LLM call starts, skip both providers
-  and use `fallbackQuickSummary` directly. Log the skip.
-- `sol_wallet_risk` 20s SLA: Parallel Helius calls complete by ~8s. LLM budget
-  is 18s from request start. If exceeded, use `fallbackWalletRiskSummary`.
-- `sol_market_intel` 10s SLA: LLM runs after DexScreener/Birdeye fetches complete.
-  If elapsed time exceeds 9s, skip LLM and use `fallbackMarketIntelSummary`.
-- `sol_deep_dive` 30s SLA: Sonnet call has comfortable headroom. If Anthropic
-  fails and Groq also fails within budget, use `fallbackDeepReport`. Log both
-  failures and the fallback reason.
-- Never let any provider failure propagate as a scan error.
-- Log which provider served each response (skip logging when Anthropic succeeds
-  to avoid log noise).
+### Deterministic fallbacks
 
-### Environment variables
+```typescript
+export function fallbackQuickSummary(r: QuickScanData): string {
+  return `Grade ${r.risk_grade}: Structural safety check only — liquidity and market conditions not evaluated.`;
+}
 
+export function fallbackDeepReport(r: DeepDiveData): string {
+  return `Risk grade ${r.risk_grade}. Recommendation: ${r.recommendation?.action ?? "DYOR"}. Full report unavailable — review structured fields.`;
+}
+
+export function fallbackMarketIntelSummary(data: MarketIntelData): string {
+  const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
+  const vol = data.volume_1h_usd != null ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
+  return `${dir} signal — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure; further analysis required.`;
+}
+
+export function fallbackWalletRiskSummary(data: WalletRiskData): string {
+  const cls = data.classification;
+  const age = `${data.activity.wallet_age_days}d old`;
+  const ct = data.copy_trading.worthiness === "UNKNOWN"
+    ? `Copy-trade assessment unavailable: ${data.copy_trading.reason ?? "insufficient data"}.`
+    : `Copy-trade worthiness: ${data.copy_trading.worthiness} (confidence ${data.copy_trading.confidence}, n=${data.copy_trading.sample_size}).`;
+  if (cls === "UNKNOWN")
+    return `Classified UNKNOWN — insufficient history (${data.activity.total_trades} trades, ${age}); no strong malicious signals detected. ${ct}`;
+  return `${cls === "HIGH_RISK" ? "High" : "Low"} counterparty risk (${age}, ${data.activity.total_trades} trades). ${ct}`;
+}
 ```
-ANTHROPIC_API_KEY=sk-ant-...   # primary — prompt caching applies
-GROQ_API_KEY=gsk_...           # fallback — free tier, get at console.groq.com
-```
-
-Both keys are optional at startup but at least one must be set or all LLM
-calls will fall through to the deterministic template immediately. Log a
-startup warning if both are missing.
-
-### Adding a third provider
-
-The PROVIDERS array is ordered — insert new providers at any position. The
-cascade tries them in array order and stops at the first success. To add a
-provider, append an entry following the same interface. The `format` field
-controls request/response shape: `"openai"` for any OpenAI-compatible API,
-`"anthropic"` for Anthropic only.
 
 ---
 
 ## Constants (`src/constants.ts`)
 
-Contains only Virtuals Protocol addresses and Solana program IDs.
-The static token whitelist previously here has been replaced by the
-Jupiter strict list in `src/sources/jupiterTokenList.ts`.
-
 ```typescript
-/**
- * Virtuals Protocol controlled addresses.
- * Never flag these as insider holders, team wallets, or rug participants.
- * Source: Virtuals Protocol graduation requirements.
- */
 export const VIRTUALS_PROTOCOL_ADDRESSES = new Set([
-  "0xe2890629ef31b32132003c02b29a50a025deee8a", // sell wall wallet
-  "0xf8dd39c71a278fe9f4377d009d7627ef140f809e", // sell execution contract
+  "0xe2890629ef31b32132003c02b29a50a025deee8a",
+  "0xf8dd39c71a278fe9f4377d009d7627ef140f809e",
 ]);
-
-export function isProtocolAddress(address: string): boolean {
-  return VIRTUALS_PROTOCOL_ADDRESSES.has(address.toLowerCase());
-}
 
 export const PROGRAMS = {
   PUMP_FUN:          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
@@ -2390,118 +1182,15 @@ export const PROGRAMS = {
 } as const;
 ```
 
-**Integration — two places, both required:**
-
-```typescript
-// quickScan.ts and deepDive.ts — filter before concentration calc
-const filteredHolders = holders.filter(h => !isProtocolAddress(h.address));
-const top10Pct = calculateConcentration(filteredHolders.slice(0, 10));
-
-// deepDive.ts — dev wallet check
-if (isProtocolAddress(devWalletAddress)) {
-  return { address: devWalletAddress, is_protocol_address: true,
-           sol_balance: null, created_tokens_count: null, previous_rugs: false };
-}
-```
-
----
-
-## API Server (`src/api/server.ts`)
-
-Hono on port 8000, host `0.0.0.0`.
-
-```
-POST /scan/quick    → quickScan()
-POST /scan/deep     → deepDive()
-POST /wallet/risk   → walletRisk()
-POST /market/intel  → marketIntel()
-GET  /health        → status, uptime, circuit_breakers, source_success_rates
-GET  /revenue/summary → revenueTracker middleware
-```
-
-### Health endpoint
-
-```typescript
-import { ensureFresh } from "../sources/jupiterTokenList.js";
-
-app.get("/health", async (c) => {
-  await ensureFresh(); // refresh Jupiter token list if stale (24h TTL)
-  const breakers = circuitBreaker.getAll();
-  const sourceStats = getSourceStats();
-  const criticalDown = ["dexscreener", "helius_rpc"].filter(s => breakers[s] === "OPEN");
-
-  return c.json({
-    status: criticalDown.length > 0 ? "degraded" : "ok",
-    uptime_seconds: Math.floor(process.uptime()),
-    cache_hits: cache.getHits(),
-    total_requests: cache.getTotal(),
-    degraded_sources: criticalDown,
-    circuit_breakers: breakers,
-    source_success_rates: Object.fromEntries(
-      Object.entries(sourceStats).map(([k, v]) => [k, v.successRate])
-    ),
-  });
-});
-```
-
-Status is `"degraded"` when DexScreener or Helius circuit breaker is OPEN.
+Filter protocol addresses before concentration calc and dev wallet checks.
 
 ---
 
 ## ACP Integration
 
-ACP tooling is already configured at `/root/virtuals-acp`. Do not re-run setup.
-The job queue and all 4 handlers live in `/root/virtuals-acp/src/seller/`.
-
-### Job Queue (`virtuals-acp/src/seller/jobQueue.ts`)
+### Handler Pattern
 
 ```typescript
-import type { ExecuteJobResult } from "../runtime/offeringTypes.js";
-
-type Job = {
-  requirements: any;
-  resolve: (result: ExecuteJobResult) => void;
-  reject: (err: unknown) => void;
-};
-
-const queue: Job[] = [];
-let processing = false;
-const MAX_QUEUE_DEPTH = 50;
-
-async function drain(handler: (req: any) => Promise<ExecuteJobResult>): Promise<void> {
-  if (processing) return;
-  processing = true;
-  while (queue.length > 0) {
-    const job = queue.shift()!;
-    try { job.resolve(await handler(job.requirements)); }
-    catch (err) { job.reject(err); }
-  }
-  processing = false;
-}
-
-export function enqueue(
-  requirements: any,
-  handler: (req: any) => Promise<ExecuteJobResult>
-): Promise<ExecuteJobResult> {
-  return new Promise((resolve, reject) => {
-    if (queue.length >= MAX_QUEUE_DEPTH) {
-      reject(new Error("Queue full — try again later"));
-      return;
-    }
-    queue.push({ requirements, resolve, reject });
-    console.log(`[jobQueue] depth=${queue.length}`);
-    drain(handler);
-  });
-}
-```
-
-### Handler Pattern (all 4 services)
-
-```typescript
-// sol_quick_scan/handlers.ts — identical structure for all 4, only URL/timeout/field differ
-import type { ExecuteJobResult, ValidationResult } from "../../../runtime/offeringTypes.js";
-import { enqueue } from "../../jobQueue.js";
-
 export async function executeJob(requirements: any): Promise<ExecuteJobResult> {
   return enqueue(requirements, async (req) => {
     const response = await fetch("http://localhost:8000/scan/quick", {
@@ -2510,8 +1199,7 @@ export async function executeJob(requirements: any): Promise<ExecuteJobResult> {
       body: JSON.stringify(req),
       signal: AbortSignal.timeout(10_000),
     });
-    const result = await response.json();
-    return { deliverable: JSON.stringify(result) }; // must be wrapped
+    return { deliverable: JSON.stringify(await response.json()) };
   });
 }
 
@@ -2521,34 +1209,81 @@ export function validateRequirements(requirements: any): ValidationResult {
 }
 
 export async function requestPayment(requirements: any): Promise<string> {
-  return "Payment accepted"; // must be plain string — never return an object
+  return "Payment accepted";
 }
 ```
 
-**Per-service values:**
-
-| Service | URL | Timeout | Validated field |
+| Service | URL | Timeout | Field |
 |---|---|---|---|
 | `sol_quick_scan` | `/scan/quick` | `10_000` | `token_address` |
 | `sol_wallet_risk` | `/wallet/risk` | `25_000` | `wallet_address` |
 | `sol_market_intel` | `/market/intel` | `10_000` | `token_address` |
 | `sol_deep_dive` | `/scan/deep` | `35_000` | `token_address` |
 
-### `offering.json` format
+### `offering.json` — all 4 services
 
+Descriptions are written for Butler and AI buyer agents.
+They answer: what does this return, when to call it, what it does NOT cover.
+
+**sol_quick_scan:**
 ```json
 {
   "name": "sol_quick_scan",
-  "description": "Instant Solana token safety check. Returns risk grade (A–F), LP burn status, mint/freeze authority, holder concentration, and liquidity in under 5 seconds. Includes AI-generated safety summary. Essential pre-trade check for any Solana trading agent. $0.05 per call.",
-  "jobFee": 0.05,
-  "jobFeeType": "fixed",
+  "description": "Structural safety gate for Solana tokens. Call this BEFORE executing any token swap or purchase to screen for mint authority risk, freeze authority risk, holder concentration, and LP burn status. Returns a deterministic risk grade (A–F) and machine-readable scoring factors. Does NOT evaluate liquidity, price, or market conditions — call sol_market_intel for those signals. Safe to call on every token before any buy decision. $0.05 per call, under 5 seconds.",
+  "jobFee": 0.05, "jobFeeType": "fixed",
   "priceV2": { "type": "fixed", "value": 0.05 },
   "requiredFunds": false,
   "requirement": {
     "type": "object",
-    "properties": {
-      "token_address": { "type": "string", "description": "Solana token mint address (base58, 32–44 characters)" }
-    },
+    "properties": { "token_address": { "type": "string", "description": "Solana token mint address (base58, 32–44 characters)" } },
+    "required": ["token_address"]
+  }
+}
+```
+
+**sol_market_intel:**
+```json
+{
+  "name": "sol_market_intel",
+  "description": "Real-time trading signal for Solana tokens. Call this when making a buy, sell, or hold decision and you need current price action, volume, buy/sell pressure ratio, volatility, and market momentum. Returns a deterministic BULLISH/BEARISH/NEUTRAL signal with numeric buy_sell_ratio and token health classification. Does NOT evaluate token structure or wallet safety — call sol_quick_scan for structural signals. $0.10 per call, under 10 seconds.",
+  "jobFee": 0.10, "jobFeeType": "fixed",
+  "priceV2": { "type": "fixed", "value": 0.10 },
+  "requiredFunds": false,
+  "requirement": {
+    "type": "object",
+    "properties": { "token_address": { "type": "string", "description": "Solana token mint address (base58, 32–44 characters)" } },
+    "required": ["token_address"]
+  }
+}
+```
+
+**sol_wallet_risk:**
+```json
+{
+  "name": "sol_wallet_risk",
+  "description": "Counterparty intelligence and alpha discovery for Solana wallets. Call this when assessing a wallet you are trading against, receiving funds from, or considering copying. Returns two orthogonal signals: (1) risk classification — LOW_RISK, HIGH_RISK, or UNKNOWN — with supporting risk_signals; (2) copy_trading worthiness — HIGH, MEDIUM, LOW, or UNKNOWN — indicating whether this wallet is worth following. Classifies UNKNOWN rather than HIGH_RISK when history is insufficient. Also returns MEV victim score, MEV bot detection, sniper score, pump.fun graduation exit rate, and early entry rate. $0.10 per call, under 20 seconds.",
+  "jobFee": 0.10, "jobFeeType": "fixed",
+  "priceV2": { "type": "fixed", "value": 0.10 },
+  "requiredFunds": false,
+  "requirement": {
+    "type": "object",
+    "properties": { "wallet_address": { "type": "string", "description": "Solana wallet address (base58, 32–44 characters)" } },
+    "required": ["wallet_address"]
+  }
+}
+```
+
+**sol_deep_dive:**
+```json
+{
+  "name": "sol_deep_dive",
+  "description": "Adversarial risk engine for Solana tokens. Call this when sol_quick_scan returns grade B or above and you need deeper due diligence before a significant position. Introduces adversarial intelligence not in quick scan: insider wallet clustering, launch pattern detection (STEALTH_LAUNCH/FAIR_LAUNCH), wash trading score, dev wallet history, sniper activity at launch, and a structured recommendation (AVOID/WATCH/CONSIDER/DYOR) with reasoning and time horizon. All signals are additive — does not repeat quick scan. $0.50 per call, under 30 seconds.",
+  "jobFee": 0.50, "jobFeeType": "fixed",
+  "priceV2": { "type": "fixed", "value": 0.50 },
+  "requiredFunds": false,
+  "requirement": {
+    "type": "object",
+    "properties": { "token_address": { "type": "string", "description": "Solana token mint address (base58, 32–44 characters)" } },
     "required": ["token_address"]
   }
 }
@@ -2556,30 +1291,14 @@ export async function requestPayment(requirements: any): Promise<string> {
 
 ---
 
-## Revenue Tracker (`scripts/revenueTracker.ts`)
+## Revenue Tracker
 
-Middleware that hooks into Hono server. Logs per-service call counts to SQLite.
-Uses `better-sqlite3`. DB at `/root/solprobe/data/revenue.db`.
-
-Exposes `GET /revenue/summary`:
-```json
-{
-  "total_usdc": 1.23,
-  "by_service": {
-    "sol_quick_scan":   { "calls": 100, "revenue_usdc": 2.00 },
-    "sol_wallet_risk":  { "calls": 5,   "revenue_usdc": 0.10 },
-    "sol_market_intel": { "calls": 2,   "revenue_usdc": 0.10 },
-    "sol_deep_dive":    { "calls": 0,   "revenue_usdc": 0.00 }
-  },
-  "since": "2025-01-01T00:00:00Z"
-}
-```
-
-Do not modify scanner logic — hook in via middleware only.
+Middleware hooks into Hono. Logs per-service call counts to SQLite (`better-sqlite3`).
+DB at `/root/solprobe/data/revenue.db`. Do not modify scanner logic — middleware only.
 
 ---
 
-## Health Watchdog (`scripts/healthWatchdog.ts`)
+## Health Watchdog
 
 ```typescript
 const res = await fetch("http://localhost:8000/health");
@@ -2588,41 +1307,26 @@ if (health.status !== "ok") {
   console.error(`[watchdog] DEGRADED — down sources: ${health.degraded_sources.join(", ")}`);
   process.exit(1);
 }
-console.log(`[watchdog] ok — uptime ${health.uptime_seconds}s`);
 ```
 
 ---
 
 ## Process Management
 
-**`ecosystem.config.cjs`:**
-
 ```javascript
 module.exports = {
   apps: [
     {
-      name: "solprobe",
-      script: "./start.sh",
-      interpreter: "bash",
-      restart_delay: 3000,
-      max_restarts: 20,
-      watch: false,
+      name: "solprobe", script: "./start.sh", interpreter: "bash",
+      restart_delay: 3000, max_restarts: 20, watch: false,
       env: { NODE_ENV: "production" },
-      log_file: "logs/combined.log",
-      error_file: "logs/error.log",
-      time: true,
+      log_file: "logs/combined.log", error_file: "logs/error.log", time: true,
     },
+    { name: "acp-seller" },
     {
-      name: "acp-seller",
-      // managed separately in /root/virtuals-acp
-    },
-    {
-      name: "health-watchdog",
-      script: "scripts/healthWatchdog.ts",
-      interpreter: "npx",
-      interpreter_args: "tsx",
-      cron_restart: "*/5 * * * *",
-      autorestart: false,
+      name: "health-watchdog", script: "scripts/healthWatchdog.ts",
+      interpreter: "npx", interpreter_args: "tsx",
+      cron_restart: "*/5 * * * *", autorestart: false,
     },
   ]
 };
@@ -2632,44 +1336,60 @@ module.exports = {
 
 ## Tests (Vitest)
 
-1. **`quickScan.test.ts`** — BONK (good), known rug (F grade), verify response shape,
-   verify `isValidSolanaAddress` rejects garbage, verify USDC grades A/B with
-   `authority_exempt: true`. **Mock rule:** always set `lp_burned: true` for healthy
-   token mocks — null triggers the -25 worst-case penalty and will fail grade A assertions.
-2. **`sources.test.ts`** — mock all APIs using real API response shapes (copy from live curl).
-   Verify 200/429/500 handling, verify parallel fetching runs concurrently, verify Helius
-   always called for authority flags, verify Jupiter list returns exempt=true for stablecoin tags.
-   RugCheck mock must include `score: 5909` and `risks: [{name: "Single holder ownership", level: "danger"}]`.
-   Birdeye OHLCV mock must include `data.items` array with `h` field on each candle.
-3. **`deepDive.test.ts`** — `recommendation` never undefined, `momentum_score` always 0–100,
-   protocol addresses not flagged as suspicious
-4. **`circuitBreaker.test.ts`** — CLOSED→OPEN after 5 failures, OPEN rejects immediately,
-   OPEN→HALF_OPEN after cooldown, HALF_OPEN→CLOSED on success
-5. **`marketIntel.test.ts`** (new) — verify token_health classification rules, verify signal
-   override (DEAD → BEARISH regardless of buy/sell ratio), verify pct_from_ath calculation,
-   verify HAWK-like token (low volume + 95% below ATH) returns BEARISH + LOW confidence
+1. **`quickScan.test.ts`** — BONK (grade A, `grade_type: "STRUCTURAL_SAFETY"`,
+   `schema_version: "2.0"`), known rug (F), `scope.excludes` present,
+   `liquidity_check` populated, `isValidSolanaAddress` rejects garbage,
+   USDC grades A/B with `authority_exempt: true`.
+   Mock rule: `lp_burned: true` for healthy TRADITIONAL_AMM mocks.
+
+2. **`walletRisk.test.ts`**
+   - `total_trades < 10` → `classification: "UNKNOWN"`
+   - `total_trades < 20` → `copy_trading.worthiness: "UNKNOWN"` with non-null `reason`
+   - `total_trades >= 20` → `copy_trading.worthiness` is LOW/MEDIUM/HIGH
+   - `sample_size < 50` → `copy_trading.confidence <= 0.5`
+   - HIGH_RISK wallet can have HIGH copy_trading worthiness (orthogonality test)
+   - LOW_RISK wallet can have UNKNOWN copy_trading worthiness (orthogonality test)
+   - Bot wallet → `copy_trading.worthiness: "UNKNOWN"` with bot-specific reason
+   - `score` is structured object with `components`
+   - `risk_signals[]` always populated
+   - `activity` object shape present
+   - `mev_victim_score` is number 0–100, never undefined
+   - `is_mev_bot` is boolean, never undefined
+   - `pumpfun_graduation_exit_rate_pct` is null when no pump.fun history
+   - `early_entry_rate_pct` is null when fewer than 5 tokens have timing data
+   - `historical_exposure.high_risk_tokens_traded` uncapped (test with 30-token wallet)
+   - `schema_version === "2.0"` on every response
+
+3. **`deepDive.test.ts`** — `recommendation` always structured object, `risk_breakdown`
+   all 4 sub-fields, `wallet_analysis` present, `key_drivers[]` populated, protocol
+   addresses not flagged, `momentum_score` 0–100, `schema_version === "2.0"`.
+
+4. **`marketIntel.test.ts`** — `buy_sell_ratio` numeric, `volatility` populated,
+   `price_change_5m_pct` null without Birdeye key, all three new subtypes,
+   DEAD → BEARISH override, HAWK-like token → BEARISH + `data_quality: "LIMITED"`,
+   `schema_version === "2.0"`.
+
+5. **`sources.test.ts`** — real API response shapes from live curl. Parallel fetching,
+   Helius always called for authority flags, Jupiter returns `authority_exempt: true`
+   for stablecoin tags. RugCheck mock: `score: 5909`,
+   `risks: [{name: "Single holder ownership", level: "danger"}]`.
+   Birdeye OHLCV mock: `data.items` array with `h` field per candle.
+
+6. **`circuitBreaker.test.ts`** — CLOSED→OPEN (5 failures), OPEN rejects immediately,
+   OPEN→HALF_OPEN (cooldown), HALF_OPEN→CLOSED (success).
 
 ---
 
 ## Environment Variables
 
 ```
-# RPC & data sources
 HELIUS_API_KEY=
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 PORT=8000
 LOG_LEVEL=info
-
-# Birdeye OHLCV — for ATH detection in sol_market_intel
-# Free key at bds.birdeye.so — required for pct_from_ath field
-# Without this key, pct_from_ath returns null (service still works)
-BIRDEYE_API_KEY=
-
-# LLM narrative layer — at least one must be set or all calls fall to template
-ANTHROPIC_API_KEY=sk-ant-...   # primary provider
-GROQ_API_KEY=gsk_...           # fallback provider — free, get at console.groq.com
-
-# Buyback script — add only after PM2 non-root user migration
+BIRDEYE_API_KEY=          # pct_from_ath and price_change_5m_pct return null without key
+ANTHROPIC_API_KEY=sk-ant-...
+GROQ_API_KEY=gsk_...
 AGENT_WALLET_PRIVATE_KEY=
 SPROBE_TOKEN_ADDRESS=
 BUYBACK_INTERVAL_MINUTES=60
@@ -2679,69 +1399,108 @@ DRY_RUN=true
 
 ---
 
-## Build Order
+## Build Order (v2)
 
-Work in this sequence. Do not skip ahead.
+Priority: Wallet Risk → Deep Dive → Market Intel → Quick Scan.
 
-1. `src/constants.ts` — no deps
-2. `src/validate.ts` — no deps, used everywhere
-3. `src/utils/retry.ts` — no deps
-4. `src/circuitBreaker.ts` — no deps
-5. `src/sources/resolver.ts` — no deps
-6. `src/sources/jupiterTokenList.ts` — no deps, test `isAuthorityExempt` in isolation
-7. `src/cache.ts` — deduplication, TTLs, token buckets
-8. `src/api/rateLimiter.ts` — no deps
-9. `src/sources/dexscreener.ts` — validate live against BONK
-10. `src/sources/helius.ts` — include `getTokenMintInfo()`, validate against BONK
+1. `src/constants.ts`
+2. `src/validate.ts`
+3. `src/utils/retry.ts`
+4. `src/circuitBreaker.ts`
+5. `src/sources/resolver.ts`
+6. `src/sources/jupiterTokenList.ts` — test `isAuthorityExempt` in isolation
+7. `src/cache.ts`
+8. `src/api/rateLimiter.ts`
+9. `src/sources/dexscreener.ts` — verify `buy_sell_ratio` numeric against BONK
+10. `src/sources/helius.ts` — `getTokenMintInfo()` + MEV parsing helpers
 11. `src/sources/rugcheck.ts` — no authority flags, include `report_age_seconds`
-12. `src/sources/birdeye.ts`, `src/sources/solscan.ts`
-13. `src/scanner/riskScorer.ts` — `scoreConfidence()` + authority exemption logic
-14. `src/llm/narrativeEngine.ts` — test in isolation with mock data
-15. `src/scanner/quickScan.ts` + `src/api/server.ts` (quick endpoint only)
-16. **Live end-to-end test against BONK and USDC** — BONK grades A, USDC grades A/B with authority_exempt: true
-17. `src/scanner/deepDive.ts`, `walletRisk.ts`, `marketIntel.ts`
-18. ACP handlers (`virtuals-acp/src/seller/jobQueue.ts` + all 4 `handlers.ts`)
-19. `scripts/revenueTracker.ts`, `scripts/healthWatchdog.ts`
-20. Tests (`circuitBreaker.test.ts` first — no external deps)
+12. `src/sources/birdeye.ts` — OHLCV daily + 5m/15m, `src/sources/solscan.ts`
+13. `src/scanner/riskScorer.ts` — `calculateConfidence()` + authority exemption
+14. `src/scanner/walletRisk.ts` — structured score, classification, copy_trading object,
+    MEV signals, pump.fun signals, uncapped historical_exposure
+15. **Test walletRisk in isolation** — copy_trading gating, orthogonality, MEV fields
+16. `src/scanner/deepDive.ts` — risk_breakdown, wallet_analysis, launch_pattern,
+    key_drivers, structured recommendation
+17. **Live end-to-end test deep dive**
+18. `src/scanner/marketIntel.ts` — numeric buy_sell_ratio, volatility, 5m/15m, subtypes
+19. `src/llm/narrativeEngine.ts` — test wallet risk prompt covers both dimensions
+20. `src/scanner/quickScan.ts` + `src/api/server.ts` — grade_type, scope, liquidity_check
+21. **Live end-to-end test BONK and USDC**
+22. ACP handlers — all 4 `handlers.ts` + updated `offering.json` descriptions
+23. `scripts/revenueTracker.ts`, `scripts/healthWatchdog.ts`
+24. Tests (circuitBreaker.test.ts first)
 
 ---
 
 ## What NOT to Do
 
-- Do not fetch `mint_authority_revoked` or `freeze_authority_revoked` from RugCheck — ever
-- Do not make the Helius authority call conditional — it runs on every scan, always
-- Do not use a static token whitelist to exempt tokens from authority penalties — use the Jupiter strict list
-- Do not hardcode USDC, USDT, or any token address as exempt — Jupiter handles this dynamically
-- Do not block server startup waiting for the Jupiter list — load it fire-and-forget
-- Do not call the LLM before all parallel source fetches have settled
-- Do not let any LLM provider failure propagate as a scan error — cascade to next provider, then template
-- Do not use Sonnet or Mixtral for `sol_quick_scan`, `sol_wallet_risk`, or `sol_market_intel` — Haiku/Llama fast models only; their SLAs have no headroom for large models
-- Do not skip the Groq fallback — the deterministic template is last resort, not first fallback
-- Do not add Ollama or any local model server — the VPS has no GPU; CPU inference blows both SLAs
-- Do not flag `0xe2890629...` or `0xF8DD39c7...` as suspicious under any circumstances
-- Do not hardcode API keys — always read from environment variables
-- Do not log which provider served a request when Anthropic succeeds — only log on fallback or failure
-- Do not fabricate or inflate `data_confidence` — buyer agents cross-check and churn
-- Do not share cache TTLs across services — each has a different staleness budget
-- Do not return an object from `requestPayment` — plain string only
-- Do not return a raw object from `executeJob` — must be `{ deliverable: JSON.stringify(result) }`
-- Do not write test mocks with invented field values — copy real API response shapes from live curl calls
-- Do not set `lp_burned: null` in test mocks for CLMM/DLMM tokens — null is correct and expected, set `lp_model: "CLMM_DLMM"` instead
-- Do not set `lp_burned: null` in test mocks for TRADITIONAL_AMM healthy tokens — use `lp_burned: true` to avoid false -10 penalty
-- Do not apply any LP burn penalty when `lp_model` is CLMM_DLMM — there is no LP mint on Meteora, Orca, or raydiumclmm
-- Do not classify `raydiumclmm` as TRADITIONAL_AMM — it is a position-based CLMM, same as Orca Whirlpool
-- Do not use `pairs[0]?.dexId` for LP model classification — always select the highest-liquidity pair first
-- Do not use `id.includes("orca")` for string matching — use `id.startsWith("orca")` to avoid over-matching
-- Do not expose only `lp_burned` without `lp_status` — null is ambiguous; NOT_APPLICABLE is unambiguous
-- Do not use a DexScreener dexId heuristic to detect pump.fun — use Helius creator program ID instead
-- Do not skip Birdeye OHLCV when `BIRDEYE_API_KEY` is missing — gracefully return null for `pct_from_ath`, do not error
-- Do not suppress errors after 3 genuine retries — an honest error is correct
-- Do not modify `/root/virtuals-acp/` files unless explicitly asked
-- Do not add PM2 watchdog under the existing `solprobe` or `acp-seller` process names
-- Do not let the LLM generate `factors[]` — factors must come from deterministic scoring logic only
-- Do not let the LLM generate `historical_flags[]` — flags are built from source data in the scanner
-- Do not let the LLM generate `signal_subtype` — it is derived from rules, not language model inference
-- Do not generate a summary before `factors[]` is assembled — LLM prompt must include top factors
-- Do not fabricate `confidence` values — calculate from actual source count and data age
-- Do not remove `data_confidence` string field — keep for backwards compatibility, derive from `confidence`
-- Do not write LLM prompts that describe raw metrics without referencing the factors array
+### Schema versioning
+- Do not omit `schema_version` from any response
+- Do not bump version without updating all four services simultaneously
+- Do not remove fields without bumping major version
+
+### Source integrity
+- Do not fetch authority flags from RugCheck — ever
+- Do not make Helius authority call conditional — runs on every scan
+- Do not use a static token whitelist — use Jupiter strict list
+- Do not block startup waiting for Jupiter list — fire-and-forget
+- Do not use `pairs[0]?.dexId` — always highest-liquidity pair
+- Do not use `id.includes("orca")` — use `id.startsWith("orca")`
+- Do not classify `raydiumclmm` as TRADITIONAL_AMM
+- Do not use DexScreener dexId to detect pump.fun — use Helius creator program ID
+- Do not error when Birdeye key missing — gracefully return null
+
+### Output integrity
+- Do not let LLM generate `factors[]`, `historical_flags[]`, `signal_subtype`,
+  `key_drivers[]`, `risk_breakdown`, `classification`, or `copy_trading`
+- Do not generate summary before `factors[]` is assembled
+- Do not use "strong", "safe", "excellent" anywhere
+- Do not fabricate confidence values
+- Do not remove `data_confidence` string — backwards compat
+- Do not omit `data_quality`, `missing_fields`, or `schema_version`
+
+### Copy-trading rules (critical)
+- Do not return `copy_trading.worthiness` as non-UNKNOWN when `total_trades < 20`
+- Do not assign `copy_trading.confidence` above 0.5 when `sample_size < 50`
+- Do not output a scalar copy_trade_worthiness score — always the structured object
+- Do not merge `copy_trading.worthiness` with `classification`
+- Do not let copy_trading signals reference token conditions (price, liquidity, volume)
+- Do not use copy_trading to duplicate market intel logic
+- Do not return `copy_trading.reason` as null when `worthiness === "UNKNOWN"`
+- Do not apply copy_trading signals to bot wallets — gate to UNKNOWN with bot reason
+
+### Service boundaries
+- Do not include liquidity/volume/price in `sol_quick_scan` beyond `liquidity_check`
+- Do not repeat structural safety in `sol_market_intel`
+- Do not let `sol_deep_dive` repeat `sol_quick_scan`
+- Do not classify wallet HIGH_RISK from thin history alone
+- Do not return recommendation as bare string in deep dive
+
+### LLM provider rules
+- Do not call LLM before all parallel source fetches settle
+- Do not let LLM provider failure propagate as scan error
+- Do not use Sonnet/Mixtral for quick scan, wallet risk, or market intel
+- Do not skip Groq fallback — template is last resort
+- Do not add local model servers — VPS has no GPU
+
+### Infrastructure rules
+- Do not flag `0xe2890629...` or `0xF8DD39c7...` as suspicious
+- Do not hardcode API keys
+- Do not share cache TTLs across services
+- Do not return object from `requestPayment` — plain string only
+- Do not return raw object from `executeJob` — must be `{ deliverable: JSON.stringify(result) }`
+- Do not expose `lp_burned` without `lp_status`
+- Do not apply LP burn penalty on CLMM_DLMM
+- Do not suppress errors after 3 genuine retries
+- Do not modify `/root/virtuals-acp/` unless explicitly asked
+- Do not call internal `quickScan()` for historical_exposure in parallel with primary
+  sources — call sequentially after primary sources settle to avoid cascading timeouts
+
+### Test rules
+- Do not write mocks with invented field values — copy from live curl
+- Do not set `lp_burned: null` in TRADITIONAL_AMM healthy mocks — use `true`
+- Do not set `lp_burned: null` in CLMM/DLMM mocks without `lp_model: "CLMM_DLMM"`
+- Do not assert `classification: "HIGH_RISK"` for thin-history mocks
+- Do not assert `copy_trading.worthiness` as non-UNKNOWN for mocks with < 20 trades
+- Do not assert `recommendation` as string in deep dive tests
+- Do not assert `schema_version` is absent — must be on every response

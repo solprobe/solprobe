@@ -10,7 +10,7 @@ import {
   buildHistoricalFlags,
   type RiskFactors,
 } from "./riskScorer.js";
-import type { ScoringFactor, HistoricalFlag } from "./types.js";
+import type { ScoringFactor, HistoricalFlag, KeyDriver } from "./types.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
@@ -47,6 +47,7 @@ export interface TradingPattern {
 }
 
 export interface DeepDiveResult {
+  schema_version: "2.0";
   is_honeypot: boolean;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
@@ -69,7 +70,32 @@ export interface DeepDiveResult {
   price_change_24h_pct: number;
   momentum_score: number;
   full_risk_report: string;
-  recommendation: "BUY" | "AVOID" | "WATCH" | "DYOR";
+  /** Structured recommendation — never a bare string */
+  recommendation: {
+    action: "AVOID" | "WATCH" | "CONSIDER" | "DYOR";
+    reason: string;
+    confidence: number;
+    time_horizon: "SHORT_TERM" | "MEDIUM_TERM" | "LONG_TERM";
+  };
+  /** Adversarial risk categorisation */
+  risk_breakdown: {
+    contract_risk: "LOW" | "MEDIUM" | "HIGH";
+    liquidity_risk: "LOW" | "MEDIUM" | "HIGH";
+    market_risk: "LOW" | "MEDIUM" | "HIGH";
+    behavioral_risk: "LOW" | "MEDIUM" | "HIGH";
+  };
+  /** Adversarial wallet layer */
+  wallet_analysis: {
+    clustered_wallets: number;
+    insider_control_percent: number | null;
+    dev_wallet_linked: boolean;
+  };
+  /** Launch classification */
+  launch_pattern: "STEALTH_LAUNCH" | "FAIR_LAUNCH" | "UNKNOWN";
+  /** Sniper activity at launch */
+  sniper_activity: "LOW" | "MEDIUM" | "HIGH";
+  /** Top contributing factors in agent-friendly shape */
+  key_drivers: KeyDriver[];
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
   rugcheck_report_age_seconds: number | null;
@@ -79,10 +105,14 @@ export interface DeepDiveResult {
   authority_exempt_reason: string | null;
   /** Structured breakdown of all scoring contributors */
   factors: ScoringFactor[];
-  /** 0.0–1.0 numeric confidence score */
-  confidence: number;
+  /** Structured confidence breakdown */
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
   /** Historical event flags derived from source data */
   historical_flags: HistoricalFlag[];
+  /** Data quality */
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  /** Fields that could not be populated */
+  missing_fields: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -197,20 +227,40 @@ function deriveWashTradingScore(
 /**
  * Derive recommendation — never undefined, defaults to DYOR on low confidence.
  */
-function deriveRecommendation(
-  risk_grade: string,
-  is_honeypot: boolean,
-  has_rug_history: boolean,
-  momentum_score: number,
-  data_confidence: string
-): "BUY" | "AVOID" | "WATCH" | "DYOR" {
-  if (has_rug_history || is_honeypot || risk_grade === "F") return "AVOID";
-  if (risk_grade === "D") return "AVOID";
-  if (data_confidence === "LOW") return "DYOR";
-  if (risk_grade === "A" && momentum_score >= 65) return "WATCH";
-  if ((risk_grade === "A" || risk_grade === "B") && momentum_score >= 45) return "WATCH";
-  if (risk_grade === "C" && momentum_score >= 70) return "WATCH";
-  return "DYOR";
+function buildRecommendation(data: {
+  risk_grade: string;
+  risk_breakdown: { contract_risk: string; liquidity_risk: string; market_risk: string; behavioral_risk: string };
+  historical_flags: HistoricalFlag[];
+  confidence_model: number;
+}): { action: "AVOID" | "WATCH" | "CONSIDER" | "DYOR"; reason: string; confidence: number; time_horizon: "SHORT_TERM" | "MEDIUM_TERM" | "LONG_TERM" } {
+  const highRisks = Object.entries(data.risk_breakdown)
+    .filter(([, v]) => v === "HIGH")
+    .map(([k]) => k.replace("_risk", "").toUpperCase());
+
+  if (data.risk_grade === "F" || highRisks.length >= 3) {
+    return { action: "AVOID", reason: highRisks.join(" + ") || "CRITICAL_GRADE", confidence: 0.9, time_horizon: "SHORT_TERM" };
+  }
+  if (data.historical_flags.includes("PAST_RUG") || data.historical_flags.includes("DEV_ASSOCIATED_WITH_PREVIOUS_RUG")) {
+    return { action: "AVOID", reason: "CONFIRMED_RUG_HISTORY", confidence: 0.95, time_horizon: "SHORT_TERM" };
+  }
+  if (data.risk_grade === "D" || highRisks.length >= 1) {
+    return { action: "WATCH", reason: highRisks.join(" + ") || "ELEVATED_RISK", confidence: data.confidence_model, time_horizon: "SHORT_TERM" };
+  }
+  if (data.risk_grade === "A" || data.risk_grade === "B") {
+    return { action: "CONSIDER", reason: "ACCEPTABLE_STRUCTURAL_RISK", confidence: data.confidence_model, time_horizon: "MEDIUM_TERM" };
+  }
+  return { action: "DYOR", reason: "INCONCLUSIVE_SIGNALS", confidence: Math.min(data.confidence_model, 0.5), time_horizon: "SHORT_TERM" };
+}
+
+function buildKeyDrivers(factors: ScoringFactor[]): KeyDriver[] {
+  return [...factors]
+    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
+    .slice(0, 5)
+    .map(f => ({
+      factor: f.name,
+      impact: Math.abs(f.impact) >= 20 ? "HIGH" as const : Math.abs(f.impact) >= 10 ? "MEDIUM" as const : "LOW" as const,
+      direction: f.impact < 0 ? "NEGATIVE" as const : f.impact > 0 ? "POSITIVE" as const : "NEUTRAL" as const,
+    }));
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -399,7 +449,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     data_age_ms,
     rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
   });
-  const data_confidence = confidenceToString(confidence);
+  const data_confidence = confidenceToString(confidence.model);
 
   // ── Historical flags ───────────────────────────────────────────────────────
   const historical_flags: HistoricalFlag[] = buildHistoricalFlags({
@@ -409,7 +459,70 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     dev_wallet_analysis: { previous_rugs: has_rug_history },
   });
 
-  const recommendation = deriveRecommendation(risk_grade, is_honeypot, has_rug_history, momentum_score, data_confidence);
+  // ── Risk breakdown ────────────────────────────────────────────────────────
+  const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
+    (is_honeypot || has_rug_history || !mint_authority_revoked || !freeze_authority_revoked) ? "HIGH"
+    : (rugData?.rugcheck_risk_score ?? 0) > 2000 ? "MEDIUM"
+    : "LOW";
+
+  const liquidity_risk: "LOW" | "MEDIUM" | "HIGH" =
+    (liquidity_usd ?? 0) < 1_000 ? "HIGH"
+    : (liquidity_usd ?? 0) < 10_000 ? "MEDIUM"
+    : lp_burned === false && lp_model === "TRADITIONAL_AMM" ? "MEDIUM"
+    : "LOW";
+
+  const market_risk: "LOW" | "MEDIUM" | "HIGH" =
+    volume_24h < 1_000 ? "HIGH"
+    : volume_24h < 10_000 || (buy_sell_ratio_1h !== null && buy_sell_ratio_1h < 0.3) ? "MEDIUM"
+    : "LOW";
+
+  const behavioral_risk: "LOW" | "MEDIUM" | "HIGH" =
+    bundled_launch_detected || (rugData?.insider_flags ?? false) ? "HIGH"
+    : (rugData?.single_holder_danger ?? false) ? "MEDIUM"
+    : "LOW";
+
+  const risk_breakdown = { contract_risk, liquidity_risk, market_risk, behavioral_risk };
+
+  // ── Wallet analysis (adversarial layer) ───────────────────────────────────
+  const dev_wallet_linked = dev_wallet_analysis.sol_balance !== null && dev_wallet_analysis.sol_balance > 0;
+  const wallet_analysis = {
+    clustered_wallets: bundled_launch_detected ? 3 : 0,   // heuristic — bundled = coordinated wallets
+    insider_control_percent: rugData?.insider_flags ? 15 : null, // heuristic from flag
+    dev_wallet_linked,
+  };
+
+  // ── Launch pattern ────────────────────────────────────────────────────────
+  const launch_pattern: "STEALTH_LAUNCH" | "FAIR_LAUNCH" | "UNKNOWN" =
+    bundled_launch_detected ? "STEALTH_LAUNCH"
+    : pump_fun_launched ? "FAIR_LAUNCH"
+    : "UNKNOWN";
+
+  // ── Sniper activity ───────────────────────────────────────────────────────
+  const sniper_activity: "LOW" | "MEDIUM" | "HIGH" =
+    bundled_launch_detected ? "HIGH"
+    : (rugData?.single_holder_danger ?? false) ? "MEDIUM"
+    : "LOW";
+
+  // ── Key drivers ───────────────────────────────────────────────────────────
+  const key_drivers = buildKeyDrivers(scoringFactors);
+
+  // ── Structured recommendation ─────────────────────────────────────────────
+  const recommendation = buildRecommendation({
+    risk_grade,
+    risk_breakdown,
+    historical_flags,
+    confidence_model: confidence.model,
+  });
+
+  // ── Data quality ──────────────────────────────────────────────────────────
+  const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
+    sources.length === 4 ? "FULL" : sources.length >= 2 ? "PARTIAL" : "LIMITED";
+
+  const missing_fields: string[] = [];
+  if (dexData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio");
+  if (rugData  === null) missing_fields.push("rugcheck_risk_score", "bundled_launch", "single_holder_danger");
+  if (mintData === null) missing_fields.push("mint_authority_revoked", "freeze_authority_revoked");
+  if (birdData === null) missing_fields.push("birdeye_price");
 
   // ── Quick-scan-style one-liner summary ─────────────────────────────────────
   const flags: string[] = [];
@@ -438,7 +551,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     pump_fun_launched,
     bundled_launch_detected,
     data_confidence,
-    recommendation,
+    recommendation: recommendation.action,
     rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
     insider_flags: rugData?.insider_flags ?? false,
     authority_exempt,
@@ -459,6 +572,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   console.info(`[deepDive] ${address} total=${totalElapsed}ms llm=${llmElapsed}ms`);
 
   return {
+    schema_version: "2.0" as const,
     is_honeypot,
     mint_authority_revoked,
     freeze_authority_revoked,
@@ -489,5 +603,12 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     factors: scoringFactors,
     confidence,
     historical_flags,
+    risk_breakdown,
+    wallet_analysis,
+    launch_pattern,
+    sniper_activity,
+    key_drivers,
+    data_quality,
+    missing_fields,
   };
 }

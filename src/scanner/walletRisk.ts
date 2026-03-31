@@ -13,26 +13,172 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface WalletRiskResult {
+  schema_version: "2.0";
+
+  // ── Classification ────────────────────────────────────────────────────────
+  classification: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN";
+
+  // ── Activity profile ──────────────────────────────────────────────────────
+  activity: {
+    wallet_age_days: number | null;
+    total_trades: number;
+    active_days: number;
+    last_active_hours_ago: number | null;
+  };
+
+  // ── Legacy flat fields (backwards compat) ─────────────────────────────────
   wallet_age_days: number | null;
   total_transactions: number;
   tokens_traded_30d: number;
+
+  // ── Behavioural signals ───────────────────────────────────────────────────
   win_rate_pct: number | null;
   avg_hold_time_hours: number | null;
   sniper_score: number;
   rug_exit_rate_pct: number | null;
-  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";
   pnl_estimate_30d_usdc: number | null;
   largest_single_loss_usdc: number | null;
   is_bot: boolean;
   whale_status: boolean;
+  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";
+
+  // ── Behavior classification ───────────────────────────────────────────────
+  behavior: {
+    style: "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT" | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE";
+    consistency: "LOW" | "MEDIUM" | "HIGH";
+  };
+
+  // ── Legacy flat field (backwards compat) ─────────────────────────────────
   trading_style: "sniper" | "hodler" | "flipper" | "bot" | "degen" | "unknown";
+
+  // ── Structured score ──────────────────────────────────────────────────────
+  score: {
+    overall: number;
+    components: {
+      history_depth: number;
+      behavioral_risk: number;
+      counterparty_exposure: number;
+    };
+  };
+
+  // ── Legacy flat field (backwards compat) ─────────────────────────────────
   risk_score: number;
+
+  // ── Risk signals ──────────────────────────────────────────────────────────
+  risk_signals: Array<{
+    name: string;
+    impact: "LOW" | "MEDIUM" | "HIGH";
+    reason: string;
+  }>;
+
+  // ── Historical exposure ───────────────────────────────────────────────────
+  historical_exposure: {
+    rug_interactions: number;
+    high_risk_tokens_traded: number;
+  };
+
+  // ── MEV intelligence ──────────────────────────────────────────────────────
+  mev_victim_score: number;        // 0–100
+  is_mev_bot: boolean;
+  mev_bot_confidence: number;      // 0.0–1.0
+
+  // ── Pump.fun intelligence ─────────────────────────────────────────────────
+  pumpfun_graduation_exit_rate_pct: number | null;
+  early_entry_rate_pct: number | null;
+
+  // ── Copy-trade opportunity ────────────────────────────────────────────────
+  copy_trading: {
+    worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+    confidence: number;       // 0.0–1.0; capped at 0.5 when sample_size < 50
+    sample_size: number;
+    key_signals: string[];
+    reason: string | null;    // always populated when worthiness === "UNKNOWN"
+  };
+
+  // ── Data quality ──────────────────────────────────────────────────────────
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
+
   risk_summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   /** Structured breakdown of all scoring contributors */
   factors: ScoringFactor[];
-  /** 0.0–1.0 numeric confidence score */
+  /** Structured confidence breakdown */
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
+}
+
+// ---------------------------------------------------------------------------
+// Copy-trading classification (CLAUDE.md: classifyCopyTrading)
+// ---------------------------------------------------------------------------
+
+interface CopyTradingResult {
+  worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
   confidence: number;
+  sample_size: number;
+  key_signals: string[];
+  reason: string | null;
+}
+
+function classifyCopyTrading(data: {
+  total_trades: number;
+  win_rate_pct: number | null;
+  avg_hold_time_hours: number | null;
+  consistency: "HIGH" | "MEDIUM" | "LOW";
+  sniper_score: number;
+  rug_exit_rate_pct: number | null;
+  is_bot: boolean;
+}): CopyTradingResult {
+  if (data.is_bot) {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "wallet classified as bot — copy-trade signal not applicable",
+    };
+  }
+
+  if (data.total_trades < 20 || data.win_rate_pct === null) {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "insufficient trading history — minimum 20 closed trades required",
+    };
+  }
+
+  const signals: string[] = [];
+  let score = 0;
+
+  if (data.win_rate_pct >= 60)      { score += 30; signals.push("high_win_rate"); }
+  else if (data.win_rate_pct >= 45) { score += 15; }
+
+  if (data.consistency === "HIGH")        { score += 25; signals.push("consistent_sizing"); }
+  else if (data.consistency === "MEDIUM") { score += 10; }
+
+  if (data.avg_hold_time_hours !== null &&
+      data.avg_hold_time_hours >= 1 && data.avg_hold_time_hours <= 72) {
+    score += 15; signals.push("disciplined_hold_time");
+  }
+
+  if (data.sniper_score < 30) { score += 10; signals.push("non_sniper_entries"); }
+
+  if (data.rug_exit_rate_pct !== null && data.rug_exit_rate_pct > 60) {
+    score += 20; signals.push("strong_rug_exit_discipline");
+  }
+
+  const raw_confidence = Math.min(1, data.total_trades / 100);
+  const confidence = data.total_trades < 50
+    ? Math.min(0.5, raw_confidence)
+    : raw_confidence;
+
+  const worthiness: "HIGH" | "MEDIUM" | "LOW" =
+    score >= 60 ? "HIGH" : score >= 35 ? "MEDIUM" : "LOW";
+
+  return {
+    worthiness,
+    confidence: Math.round(confidence * 100) / 100,
+    sample_size: data.total_trades,
+    key_signals: signals,
+    reason: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +851,18 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     sources_total: 4,
     data_age_ms: Date.now() - fetchStart,
   });
-  const data_confidence = confidenceToString(confidence);
+  const data_confidence = confidenceToString(confidence.model);
+
+  const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
+    callsOk === 4 ? "FULL" : callsOk >= 2 ? "PARTIAL" : "LIMITED";
+
+  const missing_fields: string[] = [];
+  if (sigs === null)                                                  missing_fields.push("signatures");
+  if (accountInfo === null)                                           missing_fields.push("sol_balance");
+  if (assetsResult.status !== "fulfilled" || assetsResult.value === null) missing_fields.push("token_holdings");
+  if (parsedTxs === null)                                             missing_fields.push("parsed_transactions");
+  // rug_exit_rate_pct and high_risk_tokens_traded require quickScan cross-calls — outside SLA
+  missing_fields.push("rug_exit_rate_pct", "high_risk_tokens_traded");
 
   // ── Scoring factors ───────────────────────────────────────────────────────
   const factors = buildWalletFactors(
@@ -718,10 +875,111 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     whaleStatus
   );
 
+  // ── Structured score (CLAUDE.md: calculateWalletScore) ────────────────────
+  let behavioral_risk = 0;
+  if (sniperScore > 70)                                                behavioral_risk += 25;
+  else if (sniperScore > 40)                                           behavioral_risk += 15;
+  if (winRatePct !== null && winRatePct > 80)                          behavioral_risk += 10;
+  if (isBot)                                                           behavioral_risk += 15;
+  behavioral_risk = Math.min(100, behavioral_risk);
+
+  let history_depth = 0;
+  if (walletAgeDays !== null && walletAgeDays < 7)                     history_depth += 20;
+  else if (walletAgeDays !== null && walletAgeDays < 30)               history_depth += 10;
+  history_depth = Math.min(100, history_depth);
+
+  let counterparty_exposure = 0;
+  if (fundingWalletRisk === "HIGH")                                     counterparty_exposure += 20;
+  if (whaleStatus && sniperScore > 40)                                  counterparty_exposure += 15;
+  counterparty_exposure = Math.min(100, counterparty_exposure);
+
+  const score_overall = Math.min(100, Math.max(0, behavioral_risk + history_depth + counterparty_exposure));
+
+  // ── Classification (CLAUDE.md: classifyWallet) ────────────────────────────
+  const strongSignals = factors.filter(f => f.impact >= 20).length;
+  const classification: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN" =
+    (totalTx < 10 || (walletAgeDays !== null && walletAgeDays < 7) || walletAgeDays === null)
+      ? "UNKNOWN"
+      : (score_overall >= 70 && strongSignals >= 2)
+        ? "HIGH_RISK"
+        : score_overall < 40
+          ? "LOW_RISK"
+          : "UNKNOWN";
+
+  // ── Activity profile ──────────────────────────────────────────────────────
+  const activeDays = parsedTxs && parsedTxs.length > 0
+    ? new Set(parsedTxs.map(tx => {
+        const ts = (tx as any).timestamp ?? (tx as any).blockTime;
+        return ts ? new Date(ts * 1000).toDateString() : null;
+      }).filter(Boolean)).size
+    : 0;
+
+  const lastActiveSig = sigs && sigs.length > 0 ? sigs[0] : null;
+  const lastActiveHoursAgo = lastActiveSig && typeof (lastActiveSig as any).blockTime === "number"
+    ? (Date.now() / 1000 - (lastActiveSig as any).blockTime) / 3600
+    : null;
+
+  // ── Behavior classification ───────────────────────────────────────────────
+  const behaviorStyle: "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT" | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE" =
+    totalTx < 10
+      ? "LOW_ACTIVITY"
+      : tradingStyle === "bot"     ? "BOT"
+      : tradingStyle === "sniper"  ? "SNIPER"
+      : tradingStyle === "flipper" ? "FLIPPER"
+      : tradingStyle === "hodler"  ? "HODLER"
+      : tradingStyle === "degen"   ? "DEGEN"
+      : "INCONCLUSIVE";
+
+  // consistency derived from trade amount variance (approximated from closedCount vs tokens)
+  const consistency: "LOW" | "MEDIUM" | "HIGH" =
+    closedCount >= 10 && tokensTradedLast30d > 0
+      ? closedCount / Math.max(tokensTradedLast30d, 1) > 2 ? "HIGH" : "MEDIUM"
+      : "LOW";
+
+  // ── Risk signals ──────────────────────────────────────────────────────────
+  const risk_signals: Array<{ name: string; impact: "LOW" | "MEDIUM" | "HIGH"; reason: string }> = [];
+
+  if (totalTx < 10 || walletAgeDays === null || (walletAgeDays !== null && walletAgeDays < 7)) {
+    risk_signals.push({
+      name: "low_history",
+      impact: "MEDIUM",
+      reason: `only ${totalTx} trades found — insufficient evidence for strong classification`,
+    });
+  }
+  if (sniperScore > 70) {
+    risk_signals.push({ name: "high_sniper_score", impact: "HIGH", reason: `sniper score ${sniperScore} — likely early buy coordination` });
+  } else if (sniperScore > 40) {
+    risk_signals.push({ name: "elevated_sniper_score", impact: "MEDIUM", reason: `sniper score ${sniperScore} — some sniping patterns present` });
+  }
+  if (winRatePct !== null && winRatePct > 80) {
+    risk_signals.push({ name: "high_win_rate", impact: "MEDIUM", reason: `win rate ${winRatePct.toFixed(1)}% — possible information edge` });
+  }
+  if (fundingWalletRisk === "HIGH") {
+    risk_signals.push({ name: "high_funding_risk", impact: "HIGH", reason: "funded by deployer or fresh wallet chain" });
+  }
+  if (isBot) {
+    risk_signals.push({ name: "bot_detected", impact: "HIGH", reason: "transaction pattern consistent with automated bot activity" });
+  }
+
+  // ── Historical exposure (rug_interactions requires cross-token scan — outside SLA) ─
+  const historical_exposure = {
+    rug_interactions: 0,        // populated by cross-token scan — outside 20s SLA
+    high_risk_tokens_traded: 0, // populated by cross-token scan — outside 20s SLA
+  };
+
   // ── LLM summary ───────────────────────────────────────────────────────────
   const elapsed = Date.now() - fetchStart;
+  const walletAgeDaysRounded = walletAgeDays !== null ? Math.round(walletAgeDays * 10) / 10 : null;
+
   const llmData: WalletRiskData = {
-    wallet_age_days: walletAgeDays !== null ? Math.round(walletAgeDays * 10) / 10 : null,
+    classification,
+    activity: {
+      wallet_age_days: walletAgeDaysRounded,
+      total_trades: totalTx,
+      active_days: activeDays,
+      last_active_hours_ago: lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
+    },
+    wallet_age_days: walletAgeDaysRounded,
     trading_style: tradingStyle,
     win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
     sniper_score: sniperScore,
@@ -741,23 +999,80 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   }
 
   return {
-    wallet_age_days: walletAgeDays !== null ? Math.round(walletAgeDays * 10) / 10 : null,
+    schema_version: "2.0" as const,
+
+    // ── Classification ──────────────────────────────────────────────────────
+    classification,
+
+    // ── Activity profile ────────────────────────────────────────────────────
+    activity: {
+      wallet_age_days: walletAgeDaysRounded,
+      total_trades: totalTx,
+      active_days: activeDays,
+      last_active_hours_ago: lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
+    },
+
+    // ── Legacy flat fields ──────────────────────────────────────────────────
+    wallet_age_days: walletAgeDaysRounded,
     total_transactions: totalTx,
     tokens_traded_30d: tokensTradedLast30d,
+
+    // ── Behavioural signals ─────────────────────────────────────────────────
     win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
-    avg_hold_time_hours:
-      avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
+    avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
     sniper_score: sniperScore,
     rug_exit_rate_pct: null,
-    funding_wallet_risk: fundingWalletRisk,
-    pnl_estimate_30d_usdc:
-      pnl30d !== null ? Math.round(pnl30d * 100) / 100 : null,
-    largest_single_loss_usdc:
-      largestLoss !== null ? Math.round(largestLoss * 100) / 100 : null,
+    pnl_estimate_30d_usdc: pnl30d !== null ? Math.round(pnl30d * 100) / 100 : null,
+    largest_single_loss_usdc: largestLoss !== null ? Math.round(largestLoss * 100) / 100 : null,
     is_bot: isBot,
     whale_status: whaleStatus,
+    funding_wallet_risk: fundingWalletRisk,
+
+    // ── Behavior classification ─────────────────────────────────────────────
+    behavior: { style: behaviorStyle, consistency },
+
+    // ── Legacy flat field ───────────────────────────────────────────────────
     trading_style: tradingStyle,
+
+    // ── Structured score ────────────────────────────────────────────────────
+    score: {
+      overall: score_overall,
+      components: { history_depth, behavioral_risk, counterparty_exposure },
+    },
+
+    // ── Legacy flat field ───────────────────────────────────────────────────
     risk_score: riskScore,
+
+    // ── Risk signals ────────────────────────────────────────────────────────
+    risk_signals,
+
+    // ── Historical exposure ─────────────────────────────────────────────────
+    historical_exposure,
+
+    // ── MEV intelligence (defaults — Helius parsed tx MEV parsing not yet wired) ─
+    mev_victim_score: 0,
+    is_mev_bot: false,
+    mev_bot_confidence: 0,
+
+    // ── Pump.fun intelligence (defaults — requires Helius pump.fun event parsing) ─
+    pumpfun_graduation_exit_rate_pct: null,
+    early_entry_rate_pct: null,
+
+    // ── Copy-trade opportunity ───────────────────────────────────────────────
+    copy_trading: classifyCopyTrading({
+      total_trades: closedCount,
+      win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
+      avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
+      consistency,
+      sniper_score: sniperScore,
+      rug_exit_rate_pct: null,
+      is_bot: isBot,
+    }),
+
+    // ── Data quality ────────────────────────────────────────────────────────
+    data_quality,
+    missing_fields,
+
     risk_summary,
     data_confidence,
     factors,

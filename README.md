@@ -2,14 +2,25 @@
 
 Solana token scanner agent for the [Virtuals Protocol ACP marketplace](https://github.com/Virtual-Protocol/openclaw-acp). Sells 4 tiered intelligence services to other AI agents via per-call USDC fees.
 
+Agent ID: #24456 — Chain: Base — Ticker: SPROBE
+
+All responses carry `schema_version: "2.0"`. Buyer agents gate on this field before parsing.
+
 ## Services
 
-| Service | Price | SLA | Description |
-|---|---|---|---|
-| `sol_quick_scan` | $0.01 | < 5s | Risk grade, mint/freeze authority, holder concentration, liquidity |
-| `sol_deep_dive` | $0.50 | < 30s | Dev wallet, LP lock, wash trading, pump.fun detection, recommendation |
-| `sol_wallet_risk` | $0.02 | < 10s | Wallet age, bot detection, rug involvement, trading style |
-| `sol_market_intel` | $0.05 | < 10s | Price, volume, buy/sell pressure, BULLISH/BEARISH/NEUTRAL signal |
+| Service | Price | SLA | LLM | Role |
+|---|---|---|---|---|
+| `sol_quick_scan` | $0.05 | < 5s | Haiku | Structural safety gate — mint/freeze authority, holder distribution, LP status |
+| `sol_market_intel` | $0.10 | < 10s | Haiku | Real-time trading signal — price, volume, buy/sell pressure, BULLISH/BEARISH/NEUTRAL |
+| `sol_wallet_risk` | $0.10 | < 20s | Haiku | Counterparty intelligence + copy-trade opportunity — classification, MEV detection, pump.fun signals |
+| `sol_deep_dive` | $0.50 | < 30s | Sonnet | Adversarial risk engine — insider clustering, launch pattern, wash trading, structured recommendation |
+
+### Service boundaries
+
+- **Quick Scan** — structural safety only. Does NOT evaluate liquidity, price, or market conditions.
+- **Market Intel** — trading signal only. Does NOT repeat structural safety signals.
+- **Wallet Risk** — two orthogonal dimensions: `classification` (counterparty risk) and `copy_trading` (copy-trade worthiness). Never merged.
+- **Deep Dive** — adversarial intelligence additive to Quick Scan. Does NOT repeat Quick Scan fields.
 
 ## Setup
 
@@ -28,10 +39,13 @@ cp .env.example .env
 Edit `.env` and set your values:
 
 ```
-HELIUS_API_KEY=           # optional — improves RPC rate limits significantly
+HELIUS_API_KEY=           # required for walletRisk parsed tx; improves RPC rate limits
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 PORT=8000
 LOG_LEVEL=info
+BIRDEYE_API_KEY=          # optional — enables pct_from_ath and 5m/15m price changes
+ANTHROPIC_API_KEY=        # LLM narrative summaries (Haiku/Sonnet)
+GROQ_API_KEY=             # Groq fallback for LLM summaries
 ```
 
 ### 3. ACP setup
@@ -122,17 +136,23 @@ All sources are free with no API key required (Helius key optional):
 
 | Source | Used for |
 |---|---|
-| DexScreener | Price, liquidity, volume, buy/sell ratio |
-| RugCheck | Authority flags, holder concentration, rug history |
-| Helius / public RPC | On-chain mint account data, dev wallet balance |
-| Birdeye | Fallback liquidity + volume |
+| DexScreener | Price, liquidity, volume, buy/sell ratio, LP mint |
+| RugCheck | Rug history, bundled launch, holder concentration, rugcheck score |
+| Helius / public RPC | Mint authority, freeze authority, LP burn, dev wallet, MEV signals |
+| Birdeye | ATH price, pct_from_ath, 5m/15m price changes (requires API key) |
 | Solscan | Fallback token metadata |
+| Jupiter Token List | Authority exemption for verified stablecoins and wrapped tokens |
+
+**Source responsibility split:** Helius owns all authority flags. RugCheck never returns
+authority data. Jupiter strict/verified tags do NOT grant exemption — only stable, stablecoin,
+wormhole, and wrapped tags do.
 
 ## Architecture notes
 
 - All sources fetched in parallel via `Promise.allSettled()` with per-source timeouts
 - Circuit breaker per source — opens after 5 consecutive failures, recovers after 60s
-- In-memory TTL cache: 60s quick scan, 30s market intel, 5min deep dive, 2min wallet risk
+- Cache TTLs: quick scan 30s, market intel 15s, wallet risk 300s, deep dive 60s
 - In-flight deduplication prevents duplicate API calls for burst requests on the same address
-- RPC rotation across 3 endpoints with exponential backoff on 429s
 - Risk scorer is deterministic — no ML, penalty table with grade bands A/B/C/D/F
+- LLM narrative only for human-readable summaries — all structured fields are deterministic
+- Provider cascade: Anthropic → Groq → deterministic template fallback

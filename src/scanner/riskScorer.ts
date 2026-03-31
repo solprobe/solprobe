@@ -364,18 +364,26 @@ export function calculateConfidence(data: {
   data_age_ms: number;
   rugcheck_age_seconds?: number;
   token_health?: string;
-}): number {
-  let score = data.sources_available / data.sources_total;
+  signals_agree?: boolean;
+}): { model: number; data_completeness: number; signal_consensus: number } {
+  const data_completeness = data.sources_available / data.sources_total;
 
-  if (data.data_age_ms > 60_000) score -= 0.1;
-  if (data.data_age_ms > 300_000) score -= 0.2;
-  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) score -= 0.15;
-
+  let model = data_completeness;
+  if (data.data_age_ms > 60_000)  model -= 0.1;
+  if (data.data_age_ms > 300_000) model -= 0.2;
+  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) model -= 0.15;
   if (data.token_health === "DEAD" || data.token_health === "ILLIQUID")
-    score = Math.min(score, 0.3);
-  if (data.token_health === "LOW_ACTIVITY") score = Math.min(score, 0.6);
+    model = Math.min(model, 0.3);
+  if (data.token_health === "LOW_ACTIVITY") model = Math.min(model, 0.6);
+  model = Math.max(0, Math.min(1, Math.round(model * 100) / 100));
 
-  return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+  const signal_consensus = data.signals_agree === false ? 0.5 : data_completeness;
+
+  return {
+    model,
+    data_completeness: Math.round(data_completeness * 100) / 100,
+    signal_consensus:  Math.round(signal_consensus  * 100) / 100,
+  };
 }
 
 export function confidenceToString(c: number): "HIGH" | "MEDIUM" | "LOW" {

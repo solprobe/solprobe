@@ -3,7 +3,6 @@ import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned } from "../sources/helius.js";
 import {
   calculateRiskGrade,
-  scoreConfidence,
   calculateConfidence,
   confidenceToString,
   buildHistoricalFlags,
@@ -20,11 +19,21 @@ import {
 import type { ScoringFactor, HistoricalFlag } from "./types.js";
 
 export interface QuickScanResult {
+  schema_version: "2.0";
+  /** Always "STRUCTURAL_SAFETY" — this service evaluates on-chain token structure only */
+  grade_type: "STRUCTURAL_SAFETY";
+  /** Scope declaration — clarifies what is and is not covered */
+  scope: {
+    includes: string[];
+    excludes: string[];
+  };
   is_honeypot: boolean;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
+  /** Lightweight liquidity heuristic — does not replace sol_market_intel */
+  liquidity_check: "PRESENT" | "LOW" | "UNKNOWN";
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
@@ -43,10 +52,12 @@ export interface QuickScanResult {
   authority_exempt_reason: string | null;
   /** Structured breakdown of all scoring contributors */
   factors: ScoringFactor[];
-  /** 0.0–1.0 numeric confidence score */
-  confidence: number;
+  /** Structured confidence breakdown */
+  confidence: { model: number; data_completeness: number; signal_consensus: number };
   /** Historical event flags derived from source data */
   historical_flags: HistoricalFlag[];
+  data_quality: "FULL" | "PARTIAL" | "LIMITED";
+  missing_fields: string[];
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -163,7 +174,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     data_age_ms,
     rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
   });
-  const data_confidence = confidenceToString(confidence);
+  const data_confidence = confidenceToString(confidence.model);
 
   // ── Historical flags ───────────────────────────────────────────────────────
   const historical_flags = buildHistoricalFlags({
@@ -171,6 +182,28 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     bundled_launch: riskFactors.bundled_launch,
     single_holder_danger: riskFactors.single_holder_danger,
   });
+
+  // ── Scope declaration ─────────────────────────────────────────────────────
+  const grade_type = "STRUCTURAL_SAFETY" as const;
+  const scope = {
+    includes: ["mint_authority", "freeze_authority", "holder_distribution"],
+    excludes: ["liquidity", "volume", "price_action", "market_behavior"],
+  };
+
+  // ── Liquidity check (lightweight heuristic only) ──────────────────────────
+  const liquidity_check: "PRESENT" | "LOW" | "UNKNOWN" =
+    liquidity_usd === null ? "UNKNOWN"
+    : liquidity_usd >= 10_000 ? "PRESENT"
+    : "LOW";
+
+  // ── Data quality ──────────────────────────────────────────────────────────
+  const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
+    sources.length === 3 ? "FULL" : sources.length >= 2 ? "PARTIAL" : "LIMITED";
+
+  const missing_fields: string[] = [];
+  if (dexData  === null) missing_fields.push("liquidity_usd", "dex_id", "lp_model");
+  if (rugData  === null) missing_fields.push("rugcheck_risk_score", "top_10_holder_pct", "has_rug_history");
+  if (mintData === null) missing_fields.push("mint_authority_revoked", "freeze_authority_revoked");
 
   // ── LLM summary — sequential, after all parallel fetches complete ──────────
   const llmInputData: QuickScanData = {
@@ -198,11 +231,15 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   }
 
   return {
+    schema_version: "2.0" as const,
+    grade_type,
+    scope,
     is_honeypot,
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
     liquidity_usd,
+    liquidity_check,
     lp_burned,
     lp_model,
     lp_status,
@@ -218,5 +255,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     factors: scoringFactors,
     confidence,
     historical_flags,
+    data_quality,
+    missing_fields,
   };
 }

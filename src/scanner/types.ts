@@ -20,22 +20,37 @@ export interface ScoringFactor {
  * never from the LLM.
  */
 export type SignalSubtype =
-  | "NO_VOLUME_ACTIVITY"    // near-zero volume — token dead or illiquid
-  | "EARLY_PUMP"            // sharp price rise + high buy pressure + young token
-  | "DISTRIBUTION_PHASE"    // high sell pressure + declining price + active volume
-  | "POST_RUG_STAGNATION"   // dead volume + >80% below ATH (likely rugged)
-  | "HIGH_SPECULATION"      // extreme price volatility + thin liquidity
-  | "ORGANIC_GROWTH"        // steady volume + balanced pressure + rising price
-  | "NORMAL_CORRECTION"     // healthy token in pullback from ATH
-  | "NONE";                 // no specific subtype detected
+  | "NO_VOLUME_ACTIVITY"       // near-zero volume — token dead or illiquid
+  | "EARLY_PUMP"               // sharp price rise + high buy pressure + young token
+  | "DISTRIBUTION_PHASE"       // high sell pressure + declining price + active volume
+  | "POST_RUG_STAGNATION"      // dead volume + >80% below ATH (likely rugged)
+  | "HIGH_SPECULATION"         // extreme price volatility + thin liquidity
+  | "ORGANIC_GROWTH"           // steady volume + balanced pressure + rising price
+  | "NORMAL_CORRECTION"        // healthy token in pullback from ATH
+  | "LOW_LIQUIDITY_TRAP"        // signal exists but liquidity too thin to act on safely
+  | "SELL_PRESSURE_DOMINANCE"  // sustained sell pressure overwhelming buys numerically
+  | "MOMENTUM_BREAKDOWN"       // recent bullish trend reversing with volume confirmation
+  | "NONE";                    // no specific subtype detected
 
 /**
  * Historical event flags derived from source data — never from the LLM.
  */
 export type HistoricalFlag =
-  | "PAST_RUG"                // has_rug_history from RugCheck
-  | "DEV_EXITED"              // dev wallet sold all holdings (deep dive only)
-  | "LIQUIDITY_REMOVAL_EVENT" // large LP withdrawal on-chain
-  | "BUNDLED_LAUNCH"          // bundled_launch_detected from RugCheck
-  | "INSIDER_ACTIVITY"        // insider_flags from RugCheck
-  | "SINGLE_HOLDER_DANGER";   // single_holder_danger from RugCheck risks[]
+  | "PAST_RUG"                            // has_rug_history from RugCheck
+  | "DEV_EXITED"                          // dev wallet sold all holdings (deep dive only)
+  | "LIQUIDITY_REMOVAL_EVENT"             // large LP withdrawal on-chain
+  | "BUNDLED_LAUNCH"                      // bundled_launch_detected from RugCheck
+  | "INSIDER_ACTIVITY"                    // insider_flags from RugCheck
+  | "SINGLE_HOLDER_DANGER"               // single_holder_danger from RugCheck risks[]
+  | "DEV_ASSOCIATED_WITH_PREVIOUS_RUG"   // dev wallet linked to prior confirmed rug
+  | "SUSPICIOUS_LAUNCH_PATTERN";          // stealth launch + sniper concentration
+
+/**
+ * Top contributing factor in agent-friendly shape (deep dive only).
+ * Built from ScoringFactor sort — never from the LLM.
+ */
+export interface KeyDriver {
+  factor: string;                              // matches a ScoringFactor.name
+  impact: "LOW" | "MEDIUM" | "HIGH";
+  direction: "POSITIVE" | "NEGATIVE" | "NEUTRAL";
+}

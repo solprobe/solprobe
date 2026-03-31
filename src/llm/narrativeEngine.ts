@@ -279,6 +279,13 @@ export async function generateQuickScanSummary(data: QuickScanData): Promise<str
 // ---------------------------------------------------------------------------
 
 export interface WalletRiskData {
+  classification?: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN";
+  activity?: {
+    wallet_age_days: number | null;
+    total_trades: number;
+    active_days: number;
+    last_active_hours_ago: number | null;
+  };
   wallet_age_days: number | null;
   trading_style: string;
   win_rate_pct: number | null;
@@ -292,10 +299,15 @@ export interface WalletRiskData {
 }
 
 export function fallbackWalletRiskSummary(data: WalletRiskData): string {
-  const style = data.trading_style;
-  const risk = data.risk_score > 70 ? "high" : data.risk_score > 40 ? "moderate" : "low";
-  const age = data.wallet_age_days != null ? `${Math.round(data.wallet_age_days)}d old` : "age unknown";
-  return `${style.charAt(0).toUpperCase() + style.slice(1)} wallet (${age}) — ${risk} counterparty risk score ${data.risk_score}/100.`;
+  const cls = data.classification ?? "UNKNOWN";
+  const age = data.activity?.wallet_age_days != null
+    ? `${data.activity.wallet_age_days}d old`
+    : data.wallet_age_days != null ? `${Math.round(data.wallet_age_days)}d old` : "age unknown";
+  const trades = data.activity?.total_trades ?? 0;
+  if (cls === "UNKNOWN") {
+    return `Classified UNKNOWN — insufficient history (${trades} trades, ${age}); no strong malicious signals detected.`;
+  }
+  return `${cls === "HIGH_RISK" ? "High" : "Low"} counterparty risk (${age}, ${trades} trades).`;
 }
 
 export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
