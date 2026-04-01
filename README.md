@@ -9,7 +9,7 @@ All responses carry `schema_version: "2.0"`. Buyer agents gate on this field bef
 ## Services
 
 | Service | Price | SLA | Role |
-|---|---|---|---|---|
+|---|---|---|---|
 | `sol_quick_scan` | $0.05 | < 5s | Structural safety gate — mint/freeze authority, holder distribution, LP status |
 | `sol_market_intel` | $0.10 | < 10s | Real-time trading signal — price, volume, buy/sell pressure, BULLISH/BEARISH/NEUTRAL |
 | `sol_wallet_risk` | $0.10 | < 20s | Counterparty intelligence + copy-trade opportunity — classification, MEV detection, pump.fun signals |
