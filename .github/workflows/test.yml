@@ -11,3 +11,4 @@ jobs:
       - run: npm test
         env:
           BIRDEYE_API_KEY: ""
+          HELIUS_API_KEY: "test"
