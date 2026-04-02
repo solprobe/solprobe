@@ -191,7 +191,11 @@ describe("quickScan", () => {
     // Authorities revoked (null = revoked in RugCheck), big liquidity → grade A
     expect(result.mint_authority_revoked).toBe(true);
     expect(result.freeze_authority_revoked).toBe(true);
-    expect(result.liquidity_usd).toBeGreaterThan(0);
+    expect(result.liquidity_check).toMatchObject({
+      rating: expect.stringMatching(/^(DEEP|ADEQUATE|THIN|CRITICAL|UNKNOWN)$/),
+      meaning: expect.any(String),
+      action_guidance: expect.any(String),
+    });
     expect(result.risk_grade).toBe("A");
   });
 
@@ -244,7 +248,7 @@ describe("quickScan", () => {
     expect(factorNames).toContain("mint_authority");
     expect(factorNames).toContain("freeze_authority");
     expect(factorNames).toContain("lp_status");
-    expect(factorNames).toContain("liquidity_usd");
+    expect(factorNames).toContain("liquidity_check");
     expect(factorNames).toContain("rugcheck_score");
     expect(factorNames).toContain("single_holder_danger");
     expect(factorNames).toContain("token_age_days");

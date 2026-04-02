@@ -18,6 +18,60 @@ import {
 } from "../llm/narrativeEngine.js";
 import type { ScoringFactor, HistoricalFlag } from "./types.js";
 
+// ---------------------------------------------------------------------------
+// Liquidity Check — structured object with actionable guidance
+// ---------------------------------------------------------------------------
+
+export type LiquidityRating = "DEEP" | "ADEQUATE" | "THIN" | "CRITICAL" | "UNKNOWN";
+
+export interface LiquidityCheck {
+  rating: LiquidityRating;
+  meaning: string;
+  threshold_usd: number | null;
+  action_guidance: string;
+}
+
+const LIQUIDITY_CHECK_LOOKUP: Record<LiquidityRating, LiquidityCheck> = {
+  DEEP: {
+    rating: "DEEP",
+    meaning: "Liquidity exceeds $500k. Large positions can be executed with minimal price impact.",
+    threshold_usd: 500_000,
+    action_guidance: "Liquidity is not a limiting factor. Proceed based on structural and market signals.",
+  },
+  ADEQUATE: {
+    rating: "ADEQUATE",
+    meaning: "Liquidity is between $50k and $500k. Suitable for moderate position sizes.",
+    threshold_usd: 50_000,
+    action_guidance: "Exercise normal position sizing. Monitor for liquidity changes on active trades.",
+  },
+  THIN: {
+    rating: "THIN",
+    meaning: "Liquidity is between $5k and $50k. Execution risk is elevated for any meaningful position.",
+    threshold_usd: 5_000,
+    action_guidance: "Use small position sizes only. High slippage likely on entry and exit.",
+  },
+  CRITICAL: {
+    rating: "CRITICAL",
+    meaning: "Liquidity is below $5k. Exit liquidity is effectively zero for most position sizes.",
+    threshold_usd: null,
+    action_guidance: "Do not execute. Treat as equivalent to a D or F structural grade regardless of other signals.",
+  },
+  UNKNOWN: {
+    rating: "UNKNOWN",
+    meaning: "Liquidity data could not be retrieved from available sources.",
+    threshold_usd: null,
+    action_guidance: "Do not rely on liquidity signals from this response. Verify independently before acting.",
+  },
+};
+
+export function deriveLiquidityCheck(liquidity_usd: number | null | undefined): LiquidityCheck {
+  if (liquidity_usd === null || liquidity_usd === undefined) return LIQUIDITY_CHECK_LOOKUP.UNKNOWN;
+  if (liquidity_usd >= 500_000) return LIQUIDITY_CHECK_LOOKUP.DEEP;
+  if (liquidity_usd >= 50_000)  return LIQUIDITY_CHECK_LOOKUP.ADEQUATE;
+  if (liquidity_usd >= 5_000)   return LIQUIDITY_CHECK_LOOKUP.THIN;
+  return LIQUIDITY_CHECK_LOOKUP.CRITICAL;
+}
+
 export interface QuickScanResult {
   schema_version: "2.0";
   /** Always "STRUCTURAL_SAFETY" — this service evaluates on-chain token structure only */
@@ -31,9 +85,8 @@ export interface QuickScanResult {
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
   top_10_holder_pct: number | null;
-  liquidity_usd: number | null;
-  /** Lightweight liquidity heuristic — does not replace sol_market_intel */
-  liquidity_check: "PRESENT" | "LOW" | "UNKNOWN";
+  /** Structured liquidity assessment — does not replace sol_market_intel */
+  liquidity_check: LiquidityCheck;
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
@@ -190,11 +243,8 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     excludes: ["liquidity", "volume", "price_action", "market_behavior"],
   };
 
-  // ── Liquidity check (lightweight heuristic only) ──────────────────────────
-  const liquidity_check: "PRESENT" | "LOW" | "UNKNOWN" =
-    liquidity_usd === null ? "UNKNOWN"
-    : liquidity_usd >= 10_000 ? "PRESENT"
-    : "LOW";
+  // ── Liquidity check (structured heuristic — no raw $ in response) ─────────
+  const liquidity_check = deriveLiquidityCheck(liquidity_usd);
 
   // ── Data quality ──────────────────────────────────────────────────────────
   const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
@@ -238,7 +288,6 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
-    liquidity_usd,
     liquidity_check,
     lp_burned,
     lp_model,

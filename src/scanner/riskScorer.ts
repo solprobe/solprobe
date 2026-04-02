@@ -218,28 +218,34 @@ export function calculateRiskGrade(
     });
   }
 
-  // Liquidity
+  // Liquidity — penalty uses raw value; factor exposes rating label only (service boundary)
   const liq = factors.liquidity_usd ?? 0;
+  const liquidityRating: "DEEP" | "ADEQUATE" | "THIN" | "CRITICAL" | "UNKNOWN" =
+    factors.liquidity_usd === null || factors.liquidity_usd === undefined ? "UNKNOWN"
+    : liq >= 500_000  ? "DEEP"
+    : liq >= 50_000   ? "ADEQUATE"
+    : liq >= 5_000    ? "THIN"
+    : "CRITICAL";
   if (liq < 1_000) {
     score -= 35;
     sf.push({
-      name: "liquidity_usd",
-      value: factors.liquidity_usd,
+      name: "liquidity_check",
+      value: liquidityRating,
       impact: -35,
       interpretation: "critically low liquidity (<$1k)",
     });
   } else if (liq < 10_000) {
     score -= 20;
     sf.push({
-      name: "liquidity_usd",
-      value: factors.liquidity_usd,
+      name: "liquidity_check",
+      value: liquidityRating,
       impact: -20,
       interpretation: "low liquidity (<$10k)",
     });
   } else {
     sf.push({
-      name: "liquidity_usd",
-      value: factors.liquidity_usd,
+      name: "liquidity_check",
+      value: liquidityRating,
       impact: 0,
       interpretation:
         liq >= 1_000_000
