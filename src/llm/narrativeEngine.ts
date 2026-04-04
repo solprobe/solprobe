@@ -423,10 +423,16 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
     factorLines,
   ].filter(Boolean).join(" ");
 
-  let result = await callWithFallback("fast", 80, system, userMsg);
+  let result = await callWithFallback("fast", 300, system, userMsg);
 
   // Post-generation validation: block forbidden language and health contradictions
   if (result && !validateMarketSummary(result, data.token_health)) {
+    result = ""; // fall through to deterministic fallback
+  }
+
+  // Truncation check: if the LLM response doesn't end with a sentence-terminating
+  // character, it was likely cut off by max_tokens — fall back to deterministic
+  if (result && !/[.!?]$/.test(result.trim())) {
     result = ""; // fall through to deterministic fallback
   }
 

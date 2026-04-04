@@ -4,7 +4,7 @@
 
 export const CACHE_TTL: Record<string, number> = {
   sol_quick_scan:   30_000,   // 30s
-  sol_market_intel: 15_000,   // 15s
+  sol_market_intel: 10_000,   // 10s
   sol_wallet_risk:  300_000,  // 5 min
   sol_deep_dive:    60_000,   // 1 min
 };

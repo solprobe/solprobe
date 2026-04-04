@@ -1,5 +1,5 @@
 import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
-import { getBirdeyeToken, getTokenOHLCV, type BirdeyeTokenData } from "../sources/birdeye.js";
+import { getBirdeyeTokenOverview, getTokenOHLCV, type BirdeyeTokenOverview } from "../sources/birdeye.js";
 import { getCoinGeckoATH } from "../sources/coingecko.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
@@ -14,12 +14,30 @@ import type { ScoringFactor, SignalSubtype } from "./types.js";
 // Public types
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Multi-timeframe data (Fix 2)
+// ---------------------------------------------------------------------------
+
+export interface MarketTimeframe {
+  price_change_pct: number | null;
+  volume_usd: number | null;
+  txns: number | null;
+  buys: number | null;
+  sells: number | null;
+  buy_volume_usd: number | null;
+  sell_volume_usd: number | null;
+  unique_wallets: number | null;
+  buy_sell_ratio: number | null;
+  buy_sell_pressure: "HIGH" | "MEDIUM" | "LOW";
+}
+
 export interface MarketIntelResult {
   schema_version: "2.0";
   current_price_usd: number;
   price_change_5m_pct: number | null;
-  price_change_15m_pct: number | null;
+  price_change_15m_pct: number | null;  // mapped from Birdeye 30m (no 15m available)
   price_change_1h_pct: number;
+  price_change_6h_pct: number | null;   // mapped from Birdeye 8h (no 6h available)
   price_change_24h_pct: number;
   volume_1h_usd: number;
   volume_24h_usd: number;
@@ -27,6 +45,8 @@ export interface MarketIntelResult {
   /** Numeric buy/(buy+sell) ratio e.g. 0.62 */
   buy_sell_ratio: number;
   buy_pressure: "HIGH" | "MEDIUM" | "LOW";
+  /** Which timeframe the buy/sell pressure is derived from */
+  buy_pressure_window: string;
   sell_pressure: "HIGH" | "MEDIUM" | "LOW";
   large_txs_last_hour: number;  // txs > $10k (estimated from volume/count)
   /** Derived from short-term price variance */
@@ -42,12 +62,32 @@ export interface MarketIntelResult {
   ath_source: string | null;
   /** Structured ATH distance context */
   ath_context: AthContext;
-  /** Market capitalisation (FDV) from DexScreener; null if unavailable */
+  /** Market capitalisation from Birdeye (primary) or DexScreener FDV (fallback) */
   market_cap_usd: number | null;
   /** Structured rug risk assessment */
   rug_risk: RugRisk;
   /** Static guidance for the current signal */
   signal_guidance: SignalGuidance;
+
+  // 24h participant counts (Fix 6)
+  txns_24h: number | null;
+  buys_24h: number | null;
+  sells_24h: number | null;
+  makers_24h: number | null;      // unique_wallet_24h
+  buyers_24h: number | null;      // not available split — null
+  sellers_24h: number | null;     // not available split — null
+  buy_volume_24h_usd: number | null;
+  sell_volume_24h_usd: number | null;
+
+  /** Multi-timeframe market data (Fix 2) */
+  timeframes: {
+    "5m": MarketTimeframe;
+    "30m": MarketTimeframe;    // Birdeye has 30m not 15m
+    "1h": MarketTimeframe;
+    "8h": MarketTimeframe;     // Birdeye has 8h not 6h
+    "24h": MarketTimeframe;
+  };
+
   market_summary: string;
   /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
