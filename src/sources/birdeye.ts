@@ -95,7 +95,7 @@ export async function getTokenOHLCV(
   if (!isAvailable("birdeye")) return null;
 
   const start = Date.now();
-  const timeFrom = Math.floor(Date.now() / 1000) - 365 * 2 * 24 * 60 * 60; // 2 years
+  const timeFrom = Math.floor(Date.now() / 1000) - 365 * 3 * 24 * 60 * 60; // 3 years
   const timeTo   = Math.floor(Date.now() / 1000);
   const url = `${OHLCV_URL}?address=${encodeURIComponent(address)}&type=1D&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
 
@@ -129,5 +129,6 @@ export async function getTokenOHLCV(
   if (!items.length) return null;
 
   const ath_price_usd = Math.max(...items.map((c) => c.h ?? 0));
+  if (ath_price_usd <= 0) return null; // all candles have h=0 or missing
   return { ath_price_usd, candles: items.length };
 }

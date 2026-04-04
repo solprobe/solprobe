@@ -353,21 +353,48 @@ export interface MarketIntelData {
   sell_pressure: string;
   large_txs_last_hour: number;
   signal: string;
+  signal_score?: number;
   token_health?: string;
   pct_from_ath?: number | null;
   signal_subtype?: string;
   factors?: ScoringFactor[];
 }
 
+// Forbidden words that contradict ACTIVE token health or use hyperbolic language
+const MARKET_SUMMARY_FORBIDDEN = [
+  "eliminated", "destroyed", "failed project", "abandoned",
+  "worthless", "untradeable", "dead", "rug", "rugged",
+  "wiped out", "obliterated", "catastrophic", "devastating",
+];
+
+function validateMarketSummary(text: string, tokenHealth?: string): boolean {
+  const lower = text.toLowerCase();
+  // Always block forbidden words
+  if (MARKET_SUMMARY_FORBIDDEN.some(w => lower.includes(w))) return false;
+  // Extra check: ACTIVE tokens must not be described negatively in absolute terms
+  if (tokenHealth === "ACTIVE") {
+    if (["collapse", "crash", "plummet"].some(w => lower.includes(w))) return false;
+  }
+  return true;
+}
+
 export function fallbackMarketIntelSummary(data: MarketIntelData): string {
   const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
   const vol = data.volume_1h_usd > 0 ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
-  return `${dir} signal — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure.`;
+  const scorePart = data.signal_score != null ? ` (score ${data.signal_score > 0 ? "+" : ""}${data.signal_score})` : "";
+  const healthPart = data.token_health ? `; token health ${data.token_health}` : "";
+  return `${dir} signal${scorePart} — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure${healthPart}.`;
 }
 
 export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
   const system =
-    "You are a crypto market analyst. Output exactly one sentence summarising market conditions and their implication for a trade. Reference the most significant signal factor from the factors list when available. If the token is DEAD or ILLIQUID, lead with that fact. If pct_from_ath is worse than -80%, flag this as a likely rugged token. Never hedge. Be specific with numbers.";
+    "You are a Solana market analyst writing one short paragraph for AI trading agents. " +
+    "You receive structured market data including token_health, signal, and factors[]. " +
+    "Your summary MUST be consistent with the structured fields — never contradict them. " +
+    "If token_health is ACTIVE, do not describe the token as rugged, dead, or worthless. " +
+    "If token_health is DEAD or ILLIQUID, lead with that fact. " +
+    "Reference the most impactful factor from the factors list. Be specific with numbers. " +
+    "Never use 'strong', 'safe', or 'excellent'. Never hedge. Output only the paragraph.";
 
   const topFactors = [...(data.factors ?? [])]
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
@@ -396,7 +423,13 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
     factorLines,
   ].filter(Boolean).join(" ");
 
-  const result = await callWithFallback("fast", 80, system, userMsg);
+  let result = await callWithFallback("fast", 80, system, userMsg);
+
+  // Post-generation validation: block forbidden language and health contradictions
+  if (result && !validateMarketSummary(result, data.token_health)) {
+    result = ""; // fall through to deterministic fallback
+  }
+
   return result || fallbackMarketIntelSummary(data);
 }
 

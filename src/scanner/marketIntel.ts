@@ -1,5 +1,6 @@
 import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
 import { getBirdeyeToken, getTokenOHLCV, type BirdeyeTokenData } from "../sources/birdeye.js";
+import { getCoinGeckoATH } from "../sources/coingecko.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
@@ -31,10 +32,22 @@ export interface MarketIntelResult {
   /** Derived from short-term price variance */
   volatility: "LOW" | "MEDIUM" | "HIGH";
   signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  /** Composite signal score (-100 to +100) */
+  signal_score: number;
   signal_subtype: SignalSubtype;
   token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
   pct_from_ath: number | null;          // % below all-time high (negative = below ATH)
-  ath_price_usd: number | null;         // ATH price from Birdeye OHLCV history
+  ath_price_usd: number | null;         // ATH price from multi-provider aggregation
+  /** Which provider supplied the ATH value */
+  ath_source: string | null;
+  /** Structured ATH distance context */
+  ath_context: AthContext;
+  /** Market capitalisation (FDV) from DexScreener; null if unavailable */
+  market_cap_usd: number | null;
+  /** Structured rug risk assessment */
+  rug_risk: RugRisk;
+  /** Static guidance for the current signal */
+  signal_guidance: SignalGuidance;
   market_summary: string;
   /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
@@ -44,6 +57,8 @@ export interface MarketIntelResult {
   factors: ScoringFactor[];
   data_quality: "FULL" | "PARTIAL" | "LIMITED";
   missing_fields: string[];
+  /** Total response time in milliseconds */
+  response_time_ms: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,34 +96,73 @@ function classifyTokenHealth(data: {
   return "ACTIVE";
 }
 
-function computeRawSignal(
-  buySellRatio: number | null,
-  priceChange1h: number | null
-): "BULLISH" | "BEARISH" | "NEUTRAL" {
-  const bsRatio = buySellRatio ?? 0.5;
-  const p1h = priceChange1h ?? 0;
-
-  if (bsRatio > 0.6 && p1h > 2)  return "BULLISH";
-  if (bsRatio < 0.4 && p1h < -2) return "BEARISH";
-  if (bsRatio > 0.65) return "BULLISH";
-  if (bsRatio < 0.35) return "BEARISH";
-  if (p1h > 5)  return "BULLISH";
-  if (p1h < -5) return "BEARISH";
-
-  return "NEUTRAL";
-}
-
-function deriveSignal(
-  rawSignal: "BULLISH" | "BEARISH" | "NEUTRAL",
-  health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD",
-  pct_from_ath: number | null
-): "BULLISH" | "BEARISH" | "NEUTRAL" {
-  if (health === "DEAD" || health === "ILLIQUID") return "BEARISH";
-  if (health === "LOW_ACTIVITY" && (pct_from_ath === null || pct_from_ath < -80)) {
-    return "BEARISH";
+/**
+ * Weighted signal scoring algorithm — replaces computeRawSignal + deriveSignal.
+ * Returns a composite score (-100 to +100) and derived signal direction.
+ *
+ * Components (weights sum to 1.0):
+ *   price_change  0.30 — 1h price momentum clamped to [-30, +30]
+ *   buy_sell      0.25 — buy/sell ratio deviation from neutral (0.5)
+ *   vol_liq       0.20 — volume-to-liquidity ratio (trading intensity)
+ *   large_txs     0.15 — large transaction count signal
+ *   rug_risk      0.10 — rug risk penalty (negative only)
+ */
+function deriveSignalAndScore(data: {
+  price_change_1h_pct: number;
+  buy_sell_ratio: number | null;
+  volume_24h_usd: number;
+  liquidity_usd: number;
+  large_txs_last_hour: number;
+  rug_risk_score: number; // 0–13 (scaled internally to 0–100)
+  token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
+  pct_from_ath: number | null;
+}): { signal: "BULLISH" | "BEARISH" | "NEUTRAL"; signal_score: number } {
+  // Health overrides — force BEARISH before scoring
+  if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
+    return { signal: "BEARISH", signal_score: -80 };
   }
-  if (health === "DECLINING" && rawSignal === "NEUTRAL") return "BEARISH";
-  return rawSignal;
+  if (data.token_health === "LOW_ACTIVITY" && (data.pct_from_ath === null || data.pct_from_ath < -80)) {
+    return { signal: "BEARISH", signal_score: -60 };
+  }
+
+  const bsr = data.buy_sell_ratio ?? 0.5;
+
+  // Component 1: price momentum — clamp to [-30, +30], scale to [-100, +100]
+  const priceRaw = Math.max(-30, Math.min(30, data.price_change_1h_pct));
+  const priceComponent = (priceRaw / 30) * 100;
+
+  // Component 2: buy/sell pressure — deviation from 0.5, scale to [-100, +100]
+  const bsComponent = ((bsr - 0.5) / 0.5) * 100;
+
+  // Component 3: volume-to-liquidity ratio (higher = more intense trading)
+  const vlRatio = data.liquidity_usd > 0 ? data.volume_24h_usd / data.liquidity_usd : 0;
+  const vlComponent = Math.max(-100, Math.min(100, (vlRatio - 1) * 50));
+
+  // Component 4: large transactions signal
+  const ltxComponent = Math.min(100, data.large_txs_last_hour * 20);
+
+  // Component 5: rug risk — negative only, scale 0–13 → 0–100
+  const rugComponent = -((data.rug_risk_score / 13) * 100);
+
+  const raw = Math.round(
+    priceComponent * 0.30 +
+    bsComponent   * 0.25 +
+    vlComponent   * 0.20 +
+    ltxComponent  * 0.15 +
+    rugComponent  * 0.10
+  );
+
+  const signal_score = Math.max(-100, Math.min(100, raw));
+
+  let signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  if (signal_score >= 25) signal = "BULLISH";
+  else if (signal_score <= -25) signal = "BEARISH";
+  else signal = "NEUTRAL";
+
+  // Health-based downgrade
+  if (data.token_health === "DECLINING" && signal === "NEUTRAL") signal = "BEARISH";
+
+  return { signal, signal_score };
 }
 
 function deriveVolatility(data: {
@@ -166,11 +220,238 @@ function deriveSignalSubtype(data: {
 
   if (ch1h > 20 && data.buy_pressure === "HIGH" && data.sell_pressure === "LOW") return "EARLY_PUMP";
   if (data.sell_pressure === "HIGH" && ch24h < -10 && data.volume_24h_usd > 10_000) return "DISTRIBUTION_PHASE";
-  if (ath !== null && ath < -80 && data.volume_24h_usd < 50_000) return "POST_RUG_STAGNATION";
+  if (ath !== null && ath < -80 && data.volume_24h_usd < 50_000 && liq < 100_000) return "POST_RUG_STAGNATION";
   if (Math.abs(ch1h) > 30) return "HIGH_SPECULATION";
   if (data.signal === "BEARISH" && data.token_health === "ACTIVE") return "NORMAL_CORRECTION";
   if (data.signal === "BULLISH" && data.buy_pressure !== "LOW") return "ORGANIC_GROWTH";
+
   return "NONE";
+}
+
+/** Reconcile subtype with token_health — prevent contradictions */
+function reconcileSubtype(
+  subtype: SignalSubtype,
+  health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD",
+): SignalSubtype {
+  if (health === "ACTIVE" && subtype === "POST_RUG_STAGNATION") return "NORMAL_CORRECTION";
+  if (health === "ACTIVE" && subtype === "NO_VOLUME_ACTIVITY") return "NONE";
+  return subtype;
+}
+
+// ---------------------------------------------------------------------------
+// Rug risk heuristic (Fix 7)
+// ---------------------------------------------------------------------------
+
+export type RugRiskLevel = "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
+
+export interface RugRisk {
+  score: number;         // 0–13 (sum of 5 components, each 0–3)
+  level: RugRiskLevel;
+  meaning: string;
+  action_guidance: string;
+  components_available: string[]; // names of fields that contributed
+}
+
+const RUG_RISK_GUIDANCE: Record<RugRiskLevel, { meaning: string; action_guidance: string }> = {
+  LOW:     { meaning: "No significant rug risk indicators detected.", action_guidance: "Proceed based on other signals." },
+  MEDIUM:  { meaning: "Some rug risk indicators present — elevated caution warranted.", action_guidance: "Verify holder distribution and LP status before acting." },
+  HIGH:    { meaning: "Multiple rug risk indicators detected — high probability of adverse outcome.", action_guidance: "Avoid or use minimal position size only." },
+  UNKNOWN: { meaning: "Insufficient data to assess rug risk.", action_guidance: "Do not rely on rug risk signals. Verify independently." },
+};
+
+/**
+ * Rug risk heuristic — 5 components, each scoring 0–3 points (max 13 total).
+ * Thresholds: 0–1 LOW, 2–3 MEDIUM, ≥4 HIGH.
+ */
+function calculateRugRiskLevel(data: {
+  liquidity_usd: number | null;
+  market_cap_usd: number | null;
+  top_10_holder_pct: number | null;
+  deployer_sold_pct_last_1h: number | null;
+  liquidity_dropped_48h_pct: number | null;
+}): RugRisk {
+  const components_available: string[] = [];
+  let score = 0;
+
+  // Component 1: Liquidity floor (0–3)
+  if (data.liquidity_usd !== null) {
+    components_available.push("liquidity_usd");
+    const liq = data.liquidity_usd;
+    if (liq < 1_000) score += 3;
+    else if (liq < 5_000) score += 2;
+    else if (liq < 10_000) score += 1;
+  }
+
+  // Component 2: Liquidity-to-mcap ratio (0–3)
+  if (data.market_cap_usd !== null && data.market_cap_usd > 0 && data.liquidity_usd !== null) {
+    components_available.push("liq_mcap_ratio");
+    const ratio = data.liquidity_usd / data.market_cap_usd;
+    if (ratio < 0.01) score += 3;
+    else if (ratio < 0.05) score += 2;
+    else if (ratio < 0.1) score += 1;
+  }
+
+  // Component 3: Holder concentration (0–3)
+  if (data.top_10_holder_pct !== null) {
+    components_available.push("top_10_holder_pct");
+    if (data.top_10_holder_pct > 90) score += 3;
+    else if (data.top_10_holder_pct > 70) score += 2;
+    else if (data.top_10_holder_pct > 50) score += 1;
+  }
+
+  // Component 4: Deployer selling (0–2)
+  if (data.deployer_sold_pct_last_1h !== null) {
+    components_available.push("deployer_sold_pct_last_1h");
+    if (data.deployer_sold_pct_last_1h > 50) score += 2;
+    else if (data.deployer_sold_pct_last_1h > 20) score += 1;
+  }
+
+  // Component 5: Liquidity drop (0–2)
+  if (data.liquidity_dropped_48h_pct !== null) {
+    components_available.push("liquidity_dropped_48h_pct");
+    if (data.liquidity_dropped_48h_pct > 50) score += 2;
+    else if (data.liquidity_dropped_48h_pct > 25) score += 1;
+  }
+
+  if (components_available.length === 0) {
+    return { score: 0, level: "UNKNOWN", ...RUG_RISK_GUIDANCE.UNKNOWN, components_available };
+  }
+
+  const level: RugRiskLevel =
+    score >= 4 ? "HIGH" :
+    score >= 2 ? "MEDIUM" : "LOW";
+
+  return { score, level, ...RUG_RISK_GUIDANCE[level], components_available };
+}
+
+// ---------------------------------------------------------------------------
+// Signal guidance (Fix 8) — static per signal type
+// ---------------------------------------------------------------------------
+
+export interface SignalGuidance {
+  signal: "BULLISH" | "BEARISH" | "NEUTRAL";
+  meaning: string;
+  action_guidance: string;
+  score_context: string;
+}
+
+const SIGNAL_GUIDANCE_LOOKUP: Record<"BULLISH" | "BEARISH" | "NEUTRAL", Omit<SignalGuidance, "signal">> = {
+  BULLISH: {
+    meaning: "Buying pressure exceeds selling pressure with positive price momentum.",
+    action_guidance: "Conditions favor entry. Validate with structural safety (sol_quick_scan) before acting.",
+    score_context: "Score > +25 indicates bullish bias; higher scores reflect stronger conviction across multiple components.",
+  },
+  BEARISH: {
+    meaning: "Selling pressure exceeds buying pressure with negative price momentum.",
+    action_guidance: "Conditions favor exit or avoidance. If holding, consider reducing position size.",
+    score_context: "Score < -25 indicates bearish bias; lower scores reflect stronger conviction across multiple components.",
+  },
+  NEUTRAL: {
+    meaning: "No clear directional bias — buying and selling pressure are balanced.",
+    action_guidance: "No immediate action implied. Wait for directional confirmation before acting.",
+    score_context: "Score between -25 and +25 indicates no dominant direction. May shift quickly.",
+  },
+};
+
+function deriveSignalGuidance(signal: "BULLISH" | "BEARISH" | "NEUTRAL"): SignalGuidance {
+  return { signal, ...SIGNAL_GUIDANCE_LOOKUP[signal] };
+}
+
+// ---------------------------------------------------------------------------
+// ATH context (Fix 11) — structured distance classification
+// ---------------------------------------------------------------------------
+
+export type AthDistance = "NEAR_ATH" | "MODERATE_DECLINE" | "SIGNIFICANT_DECLINE" | "EXTREME_DECLINE" | "UNKNOWN";
+
+export interface AthContext {
+  distance: AthDistance;
+  meaning: string;
+  action_guidance: string;
+}
+
+const ATH_CONTEXT_LOOKUP: Record<AthDistance, { meaning: string; action_guidance: string }> = {
+  NEAR_ATH: {
+    meaning: "Price is within 20% of all-time high.",
+    action_guidance: "Resistance near ATH is common. Consider partial profit-taking if holding.",
+  },
+  MODERATE_DECLINE: {
+    meaning: "Price is 20–50% below all-time high.",
+    action_guidance: "Normal correction range. Evaluate other signals before entry.",
+  },
+  SIGNIFICANT_DECLINE: {
+    meaning: "Price is 50–80% below all-time high.",
+    action_guidance: "Significant drawdown — verify structural safety and liquidity before considering entry.",
+  },
+  EXTREME_DECLINE: {
+    meaning: "Price is more than 80% below all-time high — not necessarily project failure; many active tokens trade far below ATH.",
+    action_guidance: "Large drawdown from peak. Cross-reference token_health and volume before drawing conclusions.",
+  },
+  UNKNOWN: {
+    meaning: "ATH data unavailable — cannot assess distance from peak.",
+    action_guidance: "Do not rely on ATH signals. Verify independently if price history matters to your decision.",
+  },
+};
+
+function deriveAthContext(pct_from_ath: number | null): AthContext {
+  if (pct_from_ath === null) return { distance: "UNKNOWN", ...ATH_CONTEXT_LOOKUP.UNKNOWN };
+  const abs = Math.abs(pct_from_ath);
+  if (abs <= 20) return { distance: "NEAR_ATH", ...ATH_CONTEXT_LOOKUP.NEAR_ATH };
+  if (abs <= 50) return { distance: "MODERATE_DECLINE", ...ATH_CONTEXT_LOOKUP.MODERATE_DECLINE };
+  if (abs <= 80) return { distance: "SIGNIFICANT_DECLINE", ...ATH_CONTEXT_LOOKUP.SIGNIFICANT_DECLINE };
+  return { distance: "EXTREME_DECLINE", ...ATH_CONTEXT_LOOKUP.EXTREME_DECLINE };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider ATH aggregation
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve ATH from multiple providers with sanity validation.
+ * CoinGecko is primary (most reliable historical data), Birdeye is secondary.
+ * Sanity bounds: ATH must be >= 0.5x current price AND <= 50x current price
+ * (or 10000x for micro-cap tokens under $0.001).
+ */
+async function resolveATH(
+  address: string,
+  currentPriceUsd: number,
+  birdeyeAth: number | null,
+): Promise<{ ath_price_usd: number | null; ath_source: string | null }> {
+  // Ceiling multiplier: micro-cap tokens can have extreme ATH ratios
+  const maxMultiple = currentPriceUsd < 0.001 ? 10_000 : 50;
+  const minMultiple = 0.5; // ATH can't be less than half current price
+
+  function isSane(ath: number): boolean {
+    if (ath <= 0 || currentPriceUsd <= 0) return false;
+    const ratio = ath / currentPriceUsd;
+    return ratio >= minMultiple && ratio <= maxMultiple;
+  }
+
+  // Try CoinGecko first (most reliable for established tokens)
+  let cgAth: number | null = null;
+  try {
+    cgAth = await getCoinGeckoATH(address, currentPriceUsd, { timeout: 4000 });
+  } catch {
+    // swallow — fallback to Birdeye
+  }
+
+  if (cgAth !== null && isSane(cgAth)) {
+    return { ath_price_usd: cgAth, ath_source: "coingecko" };
+  }
+
+  if (birdeyeAth !== null && isSane(birdeyeAth)) {
+    return { ath_price_usd: birdeyeAth, ath_source: "birdeye" };
+  }
+
+  // Both failed sanity or returned null — try whichever is non-null without sanity
+  // (prefer CoinGecko data even if outside bounds over nothing)
+  if (cgAth !== null && cgAth > 0) {
+    return { ath_price_usd: cgAth, ath_source: "coingecko" };
+  }
+  if (birdeyeAth !== null && birdeyeAth > 0) {
+    return { ath_price_usd: birdeyeAth, ath_source: "birdeye" };
+  }
+
+  return { ath_price_usd: null, ath_source: null };
 }
 
 /**
@@ -255,17 +536,26 @@ function buildMarketFactors(data: {
     interpretation: `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume`,
   });
 
-  // Buy/sell pressure
-  const pressureImpact =
-    data.buy_pressure === "HIGH" && data.sell_pressure === "LOW" ? 15 :
-    data.sell_pressure === "HIGH" && data.buy_pressure === "LOW" ? -15 :
-    data.buy_pressure === "HIGH" ? 5 :
-    data.sell_pressure === "HIGH" ? -5 : 0;
+  // Buy pressure
+  const buyImpact =
+    data.buy_pressure === "HIGH" ? 10 :
+    data.buy_pressure === "LOW"  ? -5 : 0;
   sf.push({
-    name: "buy_sell_pressure",
-    value: `buy=${data.buy_pressure} sell=${data.sell_pressure}`,
-    impact: pressureImpact,
-    interpretation: `${data.buy_pressure.toLowerCase()} buy pressure, ${data.sell_pressure.toLowerCase()} sell pressure`,
+    name: "buy_pressure",
+    value: data.buy_pressure,
+    impact: buyImpact,
+    interpretation: `${data.buy_pressure.toLowerCase()} buy pressure`,
+  });
+
+  // Sell pressure
+  const sellImpact =
+    data.sell_pressure === "HIGH" ? -10 :
+    data.sell_pressure === "LOW"  ? 5 : 0;
+  sf.push({
+    name: "sell_pressure",
+    value: data.sell_pressure,
+    impact: sellImpact,
+    interpretation: `${data.sell_pressure.toLowerCase()} sell pressure`,
   });
 
   // ATH distance
@@ -350,8 +640,9 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const liquidity_usd        = dexData?.liquidity_usd    ?? birdData?.liquidity_usd    ?? 0;
   const buy_sell_ratio       = dexData?.buy_sell_ratio_1h ?? null;
 
-  // ATH + pct_from_ath
-  const ath_price_usd = ohlcvData?.ath_price_usd ?? null;
+  // ATH + pct_from_ath — multi-provider aggregation (CoinGecko primary, Birdeye secondary)
+  const birdeyeAth = ohlcvData?.ath_price_usd ?? null;
+  const { ath_price_usd, ath_source } = await resolveATH(address, current_price_usd, birdeyeAth);
   const pct_from_ath = (ath_price_usd !== null && current_price_usd > 0)
     ? ((current_price_usd - ath_price_usd) / ath_price_usd) * 100
     : null;
@@ -364,10 +655,11 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     price_change_24h_pct,
   });
 
-  // Pressure + signal (with health-based overrides)
+  // Pressure
   const { buy_pressure, sell_pressure } = derivePressure(buy_sell_ratio);
-  const rawSignal = computeRawSignal(buy_sell_ratio, price_change_1h_pct || null);
-  const signal = deriveSignal(rawSignal, token_health, pct_from_ath);
+
+  // Market cap from DexScreener (FDV preferred, fallback marketCap)
+  const market_cap_usd = dexData?.market_cap_usd ?? null;
 
   // Short-interval price changes — null when Birdeye key is absent
   const price_change_5m_pct: number | null = null;
@@ -376,8 +668,37 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   // Volatility — derived from short-term price variance
   const volatility = deriveVolatility({ price_change_5m_pct, price_change_15m_pct, price_change_1h_pct });
 
+  // Rug risk heuristic (needed before signal scoring)
+  const rug_risk = calculateRugRiskLevel({
+    liquidity_usd,
+    market_cap_usd,
+    top_10_holder_pct: null,          // not available in market intel
+    deployer_sold_pct_last_1h: null,  // not available in market intel
+    liquidity_dropped_48h_pct: null,  // not available in market intel
+  });
+
+  // Large tx estimate (DexScreener h1 txns only) — needed before signal scoring
+  const h1Txns = dexData?.pair?.txns?.h1;
+  const large_txs_last_hour = estimateLargeTxs(
+    volume_1h_usd || null,
+    h1Txns?.buys ?? 0,
+    h1Txns?.sells ?? 0
+  );
+
+  // Weighted signal scoring (replaces computeRawSignal + deriveSignal)
+  const { signal, signal_score } = deriveSignalAndScore({
+    price_change_1h_pct,
+    buy_sell_ratio,
+    volume_24h_usd,
+    liquidity_usd,
+    large_txs_last_hour,
+    rug_risk_score: rug_risk.score,
+    token_health,
+    pct_from_ath,
+  });
+
   // Signal subtype — deterministic rules, not LLM
-  const signal_subtype = deriveSignalSubtype({
+  const raw_subtype = deriveSignalSubtype({
     signal,
     token_health,
     volume_24h_usd,
@@ -389,14 +710,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     liquidity_usd,
     buy_sell_ratio: buy_sell_ratio ?? 0.5,
   });
-
-  // Large tx estimate (DexScreener h1 txns only)
-  const h1Txns = dexData?.pair?.txns?.h1;
-  const large_txs_last_hour = estimateLargeTxs(
-    volume_1h_usd || null,
-    h1Txns?.buys ?? 0,
-    h1Txns?.sells ?? 0
-  );
+  const signal_subtype = reconcileSubtype(raw_subtype, token_health);
 
   // Data confidence — base confidence from sources, then cap by health
   const sources = [
@@ -457,6 +771,7 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     sell_pressure,
     large_txs_last_hour,
     signal,
+    signal_score,
     token_health,
     pct_from_ath,
     factors,
@@ -487,15 +802,22 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     large_txs_last_hour,
     volatility,
     signal,
+    signal_score,
     signal_subtype,
     token_health,
     pct_from_ath,
     ath_price_usd,
+    ath_source,
+    ath_context: deriveAthContext(pct_from_ath),
+    market_cap_usd,
+    rug_risk,
+    signal_guidance: deriveSignalGuidance(signal),
     market_summary,
     data_confidence,
     confidence,
     factors,
     data_quality,
     missing_fields,
+    response_time_ms: Date.now() - fetchStart,
   };
 }

@@ -21,6 +21,7 @@ function fakeResponse(data: unknown, status = 200) {
 interface MockOptions {
   volume_24h?: number;
   liquidity?: number;
+  market_cap?: number;
   price_change_1h?: number;
   price_change_24h?: number;
   buy_sell_ratio?: number; // buys / (buys + sells)
@@ -33,6 +34,7 @@ function makeFetchMock(opts: MockOptions = {}) {
   const {
     volume_24h    = 500_000,
     liquidity     = 100_000,
+    market_cap,
     price_change_1h  = 1,
     price_change_24h = 5,
     buy_sell_ratio = 0.6,
@@ -60,6 +62,7 @@ function makeFetchMock(opts: MockOptions = {}) {
           priceChange: { h1: price_change_1h, h24: price_change_24h },
           volume: { h1: volume_24h / 10, h24: volume_24h },
           liquidity: { usd: liquidity },
+          ...(market_cap !== undefined ? { fdv: market_cap } : {}),
           txns: { h1: { buys, sells }, h24: { buys: buys * 10, sells: sells * 10 } },
           pairCreatedAt: Date.now() - 200 * 86_400_000,
         }],
@@ -85,6 +88,11 @@ function makeFetchMock(opts: MockOptions = {}) {
           priceChange24hPercent: price_change_24h,
         },
       });
+    }
+
+    // CoinGecko — return not-found in tests (Birdeye OHLCV is the test ATH source)
+    if (u.includes("coingecko.com")) {
+      return fakeResponse({ error: "coin not found" }, 404);
     }
 
     return Promise.reject(new Error(`unexpected url: ${u}`));
@@ -260,13 +268,18 @@ describe("marketIntel", () => {
       sell_pressure:        expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       large_txs_last_hour:  expect.any(Number),
       signal:               expect.stringMatching(/^(BULLISH|BEARISH|NEUTRAL)$/),
+      signal_score:         expect.any(Number),
       signal_subtype:       expect.any(String),
       token_health:         expect.stringMatching(/^(ACTIVE|LOW_ACTIVITY|DECLINING|ILLIQUID|DEAD)$/),
       market_summary:       expect.any(String),
       data_confidence:      expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       confidence:           expect.objectContaining({ model: expect.any(Number), data_completeness: expect.any(Number), signal_consensus: expect.any(Number) }),
       factors:              expect.any(Array),
+      response_time_ms:     expect.any(Number),
     });
+
+    // ath_source is string or null
+    expect(result.ath_source === null || typeof result.ath_source === "string").toBe(true);
 
     // confidence.model is 0.0–1.0
     expect(result.confidence.model).toBeGreaterThanOrEqual(0);
@@ -280,5 +293,167 @@ describe("marketIntel", () => {
       expect(f).toHaveProperty("interpretation");
       expect(typeof f.impact).toBe("number");
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // signal_score (Fix 6)
+  // -------------------------------------------------------------------------
+
+  it("signal_score is between -100 and +100", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.signal_score).toBeGreaterThanOrEqual(-100);
+    expect(result.signal_score).toBeLessThanOrEqual(100);
+  });
+
+  it("DEAD token has strongly negative signal_score", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ volume_24h: 100, liquidity: 100_000 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.signal_score).toBeLessThanOrEqual(-60);
+  });
+
+  // -------------------------------------------------------------------------
+  // rug_risk (Fix 7)
+  // -------------------------------------------------------------------------
+
+  it("rug_risk is a structured object with expected fields", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.rug_risk).toMatchObject({
+      score: expect.any(Number),
+      level: expect.stringMatching(/^(LOW|MEDIUM|HIGH|UNKNOWN)$/),
+      meaning: expect.any(String),
+      action_guidance: expect.any(String),
+      components_available: expect.any(Array),
+    });
+    expect(result.rug_risk.score).toBeGreaterThanOrEqual(0);
+    expect(result.rug_risk.score).toBeLessThanOrEqual(13);
+  });
+
+  it("rug_risk is MEDIUM for very low liquidity alone", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ liquidity: 500 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.rug_risk.score).toBeGreaterThanOrEqual(2);
+    expect(result.rug_risk.level).toBe("MEDIUM");
+  });
+
+  it("rug_risk is HIGH when multiple risk components fire", async () => {
+    // liquidity=500 → 3 pts, liq/mcap ratio 500/500000=0.001 → 3 pts = 6 → HIGH
+    vi.stubGlobal("fetch", makeFetchMock({ liquidity: 500, market_cap: 500_000 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.rug_risk.score).toBeGreaterThanOrEqual(4);
+    expect(result.rug_risk.level).toBe("HIGH");
+  });
+
+  // -------------------------------------------------------------------------
+  // signal_guidance (Fix 8)
+  // -------------------------------------------------------------------------
+
+  it("signal_guidance matches signal direction and includes signal field", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.signal_guidance).toMatchObject({
+      signal: expect.stringMatching(/^(BULLISH|BEARISH|NEUTRAL)$/),
+      meaning: expect.any(String),
+      action_guidance: expect.any(String),
+      score_context: expect.any(String),
+    });
+    expect(result.signal_guidance.signal).toBe(result.signal);
+    // guidance meaning should reference the signal direction
+    if (result.signal === "BULLISH") {
+      expect(result.signal_guidance.meaning).toMatch(/buy/i);
+    } else if (result.signal === "BEARISH") {
+      expect(result.signal_guidance.meaning).toMatch(/sell/i);
+    }
+    // score_context should reference ±25 threshold
+    expect(result.signal_guidance.score_context).toMatch(/25/);
+  });
+
+  // -------------------------------------------------------------------------
+  // market_cap_usd (Fix 9)
+  // -------------------------------------------------------------------------
+
+  it("market_cap_usd is null when DexScreener lacks fdv/marketCap", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    // Our mock doesn't include fdv/marketCap, so should be null
+    expect(result.market_cap_usd).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Split buy/sell pressure factors (Fix 10)
+  // -------------------------------------------------------------------------
+
+  it("factors include separate buy_pressure and sell_pressure entries", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    const names = result.factors.map(f => f.name);
+    expect(names).toContain("buy_pressure");
+    expect(names).toContain("sell_pressure");
+    expect(names).not.toContain("buy_sell_pressure");
+  });
+
+  // -------------------------------------------------------------------------
+  // ath_context (Fix 11)
+  // -------------------------------------------------------------------------
+
+  it("ath_context is UNKNOWN when no OHLCV data", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.ath_context).toMatchObject({
+      distance: "UNKNOWN",
+      meaning: expect.any(String),
+      action_guidance: expect.any(String),
+    });
+  });
+
+  it("ath_context is EXTREME_DECLINE when deeply below ATH", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({
+      ohlcv_items: [{ h: 1.0 }, { h: 0.5 }],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.ath_context.distance).toBe("EXTREME_DECLINE");
+    // Must NOT contain "abandoned" language
+    expect(result.ath_context.action_guidance).not.toMatch(/abandoned/i);
+    expect(result.ath_context.meaning).toMatch(/not necessarily/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // response_time_ms (Fix 12)
+  // -------------------------------------------------------------------------
+
+  it("response_time_ms is a positive number", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.response_time_ms).toBeGreaterThanOrEqual(0);
+    expect(typeof result.response_time_ms).toBe("number");
+  });
+
+  // -------------------------------------------------------------------------
+  // POST_RUG_STAGNATION liquidity floor (Fix 2)
+  // -------------------------------------------------------------------------
+
+  it("POST_RUG_STAGNATION requires liquidity < $100k", async () => {
+    // Deep ATH decline but high liquidity — should NOT be POST_RUG_STAGNATION
+    vi.stubGlobal("fetch", makeFetchMock({
+      volume_24h: 40_000,
+      liquidity: 200_000,
+      price_change_1h: 0,
+      price_change_24h: -5,
+      ohlcv_items: [{ h: 1.0 }, { h: 0.5 }], // ATH = 1.0, current ≈ 0.000012 → >80% below
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.signal_subtype).not.toBe("POST_RUG_STAGNATION");
+  });
+
+  it("ACTIVE token never gets POST_RUG_STAGNATION subtype", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({
+      volume_24h: 500_000,
+      liquidity: 100_000,
+      ohlcv_items: [{ h: 1.0 }],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.token_health).toBe("ACTIVE");
+    expect(result.signal_subtype).not.toBe("POST_RUG_STAGNATION");
   });
 });

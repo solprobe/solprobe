@@ -104,6 +104,8 @@ export interface DexScreenerPair {
     h1?: { buys: number; sells: number };
     h24?: { buys: number; sells: number };
   };
+  fdv?: number;
+  marketCap?: number;
   pairCreatedAt?: number;
   info?: {
     liquidityToken?: { address: string } | null;
@@ -132,6 +134,8 @@ export interface DexScreenerTokenData {
   lp_model: LPModel;
   /** dexId of the best pair; null when no pair found */
   dex_id: string | null;
+  /** Market cap (FDV preferred, fallback to marketCap); null if unavailable */
+  market_cap_usd: number | null;
 }
 
 /**
@@ -209,6 +213,7 @@ export async function getDexScreenerToken(
       lp_mint_address: null,
       lp_model: "UNKNOWN",
       dex_id: null,
+      market_cap_usd: null,
     };
   }
 
@@ -242,5 +247,6 @@ export async function getDexScreenerToken(
     lp_mint_address: best.info?.liquidityToken?.address ?? null,
     lp_model: classifyLPModel(dex_id),
     dex_id,
+    market_cap_usd: best.fdv ?? best.marketCap ?? null,
   };
 }
