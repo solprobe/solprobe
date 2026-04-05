@@ -1,6 +1,7 @@
 import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo, checkLPBurned } from "../sources/helius.js";
+import { getTokenMintInfo, checkLPBurned, getMintCreationBlock } from "../sources/helius.js";
+import { getTokenCreationInfo } from "../sources/birdeye.js";
 import {
   calculateRiskGrade,
   calculateConfidence,
@@ -17,6 +18,98 @@ import {
   type QuickScanData,
 } from "../llm/narrativeEngine.js";
 import type { ScoringFactor, HistoricalFlag } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Launch Anomaly Detection
+// ---------------------------------------------------------------------------
+
+export type LaunchPattern = "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN";
+
+export interface LaunchAnomaly {
+  mint_block: number | null;
+  pool_init_block: number | null;
+  blocks_apart: number | null;
+  same_block_launch: boolean | null;
+  launch_pattern: LaunchPattern;
+  risk_note: string;
+  action_guidance: string;
+}
+
+const LAUNCH_ANOMALY_TEXT: Record<LaunchPattern, { risk_note: string; action_guidance: string }> = {
+  SAME_BLOCK: {
+    risk_note: "Token mint and liquidity pool were created in the same block. This is consistent with pre-planned coordinated launches.",
+    action_guidance: "Treat as bundled_launch_detected regardless of RugCheck result. Significant rug risk signal.",
+  },
+  WITHIN_5_BLOCKS: {
+    risk_note: "Liquidity pool was initialised within 5 blocks of token mint. May indicate coordinated launch.",
+    action_guidance: "Cross-reference bundled_launch_detected and top holder concentration before acting.",
+  },
+  NORMAL: {
+    risk_note: "Liquidity pool was created materially after token mint. No same-block anomaly detected.",
+    action_guidance: "No launch timing anomaly. Evaluate other structural signals normally.",
+  },
+  UNKNOWN: {
+    risk_note: "Launch timing data could not be retrieved.",
+    action_guidance: "Launch pattern cannot be assessed. Use RugCheck bundled_launch_detected as fallback.",
+  },
+};
+
+/** Solana: ~400ms per slot */
+const MS_PER_SLOT = 400;
+
+function deriveLaunchAnomaly(data: {
+  mintBlockTime: number | null;   // Unix seconds
+  poolCreatedAtMs: number | null; // Unix milliseconds (from DexScreener pairCreatedAt)
+  mintSlot: number | null;
+}): LaunchAnomaly {
+  const { mintBlockTime, poolCreatedAtMs, mintSlot } = data;
+
+  if (mintBlockTime === null || poolCreatedAtMs === null) {
+    return {
+      mint_block: mintSlot,
+      pool_init_block: null,
+      blocks_apart: null,
+      same_block_launch: null,
+      launch_pattern: "UNKNOWN",
+      ...LAUNCH_ANOMALY_TEXT.UNKNOWN,
+    };
+  }
+
+  const mintMs = mintBlockTime * 1000;
+  const diffMs = poolCreatedAtMs - mintMs;
+  const blocks_apart = Math.round(diffMs / MS_PER_SLOT);
+
+  // Negative means pool appeared before mint in the data — treat as unknown
+  if (blocks_apart < 0) {
+    return {
+      mint_block: mintSlot,
+      pool_init_block: null,
+      blocks_apart: null,
+      same_block_launch: null,
+      launch_pattern: "UNKNOWN",
+      ...LAUNCH_ANOMALY_TEXT.UNKNOWN,
+    };
+  }
+
+  const pattern: LaunchPattern =
+    blocks_apart === 0 ? "SAME_BLOCK" :
+    blocks_apart <= 5  ? "WITHIN_5_BLOCKS" :
+    "NORMAL";
+
+  // Estimate pool block from slot approximation
+  const estimatedPoolSlot = mintSlot !== null
+    ? mintSlot + blocks_apart
+    : null;
+
+  return {
+    mint_block: mintSlot,
+    pool_init_block: estimatedPoolSlot,
+    blocks_apart,
+    same_block_launch: blocks_apart === 0,
+    launch_pattern: pattern,
+    ...LAUNCH_ANOMALY_TEXT[pattern],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Liquidity Check — structured object with actionable guidance
@@ -111,6 +204,8 @@ export interface QuickScanResult {
   historical_flags: HistoricalFlag[];
   data_quality: "FULL" | "PARTIAL" | "LIMITED";
   missing_fields: string[];
+  /** Launch timing anomaly — mint vs pool creation block comparison */
+  launch_anomaly: LaunchAnomaly;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -127,16 +222,21 @@ export async function quickScan(address: string): Promise<QuickScanResult> {
 async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const fetchStart = Date.now();
 
-  // All three sources run in parallel. getTokenMintInfo is NOT sequential.
-  const [dexResult, rugResult, mintResult] = await Promise.allSettled([
+  // All sources run in parallel.
+  // Birdeye token_creation_info is primary for mint timestamp; Helius is the fallback.
+  const [dexResult, rugResult, mintResult, birdeyeCreationResult, mintBlockResult] = await Promise.allSettled([
     getDexScreenerToken(address, { timeout: 4000 }),
     getRugCheckSummary(address, { timeout: 3000 }),
-    getTokenMintInfo(address, { timeout: 3000 }),  // sole source for authority flags
+    getTokenMintInfo(address, { timeout: 3000 }),          // sole source for authority flags
+    getTokenCreationInfo(address, { timeout: 3000 }),      // primary for mint creation time
+    getMintCreationBlock(address, { timeout: 2000 }),      // fallback for mint creation time
   ]);
 
-  const dexData  = dexResult.status  === "fulfilled" ? dexResult.value  : null;
-  const rugData  = rugResult.status  === "fulfilled" ? rugResult.value  : null;
-  const mintData = mintResult.status === "fulfilled" ? mintResult.value : null;
+  const dexData            = dexResult.status            === "fulfilled" ? dexResult.value            : null;
+  const rugData            = rugResult.status            === "fulfilled" ? rugResult.value            : null;
+  const mintData           = mintResult.status           === "fulfilled" ? mintResult.value           : null;
+  const birdeyeCreationData = birdeyeCreationResult.status === "fulfilled" ? birdeyeCreationResult.value : null;
+  const mintBlockData      = mintBlockResult.status      === "fulfilled" ? mintBlockResult.value      : null;
 
   if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
   if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
@@ -191,6 +291,19 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     token_age_days = (Date.now() - dexData.pair_created_at_ms) / (1000 * 60 * 60 * 24);
   }
 
+  // ── Launch anomaly detection ───────────────────────────────────────────────
+  // Birdeye token_creation_info is primary; Helius getSignaturesForAddress is fallback.
+  // Birdeye returns accurate data for tokens of any age (including 2022-era tokens like BONK).
+  // Helius falls back to oldest signature in 1000-entry page which is unreliable for high-tx tokens.
+  const mintBlockTime = birdeyeCreationData?.block_unix_time ?? mintBlockData?.blockTime ?? null;
+  const mintSlot      = birdeyeCreationData?.slot            ?? mintBlockData?.slot      ?? null;
+
+  const launch_anomaly = deriveLaunchAnomaly({
+    mintBlockTime,
+    poolCreatedAtMs: dexData?.pair_created_at_ms ?? null,
+    mintSlot,
+  });
+
   const riskFactors: RiskFactors = {
     mint_authority_revoked,
     freeze_authority_revoked,
@@ -207,6 +320,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     lp_status,
     dex_id,
     dev_wallet_age_days: null, // quickScan never fetches this
+    launch_pattern: launch_anomaly.launch_pattern,
   };
 
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
@@ -234,6 +348,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     has_rug_history,
     bundled_launch: riskFactors.bundled_launch,
     single_holder_danger: riskFactors.single_holder_danger,
+    launch_pattern: launch_anomaly.launch_pattern,
   });
 
   // ── Scope declaration ─────────────────────────────────────────────────────
@@ -306,5 +421,6 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     historical_flags,
     data_quality,
     missing_fields,
+    launch_anomaly,
   };
 }

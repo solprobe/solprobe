@@ -288,6 +288,45 @@ export async function getWalletAgeDays(
   return (Date.now() / 1000 - oldestSig.blockTime) / 86_400;
 }
 
+/**
+ * Fetch the oldest transaction slot and blockTime for a mint address.
+ * Used for launch anomaly detection (same-block mint + pool creation).
+ *
+ * Fetches up to 1000 signatures for the address — the last entry is the
+ * creation transaction. Returns null on failure or timeout.
+ * Uses a hard 2000ms timeout per the SLA requirement.
+ */
+export async function getMintCreationBlock(
+  mintAddress: string,
+  options: { timeout?: number } = {}
+): Promise<{ slot: number | null; blockTime: number | null } | null> {
+  const timeout = options.timeout ?? 2000;
+
+  type SingleResponse = { id: number; result?: any; error?: any };
+
+  const result = await rpcWithRetry<SingleResponse>(
+    (endpoint) => rpcPost<SingleResponse>(endpoint, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getSignaturesForAddress",
+      params: [mintAddress, { limit: 1000 }],
+    }, timeout)
+  );
+
+  if (!result?.result) return null;
+
+  const sigs: Array<{ signature: string; slot: number; blockTime?: number | null }> =
+    Array.isArray(result.result) ? result.result : [];
+
+  if (sigs.length === 0) return null;
+
+  const oldest = sigs[sigs.length - 1];
+  return {
+    slot: typeof oldest.slot === "number" ? oldest.slot : null,
+    blockTime: typeof oldest.blockTime === "number" ? oldest.blockTime : null,
+  };
+}
+
 export async function getTokenInfo(
   address: string,
   options: { timeout?: number } = {}

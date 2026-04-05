@@ -78,6 +78,12 @@ function makeFetchMock(overrides: {
       return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
     }
 
+    if (body.method === "getSignaturesForAddress") {
+      // Return a signature for the mint creation — slot 100, blockTime = 400 days ago
+      const blockTime = Math.floor((Date.now() - 400 * 86_400_000) / 1000);
+      return fakeResponse({ id: 1, result: [{ signature: "fakeSig", slot: 100, blockTime }] });
+    }
+
     // Default: return base64 SPL Token mint layout (Helius owns authority flags)
     return fakeResponse({
       id: 1,
@@ -183,7 +189,7 @@ describe("quickScan", () => {
     }
 
     // historical_flags must be a valid HistoricalFlag[]
-    const validFlags = ["PAST_RUG", "BUNDLED_LAUNCH", "SINGLE_HOLDER_DANGER", "DEV_EXITED", "LIQUIDITY_REMOVAL_EVENT", "INSIDER_ACTIVITY"];
+    const validFlags = ["PAST_RUG", "BUNDLED_LAUNCH", "SINGLE_HOLDER_DANGER", "DEV_EXITED", "LIQUIDITY_REMOVAL_EVENT", "INSIDER_ACTIVITY", "SAME_BLOCK_LAUNCH"];
     for (const flag of result.historical_flags) {
       expect(validFlags).toContain(flag);
     }
@@ -362,5 +368,152 @@ describe("quickScan", () => {
     expect(dangerous.single_holder_danger).toBe(true);
     const gradeOrder = ["A", "B", "C", "D", "F"];
     expect(gradeOrder.indexOf(dangerous.risk_grade)).toBeGreaterThan(gradeOrder.indexOf(clean.risk_grade));
+  });
+
+  it("launch_anomaly is present with correct shape", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await quickScan(USDC);
+
+    expect(result.launch_anomaly).toMatchObject({
+      launch_pattern: expect.stringMatching(/^(SAME_BLOCK|WITHIN_5_BLOCKS|NORMAL|UNKNOWN)$/),
+      risk_note: expect.any(String),
+      action_guidance: expect.any(String),
+    });
+    // blocks_apart is a number or null
+    expect(
+      result.launch_anomaly.blocks_apart === null ||
+      typeof result.launch_anomaly.blocks_apart === "number"
+    ).toBe(true);
+    expect(
+      result.launch_anomaly.same_block_launch === null ||
+      typeof result.launch_anomaly.same_block_launch === "boolean"
+    ).toBe(true);
+  });
+
+  it("launch_anomaly is NORMAL when pool is created well after mint", async () => {
+    // makeFetchMock sets pairCreatedAt = 400 days ago and mintBlockTime = 400 days ago
+    // They're equal in time, but the signature mock returns blockTime 400 days ago too.
+    // Use a mock where pool is created 10 days after mint.
+    const mintBlockTime = Math.floor((Date.now() - 400 * 86_400_000) / 1000);
+    const poolCreatedAt = Date.now() - 390 * 86_400_000; // 10 days later
+
+    const customFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("dexscreener")) {
+        return fakeResponse({ pairs: [{
+          chainId: "solana", dexId: "raydium",
+          pairAddress: "fakePairAddr111111111111111111111111111111111",
+          baseToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+          quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+          priceUsd: "1.0", priceChange: {}, volume: {}, liquidity: { usd: 2_000_000 },
+          pairCreatedAt: poolCreatedAt,
+          info: { liquidityToken: { address: "FakeLPMint1111111111111111111111111111111111" } },
+        }] });
+      }
+      if (u.includes("rugcheck")) {
+        return fakeResponse({ mint: USDC, topHolders: [], score: 0, risks: [], rugged: false });
+      }
+      const body = JSON.parse((init?.body as string) ?? "{}");
+      if (body.method === "getTokenLargestAccounts") {
+        return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
+      }
+      if (body.method === "getSignaturesForAddress") {
+        return fakeResponse({ id: 1, result: [{ signature: "fakeSig", slot: 100, blockTime: mintBlockTime }] });
+      }
+      const mintBuf = Buffer.alloc(82, 0);
+      return fakeResponse({ id: 1, result: { value: { data: [mintBuf.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+    });
+
+    vi.stubGlobal("fetch", customFetch);
+    const result = await quickScan(USDC);
+
+    expect(result.launch_anomaly.launch_pattern).toBe("NORMAL");
+    expect(result.launch_anomaly.same_block_launch).toBe(false);
+    expect(result.launch_anomaly.blocks_apart).toBeGreaterThan(5);
+    expect(result.launch_anomaly.risk_note).toContain("No same-block anomaly");
+  });
+
+  it("launch_anomaly is SAME_BLOCK and applies -20 penalty", async () => {
+    // Both mint and pool at exactly the same Unix second → blocks_apart = 0
+    const sameTime = Math.floor((Date.now() - 30 * 86_400_000) / 1000);
+    const poolCreatedAtMs = sameTime * 1000;
+
+    const customFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("dexscreener")) {
+        return fakeResponse({ pairs: [{
+          chainId: "solana", dexId: "raydium",
+          pairAddress: "fakePairAddr111111111111111111111111111111111",
+          baseToken: { address: RUG, name: "Rug Token", symbol: "RUG" },
+          quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+          priceUsd: "0.001", priceChange: {}, volume: {}, liquidity: { usd: 2_000_000 },
+          pairCreatedAt: poolCreatedAtMs,
+          info: { liquidityToken: { address: "FakeLPMint1111111111111111111111111111111111" } },
+        }] });
+      }
+      if (u.includes("rugcheck")) {
+        return fakeResponse({ mint: RUG, topHolders: [], score: 0, risks: [], rugged: false });
+      }
+      const body = JSON.parse((init?.body as string) ?? "{}");
+      if (body.method === "getTokenLargestAccounts") {
+        return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
+      }
+      if (body.method === "getSignaturesForAddress") {
+        return fakeResponse({ id: 1, result: [{ signature: "fakeSig", slot: 200, blockTime: sameTime }] });
+      }
+      const mintBuf = Buffer.alloc(82, 0); // authorities revoked
+      return fakeResponse({ id: 1, result: { value: { data: [mintBuf.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+    });
+
+    vi.stubGlobal("fetch", customFetch);
+    const result = await quickScan(RUG);
+
+    expect(result.launch_anomaly.launch_pattern).toBe("SAME_BLOCK");
+    expect(result.launch_anomaly.same_block_launch).toBe(true);
+    expect(result.launch_anomaly.blocks_apart).toBe(0);
+    expect(result.historical_flags).toContain("SAME_BLOCK_LAUNCH");
+
+    // SAME_BLOCK applies -20 penalty — verify via factors[]
+    const launchFactor = result.factors.find(f => f.name === "launch_anomaly");
+    expect(launchFactor).toBeDefined();
+    expect(launchFactor?.impact).toBe(-20);
+  });
+
+  it("launch_anomaly is UNKNOWN when mint block data unavailable", async () => {
+    const customFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("dexscreener")) {
+        return fakeResponse({ pairs: [{
+          chainId: "solana", dexId: "raydium",
+          pairAddress: "fakePairAddr111111111111111111111111111111111",
+          baseToken: { address: USDC, name: "USD Coin", symbol: "USDC" },
+          quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+          priceUsd: "1.0", priceChange: {}, volume: {}, liquidity: { usd: 2_000_000 },
+          pairCreatedAt: Date.now() - 100 * 86_400_000,
+          info: { liquidityToken: { address: "FakeLPMint1111111111111111111111111111111111" } },
+        }] });
+      }
+      if (u.includes("rugcheck")) {
+        return fakeResponse({ mint: USDC, topHolders: [], score: 0, risks: [], rugged: false });
+      }
+      const body = JSON.parse((init?.body as string) ?? "{}");
+      if (body.method === "getTokenLargestAccounts") {
+        return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
+      }
+      if (body.method === "getSignaturesForAddress") {
+        // Return empty — no signatures found
+        return fakeResponse({ id: 1, result: [] });
+      }
+      const mintBuf = Buffer.alloc(82, 0);
+      return fakeResponse({ id: 1, result: { value: { data: [mintBuf.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+    });
+
+    vi.stubGlobal("fetch", customFetch);
+    const result = await quickScan(USDC);
+
+    expect(result.launch_anomaly.launch_pattern).toBe("UNKNOWN");
+    expect(result.launch_anomaly.blocks_apart).toBeNull();
+    expect(result.launch_anomaly.same_block_launch).toBeNull();
+    expect(result.historical_flags).not.toContain("SAME_BLOCK_LAUNCH");
   });
 });

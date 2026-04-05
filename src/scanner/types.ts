@@ -43,7 +43,8 @@ export type HistoricalFlag =
   | "INSIDER_ACTIVITY"                    // insider_flags from RugCheck
   | "SINGLE_HOLDER_DANGER"               // single_holder_danger from RugCheck risks[]
   | "DEV_ASSOCIATED_WITH_PREVIOUS_RUG"   // dev wallet linked to prior confirmed rug
-  | "SUSPICIOUS_LAUNCH_PATTERN";          // stealth launch + sniper concentration
+  | "SUSPICIOUS_LAUNCH_PATTERN"          // stealth launch + sniper concentration
+  | "SAME_BLOCK_LAUNCH";                 // mint and pool created in same block
 
 /**
  * Top contributing factor in agent-friendly shape (deep dive only).

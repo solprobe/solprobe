@@ -19,6 +19,7 @@ export interface RiskFactors {
   lp_status: LPStatus;                      // derived from lp_burned + lp_model
   dex_id: string | null;                    // dexId of the primary pair
   dev_wallet_age_days: number | null;       // deep dive only; null for quick scan
+  launch_pattern?: "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN"; // quick scan only
 }
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
@@ -352,6 +353,35 @@ export function calculateRiskGrade(
     }
   }
 
+  // Launch anomaly — quick scan only (undefined when not fetched)
+  if (factors.launch_pattern === "SAME_BLOCK") {
+    score -= 20;
+    sf.push({
+      name: "launch_anomaly",
+      value: "SAME_BLOCK",
+      impact: -20,
+      interpretation: "mint and pool created same block — coordinated launch",
+    });
+  } else if (factors.launch_pattern === "WITHIN_5_BLOCKS") {
+    score -= 10;
+    sf.push({
+      name: "launch_anomaly",
+      value: "WITHIN_5_BLOCKS",
+      impact: -10,
+      interpretation: "pool initialised within 5 blocks of mint",
+    });
+  } else if (factors.launch_pattern !== undefined) {
+    sf.push({
+      name: "launch_anomaly",
+      value: factors.launch_pattern,
+      impact: 0,
+      interpretation:
+        factors.launch_pattern === "NORMAL"
+          ? "no same-block launch anomaly detected"
+          : "launch timing data unavailable",
+    });
+  }
+
   // Clamp to [0, 100]
   score = Math.max(0, Math.min(100, score));
 
@@ -403,12 +433,14 @@ export function buildHistoricalFlags(data: {
   bundled_launch: boolean;
   single_holder_danger: boolean;
   dev_wallet_analysis?: { previous_rugs: boolean };
+  launch_pattern?: "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN";
 }): HistoricalFlag[] {
   const flags: HistoricalFlag[] = [];
   if (data.has_rug_history) flags.push("PAST_RUG");
   if (data.bundled_launch) flags.push("BUNDLED_LAUNCH");
   if (data.single_holder_danger) flags.push("SINGLE_HOLDER_DANGER");
   if (data.dev_wallet_analysis?.previous_rugs) flags.push("DEV_EXITED");
+  if (data.launch_pattern === "SAME_BLOCK") flags.push("SAME_BLOCK_LAUNCH");
   return flags;
 }
 

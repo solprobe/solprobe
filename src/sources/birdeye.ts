@@ -1,8 +1,10 @@
 import { isAvailable, recordSuccess, recordFailure } from "../circuitBreaker.js";
 import { recordSourceResult } from "./resolver.js";
 
-const BASE_URL = "https://public-api.birdeye.so/defi/token_overview";
-const OHLCV_URL = "https://public-api.birdeye.so/defi/ohlcv";
+const BASE_URL            = "https://public-api.birdeye.so/defi/token_overview";
+const OHLCV_URL           = "https://public-api.birdeye.so/defi/ohlcv";
+const CREATION_INFO_URL   = "https://public-api.birdeye.so/defi/token_creation_info";
+const TOKEN_SECURITY_URL  = "https://public-api.birdeye.so/defi/token_security";
 
 // ---------------------------------------------------------------------------
 // Legacy interface (used by deepDive.ts)
@@ -79,6 +81,10 @@ export interface BirdeyeTokenOverview {
   unique_wallet_1h: number | null;          // uniqueWallet1h
   unique_wallet_8h: number | null;          // uniqueWallet8h
   unique_wallet_24h: number | null;         // uniqueWallet24h
+
+  // On-chain holder count
+  // Verified via live curl against BONK on 2026-04-05: .data.holder = 998381
+  holder: number | null;                    // holder
 }
 
 // Raw response shape from Birdeye token_overview endpoint
@@ -122,6 +128,8 @@ interface RawBirdeyeOverview {
   uniqueWallet1h?: number | null;
   uniqueWallet8h?: number | null;
   uniqueWallet24h?: number | null;
+
+  holder?: number | null;
 }
 
 interface RawBirdeyeResponse {
@@ -230,7 +238,67 @@ export async function getBirdeyeTokenOverview(
     unique_wallet_1h: d.uniqueWallet1h ?? null,
     unique_wallet_8h: d.uniqueWallet8h ?? null,
     unique_wallet_24h: d.uniqueWallet24h ?? null,
+
+    holder: d.holder ?? null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Token creation info — PRIMARY source for mint creation timestamp + slot
+// Field names verified via live curl against BONK on 2026-04-05:
+//   .data.blockUnixTime = 1670531612 (Unix seconds)
+//   .data.slot          = 165714665
+//   .data.creator       = "9AhKqLR67hwapvG8SA2JFXaCshXc9nALJjpKaHZrsbkw"
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeTokenCreationInfo {
+  block_unix_time: number;  // Unix seconds — token creation timestamp
+  slot: number;             // Solana slot of the creation transaction
+  creator: string;          // Creator wallet address
+}
+
+export async function getTokenCreationInfo(
+  address: string,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeTokenCreationInfo | null> {
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const url = `${CREATION_INFO_URL}?address=${encodeURIComponent(address)}`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: { blockUnixTime?: number; slot?: number; creator?: string };
+  };
+
+  if (!json.success || !json.data) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const { blockUnixTime, slot, creator } = json.data;
+  if (typeof blockUnixTime !== "number" || typeof slot !== "number") {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  return { block_unix_time: blockUnixTime, slot, creator: creator ?? "" };
 }
 
 // ---------------------------------------------------------------------------
