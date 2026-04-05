@@ -178,8 +178,8 @@ function deriveSignalAndScore(data: {
   const vlRatio = data.liquidity_usd > 0 ? data.volume_24h_usd / data.liquidity_usd : 0;
   const vlComponent = Math.max(-100, Math.min(100, (vlRatio - 1) * 50));
 
-  // Component 4: large transactions signal
-  const ltxComponent = Math.min(100, data.large_txs_last_hour * 20);
+  // Component 4: large transactions signal — guard < 3 txs (too few to weight)
+  const ltxComponent = data.large_txs_last_hour < 3 ? 0 : Math.min(100, data.large_txs_last_hour * 20);
 
   // Component 5: rug risk — negative only, scale 0–13 → 0–100
   const rugComponent = -((data.rug_risk_score / 13) * 100);
@@ -645,6 +645,38 @@ function logError(source: string, reason: unknown, address: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Timeframe helpers (Fix 2)
+// ---------------------------------------------------------------------------
+
+function deriveTimeframePressure(volume_usd: number | null): "HIGH" | "MEDIUM" | "LOW" {
+  if (volume_usd === null) return "LOW";
+  if (volume_usd >= 100_000) return "HIGH";
+  if (volume_usd >= 10_000) return "MEDIUM";
+  return "LOW";
+}
+
+function buildTimeframe(data: {
+  price_change_pct: number | null;
+  volume_usd: number | null;
+  txns: number | null;
+  buys: number | null;
+  sells: number | null;
+  buy_volume_usd: number | null;
+  sell_volume_usd: number | null;
+  unique_wallets: number | null;
+}): MarketTimeframe {
+  const buy_sell_ratio =
+    data.buys !== null && data.sells !== null && (data.buys + data.sells) > 0
+      ? data.buys / (data.buys + data.sells)
+      : null;
+  return {
+    ...data,
+    buy_sell_ratio,
+    buy_sell_pressure: deriveTimeframePressure(data.buy_volume_usd),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -655,30 +687,50 @@ export async function marketIntel(address: string): Promise<MarketIntelResult> {
 
 async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const fetchStart = Date.now();
-  // Parallel fetch: DexScreener primary, Birdeye token overview + OHLCV
-  const [dexResult, birdResult, ohlcvResult] = await Promise.allSettled([
+
+  // Parallel fetch: Birdeye overview (primary — aggregates ALL pools), DexScreener (fallback), OHLCV
+  const [birdResult, dexResult, ohlcvResult] = await Promise.allSettled([
+    getBirdeyeTokenOverview(address, { timeout: 4000 }),
     getDexScreenerToken(address, { timeout: 4000 }),
-    getBirdeyeToken(address, { timeout: 4000 }),
     getTokenOHLCV(address, { timeout: 5000 }),
   ]);
 
+  const birdData: BirdeyeTokenOverview | null =
+    birdResult.status === "fulfilled" ? birdResult.value : null;
   const dexData: DexScreenerTokenData | null =
     dexResult.status === "fulfilled" ? dexResult.value : null;
-  const birdData: BirdeyeTokenData | null =
-    birdResult.status === "fulfilled" ? birdResult.value : null;
   const ohlcvData = ohlcvResult.status === "fulfilled" ? ohlcvResult.value : null;
 
-  if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
   if (birdResult.status === "rejected") logError("birdeye",     birdResult.reason, address);
+  if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
 
-  // Merge fields — DexScreener primary, Birdeye fallback
-  const current_price_usd    = dexData?.price_usd        ?? birdData?.price_usd        ?? 0;
-  const price_change_1h_pct  = dexData?.price_change_1h_pct  ?? birdData?.price_change_1h_pct  ?? 0;
-  const price_change_24h_pct = dexData?.price_change_24h_pct ?? birdData?.price_change_24h_pct ?? 0;
-  const volume_1h_usd        = dexData?.volume_1h_usd    ?? birdData?.volume_1h_usd    ?? 0;
-  const volume_24h_usd       = dexData?.volume_24h_usd   ?? birdData?.volume_24h_usd   ?? 0;
-  const liquidity_usd        = dexData?.liquidity_usd    ?? birdData?.liquidity_usd    ?? 0;
-  const buy_sell_ratio       = dexData?.buy_sell_ratio_1h ?? null;
+  // Merge fields — Birdeye primary (aggregates ALL pools), DexScreener fallback
+  const current_price_usd    = birdData?.price_usd            ?? dexData?.price_usd            ?? 0;
+  const price_change_1h_pct  = birdData?.price_change_1h_pct  ?? dexData?.price_change_1h_pct  ?? 0;
+  const price_change_24h_pct = birdData?.price_change_24h_pct ?? dexData?.price_change_24h_pct ?? 0;
+  const volume_1h_usd        = birdData?.volume_1h_usd        ?? dexData?.volume_1h_usd        ?? 0;
+  const volume_24h_usd       = birdData?.volume_24h_usd       ?? dexData?.volume_24h_usd       ?? 0;
+  const liquidity_usd        = birdData?.liquidity_usd        ?? dexData?.liquidity_usd        ?? 0;
+
+  // Short-interval price changes — only available from Birdeye
+  const price_change_5m_pct: number | null  = birdData?.price_change_5m_pct  ?? null;
+  const price_change_15m_pct: number | null = birdData?.price_change_30m_pct ?? null; // 30m maps to 15m slot
+  const price_change_6h_pct: number | null  = birdData?.price_change_8h_pct  ?? null; // 8h maps to 6h slot
+
+  // Buy/sell ratio — derive from Birdeye 1h counts (primary), fallback DexScreener
+  let buy_sell_ratio: number | null = null;
+  let buy_pressure_window = "1h";
+  if (birdData?.buy_1h != null && birdData?.sell_1h != null &&
+      (birdData.buy_1h + birdData.sell_1h) > 0) {
+    buy_sell_ratio = birdData.buy_1h / (birdData.buy_1h + birdData.sell_1h);
+    buy_pressure_window = "1h";
+  } else if (dexData?.buy_sell_ratio_1h != null) {
+    buy_sell_ratio = dexData.buy_sell_ratio_1h;
+    buy_pressure_window = "1h_dex";
+  }
+
+  // Market cap — Birdeye primary, DexScreener fallback
+  const market_cap_usd = birdData?.market_cap_usd ?? dexData?.market_cap_usd ?? null;
 
   // ATH + pct_from_ath — multi-provider aggregation (CoinGecko primary, Birdeye secondary)
   const birdeyeAth = ohlcvData?.ath_price_usd ?? null;
@@ -695,15 +747,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     price_change_24h_pct,
   });
 
-  // Pressure
+  // Pressure (top-level — from merged buy_sell_ratio)
   const { buy_pressure, sell_pressure } = derivePressure(buy_sell_ratio);
-
-  // Market cap from DexScreener (FDV preferred, fallback marketCap)
-  const market_cap_usd = dexData?.market_cap_usd ?? null;
-
-  // Short-interval price changes — null when Birdeye key is absent
-  const price_change_5m_pct: number | null = null;
-  const price_change_15m_pct: number | null = null;
 
   // Volatility — derived from short-term price variance
   const volatility = deriveVolatility({ price_change_5m_pct, price_change_15m_pct, price_change_1h_pct });
@@ -712,20 +757,20 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const rug_risk = calculateRugRiskLevel({
     liquidity_usd,
     market_cap_usd,
-    top_10_holder_pct: null,          // not available in market intel
-    deployer_sold_pct_last_1h: null,  // not available in market intel
-    liquidity_dropped_48h_pct: null,  // not available in market intel
+    top_10_holder_pct: null,
+    deployer_sold_pct_last_1h: null,
+    liquidity_dropped_48h_pct: null,
   });
 
-  // Large tx estimate (DexScreener h1 txns only) — needed before signal scoring
+  // Large tx estimate — DexScreener h1 txns preferred; fallback to Birdeye 1h counts
   const h1Txns = dexData?.pair?.txns?.h1;
   const large_txs_last_hour = estimateLargeTxs(
     volume_1h_usd || null,
-    h1Txns?.buys ?? 0,
-    h1Txns?.sells ?? 0
+    h1Txns?.buys ?? (birdData?.buy_1h ?? 0),
+    h1Txns?.sells ?? (birdData?.sell_1h ?? 0)
   );
 
-  // Weighted signal scoring (replaces computeRawSignal + deriveSignal)
+  // Weighted signal scoring
   const { signal, signal_score } = deriveSignalAndScore({
     price_change_1h_pct,
     buy_sell_ratio,
@@ -752,20 +797,83 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   });
   const signal_subtype = reconcileSubtype(raw_subtype, token_health);
 
-  // Data confidence — base confidence from sources, then cap by health
+  // Build timeframes from Birdeye overview data (Fix 2)
+  const timeframes = {
+    "5m": buildTimeframe({
+      price_change_pct: birdData?.price_change_5m_pct ?? null,
+      volume_usd: birdData?.volume_5m_usd ?? null,
+      txns: birdData?.trade_5m ?? null,
+      buys: birdData?.buy_5m ?? null,
+      sells: birdData?.sell_5m ?? null,
+      buy_volume_usd: birdData?.buy_volume_5m_usd ?? null,
+      sell_volume_usd: birdData?.sell_volume_5m_usd ?? null,
+      unique_wallets: birdData?.unique_wallet_5m ?? null,
+    }),
+    "30m": buildTimeframe({
+      price_change_pct: birdData?.price_change_30m_pct ?? null,
+      volume_usd: birdData?.volume_30m_usd ?? null,
+      txns: birdData?.trade_30m ?? null,
+      buys: birdData?.buy_30m ?? null,
+      sells: birdData?.sell_30m ?? null,
+      buy_volume_usd: birdData?.buy_volume_30m_usd ?? null,
+      sell_volume_usd: birdData?.sell_volume_30m_usd ?? null,
+      unique_wallets: birdData?.unique_wallet_30m ?? null,
+    }),
+    "1h": buildTimeframe({
+      price_change_pct: birdData?.price_change_1h_pct ?? null,
+      volume_usd: birdData?.volume_1h_usd ?? null,
+      txns: birdData?.trade_1h ?? null,
+      buys: birdData?.buy_1h ?? null,
+      sells: birdData?.sell_1h ?? null,
+      buy_volume_usd: birdData?.buy_volume_1h_usd ?? null,
+      sell_volume_usd: birdData?.sell_volume_1h_usd ?? null,
+      unique_wallets: birdData?.unique_wallet_1h ?? null,
+    }),
+    "8h": buildTimeframe({
+      price_change_pct: birdData?.price_change_8h_pct ?? null,
+      volume_usd: birdData?.volume_8h_usd ?? null,
+      txns: birdData?.trade_8h ?? null,
+      buys: birdData?.buy_8h ?? null,
+      sells: birdData?.sell_8h ?? null,
+      buy_volume_usd: birdData?.buy_volume_8h_usd ?? null,
+      sell_volume_usd: birdData?.sell_volume_8h_usd ?? null,
+      unique_wallets: birdData?.unique_wallet_8h ?? null,
+    }),
+    "24h": buildTimeframe({
+      price_change_pct: birdData?.price_change_24h_pct ?? null,
+      volume_usd: birdData?.volume_24h_usd ?? null,
+      txns: birdData?.trade_24h ?? null,
+      buys: birdData?.buy_24h ?? null,
+      sells: birdData?.sell_24h ?? null,
+      buy_volume_usd: birdData?.buy_volume_24h_usd ?? null,
+      sell_volume_usd: birdData?.sell_volume_24h_usd ?? null,
+      unique_wallets: birdData?.unique_wallet_24h ?? null,
+    }),
+  };
+
+  // 24h participant counts from Birdeye (Fix 6)
+  const txns_24h             = birdData?.trade_24h           ?? null;
+  const buys_24h             = birdData?.buy_24h             ?? null;
+  const sells_24h            = birdData?.sell_24h            ?? null;
+  const makers_24h           = birdData?.unique_wallet_24h   ?? null;
+  const buyers_24h: number | null  = null; // not available split in Birdeye
+  const sellers_24h: number | null = null; // not available split in Birdeye
+  const buy_volume_24h_usd   = birdData?.buy_volume_24h_usd  ?? null;
+  const sell_volume_24h_usd  = birdData?.sell_volume_24h_usd ?? null;
+
+  // Data confidence — base from sources, then cap by health
   const sources = [
-    dexData !== null ? "dexscreener" : null,
-    birdData !== null ? "birdeye" : null,
+    birdData !== null ? "birdeye"      : null,
+    dexData  !== null ? "dexscreener"  : null,
   ].filter((s): s is string => s !== null);
 
   const data_age_ms = Date.now() - fetchStart;
-  const rawConfidence = calculateConfidence({
+  const confidence = calculateConfidence({
     sources_available: sources.length,
     sources_total: 2,
     data_age_ms,
     token_health,
   });
-  const confidence = rawConfidence;
   let data_confidence = confidenceToString(confidence.model);
 
   // Health-based confidence cap (backwards-compat string field)
@@ -796,8 +904,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     sources.length === 2 ? "FULL" : sources.length === 1 ? "PARTIAL" : "LIMITED";
 
   const missing_fields: string[] = [];
-  if (dexData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio");
-  if (birdData === null) missing_fields.push("birdeye_price");
+  if (birdData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio", "timeframes");
+  if (dexData   === null) missing_fields.push("dexscreener_price");
   if (ohlcvData === null) missing_fields.push("ath_price_usd", "pct_from_ath");
 
   // LLM summary — skip if SLA headroom exhausted
@@ -832,12 +940,14 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     price_change_5m_pct,
     price_change_15m_pct,
     price_change_1h_pct,
+    price_change_6h_pct,
     price_change_24h_pct,
     volume_1h_usd,
     volume_24h_usd,
     liquidity_usd,
     buy_sell_ratio: buy_sell_ratio ?? 0.5,
     buy_pressure,
+    buy_pressure_window,
     sell_pressure,
     large_txs_last_hour,
     volatility,
@@ -852,6 +962,15 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     market_cap_usd,
     rug_risk,
     signal_guidance: deriveSignalGuidance(signal),
+    txns_24h,
+    buys_24h,
+    sells_24h,
+    makers_24h,
+    buyers_24h,
+    sellers_24h,
+    buy_volume_24h_usd,
+    sell_volume_24h_usd,
+    timeframes,
     market_summary,
     data_confidence,
     confidence,

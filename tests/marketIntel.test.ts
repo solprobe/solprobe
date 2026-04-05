@@ -46,6 +46,12 @@ function makeFetchMock(opts: MockOptions = {}) {
   const buys  = Math.round(buy_sell_ratio * 200);
   const sells = 200 - buys;
 
+  const volume_1h = volume_24h / 10;
+  const buy_vol_1h  = volume_1h  * buy_sell_ratio;
+  const sell_vol_1h = volume_1h  * (1 - buy_sell_ratio);
+  const buy_vol_24h = volume_24h * buy_sell_ratio;
+  const sell_vol_24h = volume_24h * (1 - buy_sell_ratio);
+
   return vi.fn().mockImplementation(async (url: string) => {
     const u = String(url);
 
@@ -60,7 +66,7 @@ function makeFetchMock(opts: MockOptions = {}) {
           quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
           priceUsd: "0.000012",
           priceChange: { h1: price_change_1h, h24: price_change_24h },
-          volume: { h1: volume_24h / 10, h24: volume_24h },
+          volume: { h1: volume_1h, h24: volume_24h },
           liquidity: { usd: liquidity },
           ...(market_cap !== undefined ? { fdv: market_cap } : {}),
           txns: { h1: { buys, sells }, h24: { buys: buys * 10, sells: sells * 10 } },
@@ -77,15 +83,29 @@ function makeFetchMock(opts: MockOptions = {}) {
 
     if (u.includes("birdeye.so/defi/token_overview")) {
       if (birdeye_fail) return Promise.reject(new Error("birdeye down"));
+      // Field names verified via live curl — uses vXXUSD (not vXX) for USD volumes
       return fakeResponse({
         success: true,
         data: {
           price: 0.000012,
           liquidity,
-          v1h: volume_24h / 10,
-          v24h: volume_24h,
-          priceChange1hPercent: price_change_1h,
+          // Price changes
+          priceChange1hPercent:  price_change_1h,
           priceChange24hPercent: price_change_24h,
+          // Volume USD (correct field names from Birdeye API)
+          v1hUSD:  volume_1h,
+          v24hUSD: volume_24h,
+          // Buy/sell counts per window
+          buy1h: buys, sell1h: sells,
+          buy24h: buys * 10, sell24h: sells * 10,
+          trade24h: (buys + sells) * 10,
+          // Unique wallets
+          uniqueWallet24h: 500,
+          // Buy/sell volume split
+          vBuy1hUSD:  buy_vol_1h,
+          vSell1hUSD: sell_vol_1h,
+          vBuy24hUSD:  buy_vol_24h,
+          vSell24hUSD: sell_vol_24h,
         },
       });
     }
@@ -293,6 +313,28 @@ describe("marketIntel", () => {
       expect(f).toHaveProperty("interpretation");
       expect(typeof f.impact).toBe("number");
     }
+
+    // New fields from Fix 1+2+5+6
+    expect(typeof result.buy_pressure_window).toBe("string");
+    expect(result.price_change_6h_pct === null || typeof result.price_change_6h_pct === "number").toBe(true);
+
+    // timeframes object — all 5 windows present
+    expect(result.timeframes).toBeDefined();
+    for (const window of ["5m", "30m", "1h", "8h", "24h"] as const) {
+      const tf = result.timeframes[window];
+      expect(tf).toMatchObject({
+        buy_sell_pressure: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      });
+      expect(tf.buy_sell_ratio === null || typeof tf.buy_sell_ratio === "number").toBe(true);
+    }
+
+    // 24h participant counts from Birdeye
+    expect(result.txns_24h === null || typeof result.txns_24h === "number").toBe(true);
+    expect(result.buys_24h === null || typeof result.buys_24h === "number").toBe(true);
+    expect(result.sells_24h === null || typeof result.sells_24h === "number").toBe(true);
+    expect(result.makers_24h === null || typeof result.makers_24h === "number").toBe(true);
+    expect(result.buy_volume_24h_usd === null || typeof result.buy_volume_24h_usd === "number").toBe(true);
+    expect(result.sell_volume_24h_usd === null || typeof result.sell_volume_24h_usd === "number").toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -455,5 +497,95 @@ describe("marketIntel", () => {
     const result = await marketIntel(TOKEN);
     expect(result.token_health).toBe("ACTIVE");
     expect(result.signal_subtype).not.toBe("POST_RUG_STAGNATION");
+  });
+
+  // -------------------------------------------------------------------------
+  // Birdeye primary + timeframes (Fix 1 + Fix 2)
+  // -------------------------------------------------------------------------
+
+  it("buy_pressure_window is '1h' when Birdeye 1h buy/sell counts are available", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ buy_sell_ratio: 0.7 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.buy_pressure_window).toBe("1h");
+  });
+
+  it("buy_pressure_window falls back to '1h_dex' when Birdeye fails", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ birdeye_fail: true }));
+    const result = await marketIntel(TOKEN);
+    expect(result.buy_pressure_window).toBe("1h_dex");
+  });
+
+  it("timeframes 1h buy_sell_ratio matches top-level buy_sell_ratio", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ buy_sell_ratio: 0.65 }));
+    const result = await marketIntel(TOKEN);
+    if (result.timeframes["1h"].buy_sell_ratio !== null) {
+      expect(result.timeframes["1h"].buy_sell_ratio).toBeCloseTo(result.buy_sell_ratio, 2);
+    }
+  });
+
+  it("all timeframe windows are present in response", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(Object.keys(result.timeframes)).toEqual(expect.arrayContaining(["5m", "30m", "1h", "8h", "24h"]));
+  });
+
+  // -------------------------------------------------------------------------
+  // price_change_6h_pct (Fix 5)
+  // -------------------------------------------------------------------------
+
+  it("price_change_6h_pct is null when Birdeye does not return priceChange8hPercent", async () => {
+    // Default mock does not include priceChange8hPercent → should be null
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.price_change_6h_pct).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // 24h participant counts (Fix 6)
+  // -------------------------------------------------------------------------
+
+  it("24h participant counts are populated from Birdeye", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ volume_24h: 500_000, buy_sell_ratio: 0.6 }));
+    const result = await marketIntel(TOKEN);
+    expect(typeof result.txns_24h).toBe("number");
+    expect(typeof result.buys_24h).toBe("number");
+    expect(typeof result.sells_24h).toBe("number");
+    expect(typeof result.makers_24h).toBe("number");
+    // split by wallet not available — must be null
+    expect(result.buyers_24h).toBeNull();
+    expect(result.sellers_24h).toBeNull();
+    expect(typeof result.buy_volume_24h_usd).toBe("number");
+    expect(typeof result.sell_volume_24h_usd).toBe("number");
+  });
+
+  it("24h counts are null when Birdeye fails", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ birdeye_fail: true }));
+    const result = await marketIntel(TOKEN);
+    expect(result.txns_24h).toBeNull();
+    expect(result.buys_24h).toBeNull();
+    expect(result.makers_24h).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // market_summary sentence termination (Fix 4)
+  // -------------------------------------------------------------------------
+
+  it("market_summary ends with sentence-terminating punctuation", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.market_summary).toMatch(/[.!?]$/);
+  });
+
+  // -------------------------------------------------------------------------
+  // large_txs guard: < 3 txs contributes 0 to signal_score (Fix 3)
+  // -------------------------------------------------------------------------
+
+  it("large_txs_last_hour < 3 does not inflate signal_score", async () => {
+    // Low volume means 0 large txs — signal_score should not be inflated
+    vi.stubGlobal("fetch", makeFetchMock({ volume_24h: 5_000, liquidity: 50_000 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.large_txs_last_hour).toBeLessThan(3);
+    // With near-zero buy pressure and low volume, score should not be inflated
+    expect(result.signal_score).toBeLessThanOrEqual(25);
   });
 });
