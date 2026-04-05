@@ -7,6 +7,21 @@ const CREATION_INFO_URL   = "https://public-api.birdeye.so/defi/token_creation_i
 const TOKEN_SECURITY_URL  = "https://public-api.birdeye.so/defi/token_security";
 
 // ---------------------------------------------------------------------------
+// OHLCV candle — defined here (sources layer) so marketIntel.ts can import it
+// without creating a reverse scanner→sources dependency.
+// ---------------------------------------------------------------------------
+
+export interface OHLCVCandle {
+  unix_time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** Raw token volume × close price (USD). */
+  volume_usd: number;
+}
+
+// ---------------------------------------------------------------------------
 // Legacy interface (used by deepDive.ts)
 // ---------------------------------------------------------------------------
 
@@ -85,6 +100,9 @@ export interface BirdeyeTokenOverview {
   // On-chain holder count
   // Verified via live curl against BONK on 2026-04-05: .data.holder = 998381
   holder: number | null;                    // holder
+
+  // First trade timestamp (Unix seconds); null for BONK (field absent on established tokens)
+  first_trade_unix_time: number | null;     // firstTradeUnixTime
 }
 
 // Raw response shape from Birdeye token_overview endpoint
@@ -130,6 +148,7 @@ interface RawBirdeyeOverview {
   uniqueWallet24h?: number | null;
 
   holder?: number | null;
+  firstTradeUnixTime?: number | null;
 }
 
 interface RawBirdeyeResponse {
@@ -240,6 +259,8 @@ export async function getBirdeyeTokenOverview(
     unique_wallet_24h: d.uniqueWallet24h ?? null,
 
     holder: d.holder ?? null,
+
+    first_trade_unix_time: d.firstTradeUnixTime ?? null,
   };
 }
 
@@ -320,6 +341,54 @@ export async function getBirdeyeToken(
     price_change_1h_pct: overview.price_change_1h_pct,
     price_change_24h_pct: overview.price_change_24h_pct,
   };
+}
+
+/**
+ * Fetch OHLCV candles for a token at a given interval.
+ * Candle fields verified via live curl on 2026-04-04:
+ *   .data.items[n] = { o, h, l, c, v (token units), unixTime }
+ * volume_usd per candle = v × c (close price).
+ */
+export async function getBirdeyeOHLCV(
+  address: string,
+  interval: "15m" | "1H",
+  timeFrom: number,
+  timeTo: number,
+  options: { timeout?: number } = {}
+): Promise<OHLCVCandle[] | null> {
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 4000;
+  const url = `${OHLCV_URL}?address=${encodeURIComponent(address)}&type=${interval}&time_from=${timeFrom}&time_to=${timeTo}&chain=solana`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const data = await res.json() as { data?: { items?: Array<{ o?: number; h?: number; l?: number; c?: number; v?: number; unixTime?: number }> } };
+  const items = data?.data?.items ?? [];
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+
+  return items.map((item) => ({
+    unix_time: item.unixTime ?? 0,
+    open:  item.o ?? 0,
+    high:  item.h ?? 0,
+    low:   item.l ?? 0,
+    close: item.c ?? 0,
+    volume_usd: (item.v ?? 0) * (item.c ?? 0),
+  }));
 }
 
 export async function getTokenOHLCV(

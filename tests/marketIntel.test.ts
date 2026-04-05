@@ -26,6 +26,8 @@ interface MockOptions {
   price_change_24h?: number;
   buy_sell_ratio?: number; // buys / (buys + sells)
   ohlcv_items?: Array<{ h: number }>;
+  ohlcv_1h_candles?: Array<{ o?: number; h?: number; l?: number; c?: number; v?: number; unixTime?: number }>;
+  ohlcv_15m_candles?: Array<{ o?: number; h?: number; l?: number; c?: number; v?: number; unixTime?: number }>;
   dex_fail?: boolean;
   birdeye_fail?: boolean;
 }
@@ -39,6 +41,8 @@ function makeFetchMock(opts: MockOptions = {}) {
     price_change_24h = 5,
     buy_sell_ratio = 0.6,
     ohlcv_items,
+    ohlcv_1h_candles,
+    ohlcv_15m_candles,
     dex_fail    = false,
     birdeye_fail = false,
   } = opts;
@@ -77,8 +81,17 @@ function makeFetchMock(opts: MockOptions = {}) {
 
     if (u.includes("birdeye.so/defi/ohlcv")) {
       if (birdeye_fail) return Promise.reject(new Error("birdeye down"));
-      if (!ohlcv_items) return fakeResponse({ success: true, data: { items: [] } });
-      return fakeResponse({ success: true, data: { items: ohlcv_items } });
+      if (u.includes("type=1D")) {
+        if (!ohlcv_items) return fakeResponse({ success: true, data: { items: [] } });
+        return fakeResponse({ success: true, data: { items: ohlcv_items } });
+      }
+      if (u.includes("type=1H")) {
+        return fakeResponse({ success: true, data: { items: ohlcv_1h_candles ?? [] } });
+      }
+      if (u.includes("type=15m")) {
+        return fakeResponse({ success: true, data: { items: ohlcv_15m_candles ?? [] } });
+      }
+      return fakeResponse({ success: true, data: { items: [] } });
     }
 
     if (u.includes("birdeye.so/defi/token_overview")) {
@@ -96,6 +109,7 @@ function makeFetchMock(opts: MockOptions = {}) {
           v1hUSD:  volume_1h,
           v24hUSD: volume_24h,
           // Buy/sell counts per window
+          trade1h: buys + sells,
           buy1h: buys, sell1h: sells,
           buy24h: buys * 10, sell24h: sells * 10,
           trade24h: (buys + sells) * 10,
@@ -335,6 +349,45 @@ describe("marketIntel", () => {
     expect(result.makers_24h === null || typeof result.makers_24h === "number").toBe(true);
     expect(result.buy_volume_24h_usd === null || typeof result.buy_volume_24h_usd === "number").toBe(true);
     expect(result.sell_volume_24h_usd === null || typeof result.sell_volume_24h_usd === "number").toBe(true);
+
+    // Feature 1: ohlcv
+    expect(result.ohlcv).toBeDefined();
+    expect(result.ohlcv).toHaveProperty("1h");
+    expect(result.ohlcv).toHaveProperty("24h");
+
+    // Feature 2: liquidity_concentration
+    expect(result.liquidity_concentration).toMatchObject({
+      total_pools: expect.any(Number),
+      risk: expect.stringMatching(/^(LOW|MEDIUM|HIGH|UNKNOWN)$/),
+    });
+    expect(result.liquidity_concentration.top_pool_share_pct === null || typeof result.liquidity_concentration.top_pool_share_pct === "number").toBe(true);
+    expect(result.liquidity_concentration.dominant_dex === null || typeof result.liquidity_concentration.dominant_dex === "string").toBe(true);
+
+    // Feature 3: token_maturity
+    expect(result.token_maturity).toMatchObject({
+      bracket: expect.stringMatching(/^(NEW|YOUNG|ESTABLISHED|MATURE|UNKNOWN)$/),
+    });
+    expect(result.token_maturity.first_trade_unix_time === null || typeof result.token_maturity.first_trade_unix_time === "number").toBe(true);
+    expect(result.token_maturity.age_hours === null || typeof result.token_maturity.age_hours === "number").toBe(true);
+    expect(result.token_maturity.source === null || ["birdeye", "dexscreener"].includes(result.token_maturity.source as string)).toBe(true);
+
+    // Feature 4: trading_velocity
+    expect(result.trading_velocity).toMatchObject({
+      bot_activity_flag: expect.any(Boolean),
+    });
+    expect(result.trading_velocity.txns_per_hour === null || typeof result.trading_velocity.txns_per_hour === "number").toBe(true);
+    expect(result.trading_velocity.usd_per_tx === null || typeof result.trading_velocity.usd_per_tx === "number").toBe(true);
+    expect(result.trading_velocity.candle_vol_std_dev === null || typeof result.trading_velocity.candle_vol_std_dev === "number").toBe(true);
+
+    // Feature 5: momentum_alignment
+    expect(result.momentum_alignment).toMatchObject({
+      score: expect.any(Number),
+      aligned: expect.any(Boolean),
+      direction: expect.stringMatching(/^(BULL|BEAR|MIXED|UNKNOWN)$/),
+      timeframes_used: expect.any(Array),
+    });
+    expect(result.momentum_alignment.score).toBeGreaterThanOrEqual(-3);
+    expect(result.momentum_alignment.score).toBeLessThanOrEqual(3);
   });
 
   // -------------------------------------------------------------------------
@@ -587,5 +640,187 @@ describe("marketIntel", () => {
     expect(result.large_txs_last_hour).toBeLessThan(3);
     // With near-zero buy pressure and low volume, score should not be inflated
     expect(result.signal_score).toBeLessThanOrEqual(25);
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature 1: OHLCV
+  // -------------------------------------------------------------------------
+
+  it("ohlcv['1h'] is the last 1H candle when data present", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    vi.stubGlobal("fetch", makeFetchMock({
+      ohlcv_1h_candles: [
+        { o: 0.00001, h: 0.000015, l: 0.000009, c: 0.000012, v: 1_000_000, unixTime: now - 3600 },
+        { o: 0.000012, h: 0.000018, l: 0.000011, c: 0.000014, v: 1_200_000, unixTime: now },
+      ],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.ohlcv["1h"]).not.toBeNull();
+    expect(result.ohlcv["1h"]!.close).toBeCloseTo(0.000014);
+    expect(result.ohlcv["1h"]!.unix_time).toBe(now);
+    expect(result.ohlcv["24h"]).not.toBeNull();
+    expect(result.ohlcv["24h"]!.candles).toBe(2);
+  });
+
+  it("ohlcv fields are null when no 1H candle data returned", async () => {
+    vi.stubGlobal("fetch", makeFetchMock()); // ohlcv_1h_candles not set → empty array
+    const result = await marketIntel(TOKEN);
+    expect(result.ohlcv["1h"]).toBeNull();
+    expect(result.ohlcv["24h"]).toBeNull();
+  });
+
+  it("ohlcv['24h'] summary aggregates candles correctly", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    vi.stubGlobal("fetch", makeFetchMock({
+      ohlcv_1h_candles: [
+        { o: 0.00001, h: 0.00002, l: 0.000008, c: 0.000012, v: 1_000_000, unixTime: now - 7200 },
+        { o: 0.000012, h: 0.000025, l: 0.00001, c: 0.000015, v: 2_000_000, unixTime: now - 3600 },
+        { o: 0.000015, h: 0.000030, l: 0.000012, c: 0.000020, v: 1_500_000, unixTime: now },
+      ],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.ohlcv["24h"]).not.toBeNull();
+    expect(result.ohlcv["24h"]!.candles).toBe(3);
+    expect(result.ohlcv["24h"]!.high_usd).toBeCloseTo(0.000030);
+    expect(result.ohlcv["24h"]!.vwap_usd).not.toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature 2: Liquidity concentration
+  // -------------------------------------------------------------------------
+
+  it("liquidity_concentration risk is HIGH for single pool (100% concentration)", async () => {
+    // default mock has 1 pair → 100% in single pool → HIGH
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.liquidity_concentration.total_pools).toBe(1);
+    expect(result.liquidity_concentration.top_pool_share_pct).toBe(100);
+    expect(result.liquidity_concentration.risk).toBe("HIGH");
+    expect(result.liquidity_concentration.dominant_dex).toBe("raydium");
+  });
+
+  it("liquidity_concentration is UNKNOWN when no pairs have liquidity", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ liquidity: 0 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.liquidity_concentration.risk).toBe("UNKNOWN");
+    expect(result.liquidity_concentration.top_pool_share_pct).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature 3: Token maturity
+  // -------------------------------------------------------------------------
+
+  it("token_maturity bracket is MATURE for a 200-day old pair", async () => {
+    // default mock has pairCreatedAt = Date.now() - 200 * 86_400_000 → ~4800 hours → MATURE
+    vi.stubGlobal("fetch", makeFetchMock());
+    const result = await marketIntel(TOKEN);
+    expect(result.token_maturity.bracket).toBe("MATURE");
+    expect(result.token_maturity.source).toBe("dexscreener");
+    expect(result.token_maturity.age_hours).toBeGreaterThan(168);
+  });
+
+  it("token_maturity bracket is NEW for a just-created pair", async () => {
+    vi.stubGlobal("fetch", makeFetchMock());
+    // Override fetch to return a very recent pairCreatedAt
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("dexscreener")) {
+        return fakeResponse({
+          pairs: [{
+            chainId: "solana", dexId: "raydium",
+            pairAddress: "fakePair111111111111111111111111111111111111",
+            baseToken:  { address: TOKEN, name: "BONK", symbol: "BONK" },
+            quoteToken: { address: "So11111111111111111111111111111111111111112", name: "SOL", symbol: "SOL" },
+            priceUsd: "0.000012",
+            priceChange: { h1: 1, h24: 5 },
+            volume: { h1: 50_000, h24: 500_000 },
+            liquidity: { usd: 100_000 },
+            txns: { h1: { buys: 120, sells: 80 }, h24: { buys: 1200, sells: 800 } },
+            pairCreatedAt: Date.now() - 10 * 60_000, // 10 minutes ago
+          }],
+        });
+      }
+      if (u.includes("birdeye.so/defi/ohlcv")) return fakeResponse({ success: true, data: { items: [] } });
+      if (u.includes("birdeye.so/defi/token_overview")) return fakeResponse({ success: false });
+      if (u.includes("coingecko.com")) return fakeResponse({ error: "not found" }, 404);
+      return Promise.reject(new Error(`unexpected url: ${u}`));
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.token_maturity.bracket).toBe("NEW");
+    expect(result.token_maturity.source).toBe("dexscreener");
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature 4: Trading velocity
+  // -------------------------------------------------------------------------
+
+  it("trading_velocity.bot_activity_flag is false for normal trade frequency", async () => {
+    // default: 200 trades/hour, volume ~$50k → usd_per_tx = $250 (not < $1)
+    vi.stubGlobal("fetch", makeFetchMock({ volume_24h: 500_000 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.trading_velocity.bot_activity_flag).toBe(false);
+    expect(result.trading_velocity.txns_per_hour).not.toBeNull();
+    expect(result.trading_velocity.txns_per_hour).toBe(200);
+  });
+
+  it("trading_velocity.candle_vol_std_dev is null when fewer than 4 candles", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({
+      ohlcv_15m_candles: [
+        { o: 0.00001, h: 0.000015, l: 0.000009, c: 0.000012, v: 1000, unixTime: Math.floor(Date.now()/1000) },
+        { o: 0.000012, h: 0.000018, l: 0.000011, c: 0.000014, v: 2000, unixTime: Math.floor(Date.now()/1000) - 900 },
+      ],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.trading_velocity.candle_vol_std_dev).toBeNull();
+  });
+
+  it("trading_velocity.candle_vol_std_dev is computed when >= 4 candles provided", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    vi.stubGlobal("fetch", makeFetchMock({
+      ohlcv_15m_candles: [
+        { o: 0.00001, h: 0.000015, l: 0.000009, c: 0.000012, v: 1_000, unixTime: now - 3600 },
+        { o: 0.000012, h: 0.000018, l: 0.000011, c: 0.000014, v: 2_000, unixTime: now - 2700 },
+        { o: 0.000014, h: 0.000020, l: 0.000013, c: 0.000016, v: 3_000, unixTime: now - 1800 },
+        { o: 0.000016, h: 0.000022, l: 0.000015, c: 0.000018, v: 1_500, unixTime: now - 900 },
+      ],
+    }));
+    const result = await marketIntel(TOKEN);
+    expect(result.trading_velocity.candle_vol_std_dev).not.toBeNull();
+    expect(typeof result.trading_velocity.candle_vol_std_dev).toBe("number");
+    expect(result.trading_velocity.candle_vol_std_dev!).toBeGreaterThan(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Feature 5: Momentum alignment
+  // -------------------------------------------------------------------------
+
+  it("momentum_alignment score is within [-3, +3] range", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ price_change_1h: 5 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.momentum_alignment.score).toBeGreaterThanOrEqual(-3);
+    expect(result.momentum_alignment.score).toBeLessThanOrEqual(3);
+    expect(result.momentum_alignment.timeframes_used).toContain("1h");
+  });
+
+  it("momentum_alignment direction is BULL when 1h price change > 1%", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ price_change_1h: 5 }));
+    const result = await marketIntel(TOKEN);
+    // 1h contributes +1 vote; 5m and 30m are null → score = 1 → BULL
+    expect(result.momentum_alignment.direction).toBe("BULL");
+    expect(result.momentum_alignment.score).toBe(1);
+  });
+
+  it("momentum_alignment direction is BEAR when 1h price change < -1%", async () => {
+    vi.stubGlobal("fetch", makeFetchMock({ price_change_1h: -5 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.momentum_alignment.direction).toBe("BEAR");
+    expect(result.momentum_alignment.score).toBe(-1);
+  });
+
+  it("momentum_alignment.aligned is true when all available timeframes agree", async () => {
+    // only 1h available in default mock → single timeframe always 'aligned'
+    vi.stubGlobal("fetch", makeFetchMock({ price_change_1h: 5 }));
+    const result = await marketIntel(TOKEN);
+    expect(result.momentum_alignment.aligned).toBe(true);
   });
 });

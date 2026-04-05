@@ -1,5 +1,5 @@
-import { getDexScreenerToken, type DexScreenerTokenData } from "../sources/dexscreener.js";
-import { getBirdeyeTokenOverview, getTokenOHLCV, type BirdeyeTokenOverview } from "../sources/birdeye.js";
+import { getDexScreenerToken, type DexScreenerTokenData, type DexScreenerPair } from "../sources/dexscreener.js";
+import { getBirdeyeTokenOverview, getTokenOHLCV, getBirdeyeOHLCV, type BirdeyeTokenOverview, type OHLCVCandle } from "../sources/birdeye.js";
 import { getCoinGeckoATH } from "../sources/coingecko.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import { deduplicate, getOrFetch } from "../cache.js";
@@ -8,7 +8,7 @@ import {
   fallbackMarketIntelSummary,
   type MarketIntelData,
 } from "../llm/narrativeEngine.js";
-import type { ScoringFactor, SignalSubtype } from "./types.js";
+import type { ScoringFactor, SignalSubtype, OHLCVSummary, LiquidityConcentration, TokenMaturity, TradingVelocity, MomentumAlignment } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -88,6 +88,17 @@ export interface MarketIntelResult {
     "24h": MarketTimeframe;
   };
 
+  /** OHLCV candle data: last 1H candle + 24h aggregated summary */
+  ohlcv: { "1h": OHLCVCandle | null; "24h": OHLCVSummary | null };
+  /** Liquidity spread across DEX pools */
+  liquidity_concentration: LiquidityConcentration;
+  /** Token age and maturity bracket */
+  token_maturity: TokenMaturity;
+  /** Short-term trading velocity and bot-activity detection */
+  trading_velocity: TradingVelocity;
+  /** Multi-timeframe momentum alignment */
+  momentum_alignment: MomentumAlignment;
+
   market_summary: string;
   /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
@@ -156,6 +167,8 @@ function deriveSignalAndScore(data: {
   rug_risk_score: number; // 0–13 (scaled internally to 0–100)
   token_health: "ACTIVE" | "LOW_ACTIVITY" | "DECLINING" | "ILLIQUID" | "DEAD";
   pct_from_ath: number | null;
+  momentum_score?: number;   // from MomentumAlignment (-3 to +3)
+  bot_activity_flag?: boolean;
 }): { signal: "BULLISH" | "BEARISH" | "NEUTRAL"; signal_score: number } {
   // Health overrides — force BEARISH before scoring
   if (data.token_health === "DEAD" || data.token_health === "ILLIQUID") {
@@ -184,13 +197,22 @@ function deriveSignalAndScore(data: {
   // Component 5: rug risk — negative only, scale 0–13 → 0–100
   const rugComponent = -((data.rug_risk_score / 13) * 100);
 
-  const raw = Math.round(
+  let raw = Math.round(
     priceComponent * 0.30 +
     bsComponent   * 0.25 +
     vlComponent   * 0.20 +
     ltxComponent  * 0.15 +
     rugComponent  * 0.10
   );
+
+  // Momentum alignment modifiers
+  const ms = data.momentum_score ?? 0;
+  if (ms >= 2)       raw += 10;  // STRONG_BULL: all timeframes agree bullish
+  else if (ms <= -2) raw -= 10;  // STRONG_BEAR: all timeframes agree bearish
+  else if (ms === 0 && (data.momentum_score !== undefined)) raw = Math.round(raw * 0.9); // DIVERGENT
+
+  // Bot activity penalty — wash-trading degrades signal confidence
+  if (data.bot_activity_flag) raw = Math.round(raw * 0.8);
 
   const signal_score = Math.max(-100, Math.min(100, raw));
 
@@ -638,6 +660,132 @@ function buildMarketFactors(data: {
   return sf;
 }
 
+// ---------------------------------------------------------------------------
+// Feature computation helpers (Features 1–5)
+// ---------------------------------------------------------------------------
+
+function buildOHLCVSummary(candles: OHLCVCandle[]): OHLCVSummary {
+  const volume_usd = candles.reduce((s, c) => s + c.volume_usd, 0);
+  const high_usd   = candles.reduce((max, c) => Math.max(max, c.high), 0);
+  const low_usd    = candles.reduce((min, c) => Math.min(min, c.low), Infinity);
+  const vwap_usd   = volume_usd > 0
+    ? candles.reduce((s, c) => s + c.close * c.volume_usd, 0) / volume_usd
+    : null;
+  return {
+    candles: candles.length,
+    volume_usd,
+    high_usd,
+    low_usd: low_usd === Infinity ? 0 : low_usd,
+    vwap_usd: vwap_usd !== null ? Math.round(vwap_usd * 1e9) / 1e9 : null,
+  };
+}
+
+function buildLiquidityConcentration(pairs: DexScreenerPair[]): LiquidityConcentration {
+  const withLiq = pairs.filter(p => (p.liquidity?.usd ?? 0) > 0);
+  if (withLiq.length === 0) {
+    return { total_pools: pairs.length, top_pool_share_pct: null, dominant_dex: null, risk: "UNKNOWN" };
+  }
+  const total = withLiq.reduce((s, p) => s + (p.liquidity?.usd ?? 0), 0);
+  const sorted = [...withLiq].sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+  const topLiq = sorted[0].liquidity?.usd ?? 0;
+  const top_pool_share_pct = total > 0 ? (topLiq / total) * 100 : null;
+  const dominant_dex = sorted[0].dexId ?? null;
+  const risk: LiquidityConcentration["risk"] =
+    top_pool_share_pct === null ? "UNKNOWN" :
+    top_pool_share_pct > 90    ? "HIGH" :
+    top_pool_share_pct > 60    ? "MEDIUM" : "LOW";
+  return { total_pools: pairs.length, top_pool_share_pct, dominant_dex, risk };
+}
+
+function buildTokenMaturity(
+  firstTradeUnixTime: number | null,
+  pairs: DexScreenerPair[]
+): TokenMaturity {
+  // Try Birdeye firstTradeUnixTime first (Unix seconds)
+  if (firstTradeUnixTime !== null) {
+    const age_hours = (Date.now() / 1000 - firstTradeUnixTime) / 3600;
+    const bracket: TokenMaturity["bracket"] =
+      age_hours < 1    ? "NEW" :
+      age_hours < 24   ? "YOUNG" :
+      age_hours < 168  ? "ESTABLISHED" : "MATURE";
+    return { first_trade_unix_time: firstTradeUnixTime, age_hours: Math.round(age_hours), bracket, source: "birdeye" };
+  }
+  // Fallback: oldest pairCreatedAt from DexScreener (milliseconds → seconds)
+  const pairTimes = pairs
+    .map(p => p.pairCreatedAt)
+    .filter((t): t is number => typeof t === "number" && t > 0);
+  if (pairTimes.length > 0) {
+    const oldestMs = Math.min(...pairTimes);
+    const oldestSec = oldestMs > 1e12 ? oldestMs / 1000 : oldestMs; // normalise ms vs s
+    const age_hours = (Date.now() / 1000 - oldestSec) / 3600;
+    const bracket: TokenMaturity["bracket"] =
+      age_hours < 1    ? "NEW" :
+      age_hours < 24   ? "YOUNG" :
+      age_hours < 168  ? "ESTABLISHED" : "MATURE";
+    return { first_trade_unix_time: Math.round(oldestSec), age_hours: Math.round(age_hours), bracket, source: "dexscreener" };
+  }
+  return { first_trade_unix_time: null, age_hours: null, bracket: "UNKNOWN", source: null };
+}
+
+function buildTradingVelocity(
+  birdData: BirdeyeTokenOverview | null,
+  candles15m: OHLCVCandle[]
+): TradingVelocity {
+  const txns_per_hour = birdData?.trade_1h ?? null;
+  const volume_1h_usd = birdData?.volume_1h_usd ?? null;
+  const usd_per_tx =
+    txns_per_hour !== null && txns_per_hour > 0 && volume_1h_usd !== null
+      ? volume_1h_usd / txns_per_hour
+      : null;
+
+  // Std dev of 15m candle USD volumes (need ≥ 4 candles)
+  let candle_vol_std_dev: number | null = null;
+  if (candles15m.length >= 4) {
+    const vols = candles15m.map(c => c.volume_usd);
+    const mean = vols.reduce((s, v) => s + v, 0) / vols.length;
+    const variance = vols.reduce((s, v) => s + (v - mean) ** 2, 0) / vols.length;
+    candle_vol_std_dev = Math.round(Math.sqrt(variance) * 100) / 100;
+  }
+
+  const bot_activity_flag =
+    usd_per_tx !== null && usd_per_tx < 1 &&
+    txns_per_hour !== null && txns_per_hour > 500;
+
+  return { txns_per_hour, usd_per_tx, candle_vol_std_dev, bot_activity_flag };
+}
+
+function buildMomentumAlignment(changes: {
+  change_5m:  number | null;
+  change_30m: number | null;
+  change_1h:  number | null;
+}): MomentumAlignment {
+  const timeframes_used: string[] = [];
+  let score = 0;
+
+  function vote(val: number | null, label: string): void {
+    if (val === null) return;
+    timeframes_used.push(label);
+    if (val > 1)  score += 1;
+    else if (val < -1) score -= 1;
+    // flat (between -1% and +1%) contributes 0
+  }
+
+  vote(changes.change_5m,  "5m");
+  vote(changes.change_30m, "30m");
+  vote(changes.change_1h,  "1h");
+
+  const n = timeframes_used.length;
+  const aligned = n > 0 && Math.abs(score) === n; // all agree on same direction
+
+  const direction: MomentumAlignment["direction"] =
+    n === 0             ? "UNKNOWN" :
+    score >= 1          ? "BULL" :
+    score <= -1         ? "BEAR" :
+    /* score == 0 */      "MIXED";
+
+  return { score, aligned, direction, timeframes_used };
+}
+
 function logError(source: string, reason: unknown, address: string): void {
   const ts = new Date().toISOString();
   const msg = reason instanceof Error ? reason.message : String(reason);
@@ -688,11 +836,15 @@ export async function marketIntel(address: string): Promise<MarketIntelResult> {
 async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const fetchStart = Date.now();
 
+  const nowSec = Math.floor(Date.now() / 1000);
+
   // Parallel fetch: Birdeye overview (primary — aggregates ALL pools), DexScreener (fallback), OHLCV
-  const [birdResult, dexResult, ohlcvResult] = await Promise.allSettled([
+  const [birdResult, dexResult, ohlcvResult, ohlcv1hResult, ohlcv15mResult] = await Promise.allSettled([
     getBirdeyeTokenOverview(address, { timeout: 4000 }),
     getDexScreenerToken(address, { timeout: 4000 }),
     getTokenOHLCV(address, { timeout: 5000 }),
+    getBirdeyeOHLCV(address, "1H",  nowSec - 86_400, nowSec, { timeout: 4000 }),  // last 24h daily candles
+    getBirdeyeOHLCV(address, "15m", nowSec - 7_200,  nowSec, { timeout: 4000 }),  // last 2h for std dev
   ]);
 
   const birdData: BirdeyeTokenOverview | null =
@@ -700,6 +852,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   const dexData: DexScreenerTokenData | null =
     dexResult.status === "fulfilled" ? dexResult.value : null;
   const ohlcvData = ohlcvResult.status === "fulfilled" ? ohlcvResult.value : null;
+  const candles1h: OHLCVCandle[]  = (ohlcv1hResult.status  === "fulfilled" && ohlcv1hResult.value)  ? ohlcv1hResult.value  : [];
+  const candles15m: OHLCVCandle[] = (ohlcv15mResult.status === "fulfilled" && ohlcv15mResult.value) ? ohlcv15mResult.value : [];
 
   if (birdResult.status === "rejected") logError("birdeye",     birdResult.reason, address);
   if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
@@ -770,6 +924,29 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     h1Txns?.sells ?? (birdData?.sell_1h ?? 0)
   );
 
+  // Feature 2: liquidity concentration
+  const liquidity_concentration = buildLiquidityConcentration(dexData?.pairs ?? []);
+
+  // Feature 3: token maturity
+  const token_maturity = buildTokenMaturity(
+    birdData?.first_trade_unix_time ?? null,
+    dexData?.pairs ?? []
+  );
+
+  // Feature 4: trading velocity
+  const trading_velocity = buildTradingVelocity(birdData, candles15m);
+
+  // Feature 5: momentum alignment
+  const momentum_alignment = buildMomentumAlignment({
+    change_5m:  birdData?.price_change_5m_pct  ?? null,
+    change_30m: birdData?.price_change_30m_pct ?? null,
+    change_1h:  birdData?.price_change_1h_pct  ?? null,
+  });
+
+  // Feature 1: OHLCV objects
+  const ohlcv_1h_candle: OHLCVCandle | null  = candles1h.length > 0 ? candles1h[candles1h.length - 1] : null;
+  const ohlcv_24h_summary: OHLCVSummary | null = candles1h.length > 0 ? buildOHLCVSummary(candles1h) : null;
+
   // Weighted signal scoring
   const { signal, signal_score } = deriveSignalAndScore({
     price_change_1h_pct,
@@ -780,6 +957,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     rug_risk_score: rug_risk.score,
     token_health,
     pct_from_ath,
+    momentum_score: momentum_alignment.score,
+    bot_activity_flag: trading_velocity.bot_activity_flag,
   });
 
   // Signal subtype — deterministic rules, not LLM
@@ -907,6 +1086,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
   if (birdData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio", "timeframes");
   if (dexData   === null) missing_fields.push("dexscreener_price");
   if (ohlcvData === null) missing_fields.push("ath_price_usd", "pct_from_ath");
+  if (candles1h.length  === 0) missing_fields.push("ohlcv_1h", "ohlcv_24h_summary");
+  if (candles15m.length === 0) missing_fields.push("candle_vol_std_dev");
 
   // LLM summary — skip if SLA headroom exhausted
   const llmInput: MarketIntelData = {
@@ -971,6 +1152,11 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     buy_volume_24h_usd,
     sell_volume_24h_usd,
     timeframes,
+    ohlcv: { "1h": ohlcv_1h_candle, "24h": ohlcv_24h_summary },
+    liquidity_concentration,
+    token_maturity,
+    trading_velocity,
+    momentum_alignment,
     market_summary,
     data_confidence,
     confidence,
