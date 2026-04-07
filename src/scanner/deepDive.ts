@@ -1,7 +1,7 @@
 import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo, checkLPBurned, getWalletAgeDays } from "../sources/helius.js";
-import { getBirdeyeToken } from "../sources/birdeye.js";
+import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory } from "../sources/helius.js";
+import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
   calculateRiskGrade,
@@ -44,6 +44,26 @@ export interface TradingPattern {
   buy_sell_ratio_1h: number;
   unique_buyers_24h: number;
   wash_trading_score: number;
+  circular_pairs: number;
+  wash_method: "HEURISTIC" | "CIRCULAR_SWAP";
+}
+
+export interface MetadataImmutability {
+  is_mutable: boolean | null;
+  update_authority: string | null;
+  risk: "MUTABLE" | "IMMUTABLE" | "UNKNOWN";
+}
+
+export interface AuthorityHistory {
+  mint_authority_changes: number;
+  authority_ever_regranted: boolean;
+  post_launch_mints: number;
+}
+
+export interface DilutionRisk {
+  total_supply: number | null;
+  post_launch_mints: number;
+  risk: "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
 }
 
 export interface DeepDiveResult {
@@ -89,7 +109,15 @@ export interface DeepDiveResult {
     clustered_wallets: number;
     insider_control_percent: number | null;
     dev_wallet_linked: boolean;
+    funding_wallet_overlap: number | null;
+    funding_source_risk: "LOW" | "MEDIUM" | "HIGH";
   };
+  /** Token metadata immutability (deep dive only) */
+  metadata_immutability: MetadataImmutability;
+  /** Mint authority change history (deep dive only) */
+  authority_history: AuthorityHistory;
+  /** Post-launch supply dilution risk (deep dive only) */
+  dilution_risk: DilutionRisk;
   /** Launch classification */
   launch_pattern: "STEALTH_LAUNCH" | "FAIR_LAUNCH" | "UNKNOWN";
   /** Sniper activity at launch */
@@ -282,7 +310,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const fetchStart = Date.now();
 
   // All sources run in parallel. getTokenMintInfo is NOT sequential.
-  const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult] =
+  const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult,
+         securityResult, holderListResult, washTradingResult, authHistoryResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
@@ -290,13 +319,21 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       getBirdeyeToken(address, { timeout: 4000 }),
       getSolscanMeta(address, { timeout: 4000 }),
       getMintAuthorityAddress(address, 4000),
+      getBirdeyeTokenSecurity(address, { timeout: 4000 }),
+      getBirdeyeHolderList(address, 20, { timeout: 4000 }),
+      detectCircularWashTrading(address, { timeout: 5000 }),
+      getAuthorityHistory(address, { timeout: 5000 }),
     ]);
 
-  const dexData  = dexResult.status  === "fulfilled" ? dexResult.value  : null;
-  const rugData  = rugResult.status  === "fulfilled" ? rugResult.value  : null;
-  const mintData = mintResult.status === "fulfilled" ? mintResult.value : null;
-  const birdData = birdResult.status === "fulfilled" ? birdResult.value : null;
-  const mintAuthAddress = mintAuthResult.status === "fulfilled" ? mintAuthResult.value : null;
+  const dexData       = dexResult.status         === "fulfilled" ? dexResult.value         : null;
+  const rugData       = rugResult.status         === "fulfilled" ? rugResult.value         : null;
+  const mintData      = mintResult.status        === "fulfilled" ? mintResult.value        : null;
+  const birdData      = birdResult.status        === "fulfilled" ? birdResult.value        : null;
+  const mintAuthAddress = mintAuthResult.status  === "fulfilled" ? mintAuthResult.value    : null;
+  const securityData  = securityResult.status    === "fulfilled" ? securityResult.value    : null;
+  const holderListData = holderListResult.status === "fulfilled" ? holderListResult.value  : null;
+  const washTradingData = washTradingResult.status === "fulfilled" ? washTradingResult.value : null;
+  const authHistoryData = authHistoryResult.status === "fulfilled" ? authHistoryResult.value : null;
 
   if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
   if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
@@ -366,6 +403,44 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     token_age_days = (Date.now() - dexData.pair_created_at_ms) / 86_400_000;
   }
 
+  // ── Supplemental deep-dive signals ───────────────────────────────────────
+
+  // Metadata immutability (Birdeye token_security)
+  const is_mutable = securityData?.mutable_metadata ?? null;
+  const update_authority = securityData?.metaplex_update_authority ?? null;
+  const metadata_immutability: MetadataImmutability = {
+    is_mutable,
+    update_authority,
+    risk: is_mutable === null ? "UNKNOWN" : is_mutable ? "MUTABLE" : "IMMUTABLE",
+  };
+
+  // Authority history (Helius SET_AUTHORITY + MINT_TO)
+  const authority_history: AuthorityHistory = {
+    mint_authority_changes: authHistoryData?.mint_authority_changes ?? 0,
+    authority_ever_regranted: authHistoryData?.authority_ever_regranted ?? false,
+    post_launch_mints: authHistoryData?.post_launch_mints ?? 0,
+  };
+
+  // Dilution risk
+  const total_supply = securityData?.total_supply ?? null;
+  const dilution_risk: DilutionRisk = {
+    total_supply,
+    post_launch_mints: authority_history.post_launch_mints,
+    risk: authority_history.post_launch_mints > 0 ? "HIGH"
+      : total_supply === null ? "UNKNOWN"
+      : "LOW",
+  };
+
+  // Circular wash trading (Helius SWAP tx analysis)
+  const circular_pairs = washTradingData?.circular_pairs ?? 0;
+
+  // Funding wallet overlap (top-20 holders vs dev wallet)
+  const funding_wallet_overlap = holderListData !== null && mintAuthAddress !== null
+    ? holderListData.filter(h => h.owner === mintAuthAddress).length
+    : null;
+  const funding_source_risk: "LOW" | "MEDIUM" | "HIGH" =
+    funding_wallet_overlap !== null && funding_wallet_overlap > 0 ? "MEDIUM" : "LOW";
+
   // ── Risk grade ────────────────────────────────────────────────────────────
   const bundled_launch_detected = rugData?.bundled_launch_detected
     ?? ((token_age_days != null && token_age_days < 1) && (top_10_holder_pct != null && top_10_holder_pct > 90));
@@ -386,6 +461,13 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     lp_status,
     dex_id,
     dev_wallet_age_days,
+    is_mutable_metadata: is_mutable,
+    update_authority_is_deployer: update_authority !== null && mintAuthAddress !== null
+      ? update_authority === mintAuthAddress
+      : null,
+    authority_ever_regranted: authority_history.authority_ever_regranted,
+    wash_trading_circular_pairs: circular_pairs,
+    post_launch_mints: authority_history.post_launch_mints,
   };
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
   const { grade: risk_grade, scoringFactors } = calculateRiskGrade(factors, authority_exempt);
@@ -426,10 +508,13 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // ── Trading pattern ───────────────────────────────────────────────────────
   const unique_buyers_24h = dexData?.pair?.txns?.h24?.buys ?? 0;
   const wash_trading_score = deriveWashTradingScore(buy_sell_ratio_1h, volume_24h || null, liquidity_usd);
+  const wash_method: "HEURISTIC" | "CIRCULAR_SWAP" = circular_pairs > 0 ? "CIRCULAR_SWAP" : "HEURISTIC";
   const trading_pattern: TradingPattern = {
     buy_sell_ratio_1h: buy_sell_ratio_1h ?? 0.5,
     unique_buyers_24h,
     wash_trading_score,
+    circular_pairs,
+    wash_method,
   };
 
   // ── Momentum score ────────────────────────────────────────────────────────
@@ -458,10 +543,12 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     single_holder_danger: rugData?.single_holder_danger ?? false,
     dev_wallet_analysis: { previous_rugs: has_rug_history },
   });
+  if (is_mutable === true) historical_flags.push("MUTABLE_METADATA");
+  if (authority_history.authority_ever_regranted) historical_flags.push("AUTHORITY_REGRANTED");
 
   // ── Risk breakdown ────────────────────────────────────────────────────────
   const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
-    (is_honeypot || has_rug_history || !mint_authority_revoked || !freeze_authority_revoked) ? "HIGH"
+    (is_honeypot || has_rug_history || !mint_authority_revoked || !freeze_authority_revoked || authority_history.authority_ever_regranted) ? "HIGH"
     : (rugData?.rugcheck_risk_score ?? 0) > 2000 ? "MEDIUM"
     : "LOW";
 
@@ -489,6 +576,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     clustered_wallets: bundled_launch_detected ? 3 : 0,   // heuristic — bundled = coordinated wallets
     insider_control_percent: rugData?.insider_flags ? 15 : null, // heuristic from flag
     dev_wallet_linked,
+    funding_wallet_overlap,
+    funding_source_risk,
   };
 
   // ── Launch pattern ────────────────────────────────────────────────────────
@@ -610,5 +699,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     key_drivers,
     data_quality,
     missing_fields,
+    metadata_immutability,
+    authority_history,
+    dilution_risk,
   };
 }

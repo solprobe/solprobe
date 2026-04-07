@@ -44,7 +44,9 @@ export type HistoricalFlag =
   | "SINGLE_HOLDER_DANGER"               // single_holder_danger from RugCheck risks[]
   | "DEV_ASSOCIATED_WITH_PREVIOUS_RUG"   // dev wallet linked to prior confirmed rug
   | "SUSPICIOUS_LAUNCH_PATTERN"          // stealth launch + sniper concentration
-  | "SAME_BLOCK_LAUNCH";                 // mint and pool created in same block
+  | "SAME_BLOCK_LAUNCH"                  // mint and pool created in same block
+  | "MUTABLE_METADATA"                   // token metadata is mutable post-launch (deep dive only)
+  | "AUTHORITY_REGRANTED";               // mint authority was regranted after revocation (deep dive only)
 
 /**
  * Top contributing factor in agent-friendly shape (deep dive only).

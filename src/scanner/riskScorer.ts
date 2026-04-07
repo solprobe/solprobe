@@ -20,6 +20,12 @@ export interface RiskFactors {
   dex_id: string | null;                    // dexId of the primary pair
   dev_wallet_age_days: number | null;       // deep dive only; null for quick scan
   launch_pattern?: "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN"; // quick scan only
+  // Deep dive supplemental signals
+  is_mutable_metadata?: boolean | null;             // Birdeye token_security.mutableMetadata
+  update_authority_is_deployer?: boolean | null;    // metaplexUpdateAuthority === creatorAddress
+  authority_ever_regranted?: boolean;               // any SET_AUTHORITY tx post-launch
+  wash_trading_circular_pairs?: number;             // A→B→A circular swap pairs detected
+  post_launch_mints?: number;                       // MINT_TO events after token creation
 }
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
@@ -349,6 +355,91 @@ export function calculateRiskGrade(
         value: Math.round(factors.dev_wallet_age_days),
         impact: 0,
         interpretation: `dev wallet aged (${Math.round(factors.dev_wallet_age_days)}d old)`,
+      });
+    }
+  }
+
+  // Metadata immutability (deep dive only — undefined when not supplied)
+  if (factors.is_mutable_metadata !== undefined && factors.is_mutable_metadata !== null) {
+    if (factors.is_mutable_metadata) {
+      const penalty = factors.update_authority_is_deployer ? 20 : 10;
+      score -= penalty;
+      sf.push({
+        name: "metadata_mutability",
+        value: true,
+        impact: -penalty,
+        interpretation: factors.update_authority_is_deployer
+          ? "mutable metadata controlled by deployer — rug risk"
+          : "mutable metadata — unknown update authority",
+      });
+    } else {
+      sf.push({
+        name: "metadata_mutability",
+        value: false,
+        impact: 0,
+        interpretation: "metadata immutable — cannot be changed post-launch",
+      });
+    }
+  }
+
+  // Authority regranted post-launch (deep dive only)
+  if (factors.authority_ever_regranted !== undefined) {
+    if (factors.authority_ever_regranted) {
+      score -= 40;
+      sf.push({
+        name: "authority_regranted",
+        value: true,
+        impact: -40,
+        interpretation: "mint authority regranted post-launch — extreme risk",
+      });
+    } else {
+      sf.push({
+        name: "authority_regranted",
+        value: false,
+        impact: 0,
+        interpretation: "no post-launch authority changes detected",
+      });
+    }
+  }
+
+  // Circular wash trading (deep dive only)
+  if (factors.wash_trading_circular_pairs !== undefined) {
+    if (factors.wash_trading_circular_pairs > 10) {
+      score -= 10;
+      sf.push({
+        name: "circular_wash_trading",
+        value: factors.wash_trading_circular_pairs,
+        impact: -10,
+        interpretation: `${factors.wash_trading_circular_pairs} circular swap pairs — wash risk`,
+      });
+    } else {
+      sf.push({
+        name: "circular_wash_trading",
+        value: factors.wash_trading_circular_pairs,
+        impact: 0,
+        interpretation: factors.wash_trading_circular_pairs > 0
+          ? `${factors.wash_trading_circular_pairs} circular pairs — below threshold`
+          : "no circular trading detected",
+      });
+    }
+  }
+
+  // Post-launch minting (deep dive only — supply inflation signal)
+  if (factors.post_launch_mints !== undefined) {
+    if (factors.post_launch_mints > 0) {
+      score -= 15;
+      sf.push({
+        name: "post_launch_mints",
+        value: factors.post_launch_mints,
+        impact: -15,
+        interpretation: `${factors.post_launch_mints} post-launch mint events — dilution risk`,
+      });
+    } else {
+      sf.push({
+        name: "post_launch_mints",
+        value: 0,
+        impact: 0,
+        interpretation: "no post-launch minting detected",
       });
     }
   }

@@ -1,5 +1,9 @@
 import { deduplicate, getOrFetch } from "../cache.js";
 import { getDexScreenerToken } from "../sources/dexscreener.js";
+import {
+  getBirdeyeWalletPortfolio,
+  type BirdeyeWalletPortfolioItem,
+} from "../sources/birdeye.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import type { ScoringFactor } from "./types.js";
 import {
@@ -11,6 +15,63 @@ import {
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+export type WinRateStatus =
+  | "CALCULATED"
+  | "NO_CLOSED_TRADES"
+  | "INSUFFICIENT_TRADES"
+  | "DATA_UNAVAILABLE"
+  | "HODL_ONLY";
+
+export type WalletActivityType =
+  | "ACTIVE_TRADER"
+  | "HODLER"
+  | "SWING_TRADER"
+  | "SNIPER"
+  | "BOT"
+  | "INACTIVE"
+  | "NEW_WALLET"
+  | "UNKNOWN";
+
+export type FunderType =
+  | "CEX"
+  | "MIXER"
+  | "FRESH_WALLET"
+  | "DEPLOYER"
+  | "KNOWN_PROTOCOL"
+  | "PEER_WALLET"
+  | "UNKNOWN";
+
+export interface FundingSource {
+  funder_address: string | null;
+  funder_type: FunderType;
+  funder_age_days: number | null;
+  funder_tx_count: number | null;
+  shared_funder_wallets: number;
+  cluster_size: number;
+  risk: "HIGH" | "MEDIUM" | "LOW";
+  risk_reason: string;
+  action_guidance: string;
+}
+
+export interface DustingAnalysis {
+  dust_transactions_detected: number;
+  dust_senders: number;
+  most_recent_dust_timestamp: number | null;
+  dusting_risk: "HIGH" | "MEDIUM" | "LOW" | "NONE";
+  meaning: string;
+  action_guidance: string;
+}
+
+export interface StructuredPnL {
+  realized_pnl_usdc: number | null;
+  unrealized_pnl_usdc: number | null;
+  unrealized_pnl_pct: number | null;
+  total_pnl_usdc: number | null;
+  positions_analysed: number;
+  cost_basis_method: "SOL_LAMPORTS" | "ESTIMATED";
+  calculation_note: string | null;
+}
 
 export interface WalletRiskResult {
   schema_version: "2.0";
@@ -33,19 +94,31 @@ export interface WalletRiskResult {
 
   // ── Behavioural signals ───────────────────────────────────────────────────
   win_rate_pct: number | null;
+  win_rate_calculation_status: WinRateStatus;
   avg_hold_time_hours: number | null;
   sniper_score: number;
   rug_exit_rate_pct: number | null;
-  pnl_estimate_30d_usdc: number | null;
+  pnl_estimate_30d_usdc: number | null;   // backwards compat
+  pnl: StructuredPnL;
   largest_single_loss_usdc: number | null;
   is_bot: boolean;
   whale_status: boolean;
-  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";
+  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";  // backwards compat
+  funding_source: FundingSource;
+
+  // ── Wallet activity type ──────────────────────────────────────────────────
+  wallet_activity_type: WalletActivityType;
 
   // ── Behavior classification ───────────────────────────────────────────────
   behavior: {
-    style: "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT" | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE";
+    style:
+      | "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT"
+      | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE"
+      | "PRO_TRADER" | "INSIDER" | "BUNDLER";
     consistency: "LOW" | "MEDIUM" | "HIGH";
+    style_confidence: number;    // 0.0–1.0
+    style_evidence: string[];
+    profile_summary: string;
   };
 
   // ── Legacy flat field (backwards compat) ─────────────────────────────────
@@ -86,6 +159,9 @@ export interface WalletRiskResult {
   pumpfun_graduation_exit_rate_pct: number | null;
   early_entry_rate_pct: number | null;
 
+  // ── Dusting analysis ──────────────────────────────────────────────────────
+  dusting_analysis: DustingAnalysis;
+
   // ── Copy-trade opportunity ────────────────────────────────────────────────
   copy_trading: {
     worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
@@ -101,14 +177,49 @@ export interface WalletRiskResult {
 
   risk_summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
-  /** Structured breakdown of all scoring contributors */
   factors: ScoringFactor[];
-  /** Structured confidence breakdown */
   confidence: { model: number; data_completeness: number; signal_consensus: number };
 }
 
 // ---------------------------------------------------------------------------
-// Copy-trading classification (CLAUDE.md: classifyCopyTrading)
+// FIX 1: Win rate with status
+// ---------------------------------------------------------------------------
+
+function resolveWinRate(
+  positions: Map<string, TokenPosition>,
+  parsedTxs: ParsedTx[] | null
+): { win_rate_pct: number | null; win_rate_calculation_status: WinRateStatus } {
+  if (parsedTxs === null) {
+    return { win_rate_pct: null, win_rate_calculation_status: "DATA_UNAVAILABLE" };
+  }
+
+  const allPositions = [...positions.values()];
+  if (allPositions.length === 0) {
+    return { win_rate_pct: null, win_rate_calculation_status: "NO_CLOSED_TRADES" };
+  }
+
+  const closed = allPositions.filter((p) => p.isClosed && p.solSpent > 0);
+  if (closed.length === 0) {
+    const hasOpen = allPositions.some((p) => !p.isClosed && p.solSpent > 0);
+    return {
+      win_rate_pct: null,
+      win_rate_calculation_status: hasOpen ? "HODL_ONLY" : "NO_CLOSED_TRADES",
+    };
+  }
+
+  if (closed.length < 5) {
+    return { win_rate_pct: null, win_rate_calculation_status: "INSUFFICIENT_TRADES" };
+  }
+
+  const wins = closed.filter((p) => p.solReceived > p.solSpent).length;
+  return {
+    win_rate_pct: (wins / closed.length) * 100,
+    win_rate_calculation_status: "CALCULATED",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Copy-trading classification (updated to handle WinRateStatus and extended styles)
 // ---------------------------------------------------------------------------
 
 interface CopyTradingResult {
@@ -122,11 +233,13 @@ interface CopyTradingResult {
 function classifyCopyTrading(data: {
   total_trades: number;
   win_rate_pct: number | null;
+  win_rate_calculation_status: WinRateStatus;
   avg_hold_time_hours: number | null;
   consistency: "HIGH" | "MEDIUM" | "LOW";
   sniper_score: number;
   rug_exit_rate_pct: number | null;
   is_bot: boolean;
+  behavior_style: string;
 }): CopyTradingResult {
   if (data.is_bot) {
     return {
@@ -136,6 +249,41 @@ function classifyCopyTrading(data: {
     };
   }
 
+  // INSIDER and BUNDLER signals don't transfer to copy traders
+  if (data.behavior_style === "INSIDER") {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "wallet classified as insider — copy-trade signal unreliable",
+    };
+  }
+  if (data.behavior_style === "BUNDLER") {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "wallet classified as bundler — copy-trade signal unreliable",
+    };
+  }
+
+  // HODL_ONLY: all holdings unrealized, no closed trade signal
+  if (data.win_rate_calculation_status === "HODL_ONLY") {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "no closed positions — all holdings are unrealized; insufficient signal",
+    };
+  }
+
+  // NO_CLOSED_TRADES: nothing to evaluate
+  if (data.win_rate_calculation_status === "NO_CLOSED_TRADES") {
+    return {
+      worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
+      key_signals: [],
+      reason: "no closed trades found — insufficient trading history",
+    };
+  }
+
+  // Hard gate: minimum 20 closed trades
   if (data.total_trades < 20 || data.win_rate_pct === null) {
     return {
       worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
@@ -162,6 +310,11 @@ function classifyCopyTrading(data: {
 
   if (data.rug_exit_rate_pct !== null && data.rug_exit_rate_pct > 60) {
     score += 20; signals.push("strong_rug_exit_discipline");
+  }
+
+  // PRO_TRADER bonus: validated skill signal
+  if (data.behavior_style === "PRO_TRADER" && data.total_trades >= 50) {
+    score += 10; signals.push("pro_trader_profile");
   }
 
   const raw_confidence = Math.min(1, data.total_trades / 100);
@@ -224,7 +377,6 @@ async function rpcWithFallback<T>(
 }
 
 // Helius Enhanced API — parsed transaction history
-// Returns null when HELIUS_API_KEY is absent or the call fails.
 async function fetchParsedTransactions(
   walletAddress: string,
   timeoutMs: number
@@ -288,7 +440,6 @@ function computePositions(
   txs: ParsedTx[]
 ): Map<string, TokenPosition> {
   const positions = new Map<string, TokenPosition>();
-  // Sort oldest first so firstBuyTs is set to the actual first occurrence
   const sorted = [...txs].sort((a, b) => a.timestamp - b.timestamp);
 
   for (const tx of sorted) {
@@ -312,11 +463,9 @@ function computePositions(
       const pos = positions.get(mint)!;
 
       if (transfer.toUserAccount === walletAddress) {
-        // Received token = buy event
         pos.firstBuyTs = Math.min(pos.firstBuyTs, tx.timestamp);
         if (nativeChange < 0) pos.solSpent += Math.abs(nativeChange);
       } else if (transfer.fromUserAccount === walletAddress) {
-        // Sent token = sell event
         pos.lastSellTs = tx.timestamp;
         pos.isClosed = true;
         if (nativeChange > 0) pos.solReceived += nativeChange;
@@ -325,15 +474,6 @@ function computePositions(
   }
 
   return positions;
-}
-
-function computeWinRate(positions: Map<string, TokenPosition>): number | null {
-  const closed = [...positions.values()].filter(
-    (p) => p.isClosed && p.solSpent > 0
-  );
-  if (closed.length < 5) return null;
-  const wins = closed.filter((p) => p.solReceived > p.solSpent).length;
-  return (wins / closed.length) * 100;
 }
 
 function computeAvgHoldTime(
@@ -373,12 +513,10 @@ function detectBot(
   txs: ParsedTx[],
   walletAddress: string
 ): boolean {
-  // Criterion 1: >500 tx/day average
   if (walletAgeDays !== null && walletAgeDays > 0) {
     if (totalTx / walletAgeDays > 500) return true;
   }
 
-  // Criterion 2: uniform trade sizing (CV < 1%) across ≥10 swaps
   if (txs.length >= 20) {
     const swaps = txs.filter((t) => t.type === "SWAP");
     if (swaps.length >= 10) {
@@ -387,7 +525,7 @@ function detectBot(
           const d = tx.accountData.find((a) => a.account === walletAddress);
           return d ? Math.abs(d.nativeBalanceChange) : 0;
         })
-        .filter((v) => v > 10_000); // filter dust (<0.00001 SOL)
+        .filter((v) => v > 10_000);
 
       if (amounts.length >= 10) {
         const mean = amounts.reduce((a, b) => a + b, 0) / amounts.length;
@@ -418,35 +556,591 @@ function deriveTradingStyle(
   if (isBot) return "bot";
   if (sniperScore > 60 && avgHoldTimeHours !== null && avgHoldTimeHours < 2)
     return "sniper";
-  if (
-    avgHoldTimeHours !== null &&
-    avgHoldTimeHours < 24 &&
-    tokensTradedLast30d > 20
-  )
+  if (avgHoldTimeHours !== null && avgHoldTimeHours < 24 && tokensTradedLast30d > 20)
     return "flipper";
-  if (
-    avgHoldTimeHours !== null &&
-    avgHoldTimeHours > 168 &&
-    tokensTradedLast30d < 5
-  )
+  if (avgHoldTimeHours !== null && avgHoldTimeHours > 168 && tokensTradedLast30d < 5)
     return "hodler";
-
-  // Degen: frequent trader, diverse tokens, low win rate
   const txPerDay =
-    walletAgeDays !== null && walletAgeDays > 0
-      ? totalTx / walletAgeDays
-      : null;
+    walletAgeDays !== null && walletAgeDays > 0 ? totalTx / walletAgeDays : null;
   if (
-    txPerDay !== null &&
-    txPerDay > 10 &&
-    tokensTradedLast30d > 10 &&
-    winRatePct !== null &&
-    winRatePct < 40
+    txPerDay !== null && txPerDay > 10 && tokensTradedLast30d > 10 &&
+    winRatePct !== null && winRatePct < 40
   )
     return "degen";
-
   if (closedPositionCount < 10) return "unknown";
   return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2: Structured PnL
+// ---------------------------------------------------------------------------
+
+function estimateStructuredPnL(
+  positions: Map<string, TokenPosition>,
+  solPriceUsd: number,
+  portfolio: BirdeyeWalletPortfolioItem[] | null
+): { pnl: StructuredPnL; largestLoss: number | null } {
+  const cutoff = Date.now() / 1000 - 30 * 86400;
+
+  // Realized PnL from closed positions in last 30 days
+  let realizedLamports = 0;
+  let realizedCount = 0;
+  let largestLossLamports = 0;
+
+  for (const pos of positions.values()) {
+    if (pos.solSpent === 0) continue;
+    if (!pos.isClosed) continue;
+    if (pos.firstBuyTs < cutoff && !pos.isClosed) continue;
+    const pnl = pos.solReceived - pos.solSpent;
+    realizedLamports += pnl;
+    realizedCount++;
+    if (pnl < largestLossLamports) largestLossLamports = pnl;
+  }
+
+  const realized_pnl_usdc = realizedCount > 0
+    ? Math.round((realizedLamports / 1e9) * solPriceUsd * 100) / 100
+    : null;
+
+  // Unrealized PnL from open positions (requires portfolio data)
+  let unrealized_pnl_usdc: number | null = null;
+  let unrealized_cost_basis_usdc = 0;
+  let unrealizedCount = 0;
+  let portfolioMatched = 0;
+  const notes: string[] = [];
+
+  const openPositions = [...positions.values()].filter(
+    (p) => !p.isClosed && p.solSpent > 0
+  );
+
+  if (portfolio !== null && openPositions.length > 0) {
+    const portfolioMap = new Map<string, BirdeyeWalletPortfolioItem>();
+    for (const item of portfolio) portfolioMap.set(item.address, item);
+
+    let unrealizedGross = 0;
+
+    for (const pos of openPositions) {
+      const item = portfolioMap.get(pos.mint);
+      const costUsd = (pos.solSpent / 1e9) * solPriceUsd;
+      unrealized_cost_basis_usdc += costUsd;
+      unrealizedCount++;
+
+      if (item?.value_usd != null) {
+        unrealizedGross += item.value_usd - costUsd;
+        portfolioMatched++;
+      }
+    }
+
+    if (portfolioMatched > 0) {
+      unrealized_pnl_usdc = Math.round(unrealizedGross * 100) / 100;
+    }
+    if (portfolioMatched < unrealizedCount) {
+      notes.push(`${unrealizedCount - portfolioMatched} open position(s) not found in portfolio`);
+    }
+  } else if (openPositions.length > 0) {
+    notes.push("unrealized PnL unavailable — Birdeye portfolio not fetched");
+  }
+
+  const total_pnl_usdc =
+    realized_pnl_usdc !== null || unrealized_pnl_usdc !== null
+      ? Math.round(((realized_pnl_usdc ?? 0) + (unrealized_pnl_usdc ?? 0)) * 100) / 100
+      : null;
+
+  const unrealized_pnl_pct =
+    unrealized_pnl_usdc !== null && unrealized_cost_basis_usdc > 0
+      ? Math.round((unrealized_pnl_usdc / unrealized_cost_basis_usdc) * 10000) / 100
+      : null;
+
+  const largestLoss =
+    largestLossLamports < 0
+      ? Math.round(Math.abs((largestLossLamports / 1e9) * solPriceUsd) * 100) / 100
+      : null;
+
+  return {
+    pnl: {
+      realized_pnl_usdc,
+      unrealized_pnl_usdc,
+      unrealized_pnl_pct,
+      total_pnl_usdc,
+      positions_analysed: realizedCount + unrealizedCount,
+      cost_basis_method: portfolio !== null ? "SOL_LAMPORTS" : "ESTIMATED",
+      calculation_note: notes.length > 0 ? notes.join("; ") : null,
+    },
+    largestLoss,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3: Wallet activity type
+// ---------------------------------------------------------------------------
+
+function deriveWalletActivityType(data: {
+  is_bot: boolean;
+  walletAgeDays: number | null;
+  totalTx: number;
+  tokensTradedLast30d: number;
+  sniperScore: number;
+  avgHoldTimeHours: number | null;
+  closedCount: number;
+  winRatePct: number | null;
+}): WalletActivityType {
+  if (data.is_bot) return "BOT";
+  if (data.walletAgeDays !== null && data.walletAgeDays < 7) return "NEW_WALLET";
+  if (data.totalTx < 10) return "INACTIVE";
+  if (data.sniperScore > 60) return "SNIPER";
+  if (
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours > 168 &&
+    data.tokensTradedLast30d < 5
+  ) return "HODLER";
+  if (
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours >= 24 &&
+    data.avgHoldTimeHours <= 168 &&
+    data.closedCount >= 5
+  ) return "SWING_TRADER";
+  if (
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours < 24 &&
+    data.tokensTradedLast30d > 10
+  ) return "ACTIVE_TRADER";
+  if (data.closedCount >= 10) return "ACTIVE_TRADER";
+  return "UNKNOWN";
+}
+
+// ---------------------------------------------------------------------------
+// FIX 4: Structured funding source
+// ---------------------------------------------------------------------------
+
+interface FundingSourceResult extends FundingSource {}
+
+async function getFundingSource(
+  walletAddress: string,
+  oldestSig: string | null,
+  timeoutMs: number
+): Promise<FundingSourceResult> {
+  const _default: FundingSourceResult = {
+    funder_address: null,
+    funder_type: "UNKNOWN",
+    funder_age_days: null,
+    funder_tx_count: null,
+    shared_funder_wallets: 0,
+    cluster_size: 1,
+    risk: "MEDIUM",
+    risk_reason: "funder details unavailable",
+    action_guidance: "verify funding source manually before high-value trades",
+  };
+
+  if (!oldestSig) return _default;
+
+  try {
+    const tx = await rpcWithFallback<any>(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getTransaction",
+        params: [oldestSig, { encoding: "json", maxSupportedTransactionVersion: 0 }],
+      },
+      timeoutMs
+    );
+    if (!tx) return _default;
+
+    const accountKeys: string[] = tx.transaction?.message?.accountKeys ?? [];
+    const preBalances: number[] = tx.meta?.preBalances ?? [];
+    const postBalances: number[] = tx.meta?.postBalances ?? [];
+    const walletIdx = accountKeys.indexOf(walletAddress);
+    if (walletIdx === -1) return _default;
+
+    let funderIdx = -1;
+    for (let i = 0; i < accountKeys.length; i++) {
+      if (i === walletIdx) continue;
+      if ((postBalances[i] ?? 0) - (preBalances[i] ?? 0) < 0) {
+        funderIdx = i;
+        break;
+      }
+    }
+    if (funderIdx === -1) return _default;
+
+    const funderAddress = accountKeys[funderIdx];
+
+    const funderSigs = await rpcWithFallback<any[]>(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "getSignaturesForAddress",
+        params: [funderAddress, { limit: 200 }],
+      },
+      timeoutMs
+    );
+
+    if (!funderSigs || funderSigs.length === 0) {
+      return {
+        funder_address: funderAddress,
+        funder_type: "FRESH_WALLET",
+        funder_age_days: 0,
+        funder_tx_count: 0,
+        shared_funder_wallets: 0,
+        cluster_size: 1,
+        risk: "HIGH",
+        risk_reason: "funded by brand-new wallet with zero transaction history",
+        action_guidance: "treat as high-risk — fresh wallets are common deployer proxies",
+      };
+    }
+
+    const funderTxCount = funderSigs.length;
+    const oldest = funderSigs[funderSigs.length - 1];
+    const funderAgeDays = typeof oldest?.blockTime === "number"
+      ? (Date.now() / 1000 - oldest.blockTime) / 86400
+      : null;
+
+    // Classify funder type
+    let funder_type: FunderType;
+    if (funderTxCount > 10_000) {
+      funder_type = "CEX";
+    } else if (funderAgeDays !== null && funderAgeDays < 3 && funderTxCount < 10) {
+      funder_type = "FRESH_WALLET";
+    } else if (funderAgeDays !== null && funderAgeDays < 30 && funderTxCount < 100) {
+      funder_type = "DEPLOYER";
+    } else {
+      funder_type = "PEER_WALLET";
+    }
+
+    // Risk classification
+    let risk: "HIGH" | "MEDIUM" | "LOW";
+    let risk_reason: string;
+    let action_guidance: string;
+
+    if (funder_type === "FRESH_WALLET") {
+      risk = "HIGH";
+      risk_reason = "funder is a fresh wallet (<3 days, <10 txns) — probable deployer proxy";
+      action_guidance = "avoid high-value trades — fresh funder chain is a common rug setup";
+    } else if (funder_type === "DEPLOYER") {
+      risk = "HIGH";
+      risk_reason = "funder has deployer-like activity pattern (<30 days, <100 txns)";
+      action_guidance = "verify funder is not associated with token deployers you are trading";
+    } else if (funder_type === "CEX") {
+      risk = "LOW";
+      risk_reason = "funded from a high-volume account (likely CEX withdrawal)";
+      action_guidance = "no unusual funding risk detected";
+    } else if (funderAgeDays !== null && funderAgeDays > 365) {
+      risk = "LOW";
+      risk_reason = "funded by an aged wallet (>1 year) — low chain risk";
+      action_guidance = "no unusual funding risk detected";
+    } else {
+      risk = "MEDIUM";
+      risk_reason = "funder is a peer wallet with limited history";
+      action_guidance = "standard caution — no specific risk signal detected";
+    }
+
+    return {
+      funder_address: funderAddress,
+      funder_type,
+      funder_age_days: funderAgeDays !== null ? Math.round(funderAgeDays * 10) / 10 : null,
+      funder_tx_count: funderTxCount,
+      shared_funder_wallets: 0,  // cluster detection beyond single hop is outside SLA
+      cluster_size: 1,
+      risk,
+      risk_reason,
+      action_guidance,
+    };
+  } catch {
+    return _default;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE 5: Dusting detection
+// ---------------------------------------------------------------------------
+
+function detectDusting(
+  walletAddress: string,
+  txs: ParsedTx[]
+): DustingAnalysis {
+  if (txs.length === 0) {
+    return {
+      dust_transactions_detected: 0,
+      dust_senders: 0,
+      most_recent_dust_timestamp: null,
+      dusting_risk: "NONE",
+      meaning: "no transaction data available",
+      action_guidance: "no action required",
+    };
+  }
+
+  // Build set of all known counterparties from the wallet's history
+  const knownCounterparties = new Set<string>();
+  for (const tx of txs) {
+    for (const transfer of tx.tokenTransfers) {
+      if (transfer.fromUserAccount !== walletAddress)
+        knownCounterparties.add(transfer.fromUserAccount);
+      if (transfer.toUserAccount !== walletAddress)
+        knownCounterparties.add(transfer.toUserAccount);
+    }
+  }
+
+  // Dusting criteria:
+  // 1. Incoming token transfer to this wallet
+  // 2. Token amount < 1.0 (fractional — likely dust in UI units)
+  // 3. Sender is not in known counterparties (first and only interaction)
+  const dustTxs: ParsedTx[] = [];
+  const dustSenderSet = new Set<string>();
+
+  for (const tx of txs) {
+    for (const transfer of tx.tokenTransfers) {
+      if (transfer.toUserAccount !== walletAddress) continue;
+      if (transfer.fromUserAccount === walletAddress) continue;
+      if (transfer.tokenAmount >= 1.0) continue;  // not a dust amount
+
+      const sender = transfer.fromUserAccount;
+      if (!sender) continue;
+
+      // Only count as dust if this sender appears nowhere else in the full history
+      // (i.e., the count of txs involving this sender == 1 for incoming to wallet)
+      const senderInteractionCount = txs.flatMap((t) => t.tokenTransfers).filter(
+        (t) =>
+          (t.fromUserAccount === sender && t.toUserAccount === walletAddress) ||
+          (t.toUserAccount === sender && t.fromUserAccount === walletAddress)
+      ).length;
+
+      if (senderInteractionCount === 1) {
+        dustTxs.push(tx);
+        dustSenderSet.add(sender);
+      }
+    }
+  }
+
+  const dust_transactions_detected = dustTxs.length;
+  const dust_senders = dustSenderSet.size;
+  const most_recent_dust_timestamp = dustTxs.length > 0
+    ? Math.max(...dustTxs.map((t) => t.timestamp))
+    : null;
+
+  let dusting_risk: "HIGH" | "MEDIUM" | "LOW" | "NONE";
+  let meaning: string;
+  let action_guidance: string;
+
+  if (dust_senders === 0) {
+    dusting_risk = "NONE";
+    meaning = "no dusting activity detected";
+    action_guidance = "no action required";
+  } else if (dust_senders >= 5) {
+    dusting_risk = "HIGH";
+    meaning = `${dust_senders} unknown senders sent micro-amounts — likely active dusting campaign`;
+    action_guidance = "do not interact with dust tokens; avoid approving any contracts from these senders";
+  } else if (dust_senders >= 2) {
+    dusting_risk = "MEDIUM";
+    meaning = `${dust_senders} unknown senders sent micro-amounts — possible dusting`;
+    action_guidance = "ignore dust tokens; do not send them or approve any contracts";
+  } else {
+    dusting_risk = "LOW";
+    meaning = "1 unknown sender sent a micro-amount — isolated incident, low concern";
+    action_guidance = "ignore the dust token; no action required";
+  }
+
+  return {
+    dust_transactions_detected,
+    dust_senders,
+    most_recent_dust_timestamp,
+    dusting_risk,
+    meaning,
+    action_guidance,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE 6: Extended behavior style classification
+// ---------------------------------------------------------------------------
+
+type ExtendedBehaviorStyle =
+  | "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT"
+  | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE"
+  | "PRO_TRADER" | "INSIDER" | "BUNDLER";
+
+interface BehaviorProfile {
+  style: ExtendedBehaviorStyle;
+  consistency: "LOW" | "MEDIUM" | "HIGH";
+  style_confidence: number;
+  style_evidence: string[];
+  profile_summary: string;
+}
+
+function deriveBehaviorProfile(data: {
+  isBot: boolean;
+  sniperScore: number;
+  avgHoldTimeHours: number | null;
+  tokensTradedLast30d: number;
+  winRatePct: number | null;
+  totalTx: number;
+  walletAgeDays: number | null;
+  closedCount: number;
+  earlyEntryRatePct: number | null;
+  pumpfunGraduationExitRatePct: number | null;
+  isMevBot: boolean;
+  fundingSourceType: FunderType;
+  consistency: "LOW" | "MEDIUM" | "HIGH";
+}): BehaviorProfile {
+  const evidence: string[] = [];
+  let style: ExtendedBehaviorStyle;
+  let style_confidence: number;
+
+  if (data.totalTx < 10) {
+    return {
+      style: "LOW_ACTIVITY",
+      consistency: "LOW",
+      style_confidence: 0.9,
+      style_evidence: [`only ${data.totalTx} transactions recorded`],
+      profile_summary: "insufficient activity for behavioral classification",
+    };
+  }
+
+  // Priority order: BOT > BUNDLER > INSIDER > PRO_TRADER > SNIPER > FLIPPER > HODLER > DEGEN > INCONCLUSIVE
+
+  if (data.isBot) {
+    evidence.push("uniform trade sizing detected", "high tx velocity");
+    return {
+      style: "BOT",
+      consistency: "HIGH",
+      style_confidence: 0.9,
+      style_evidence: evidence,
+      profile_summary: "automated bot — uniform sizing and/or high-frequency pattern detected",
+    };
+  }
+
+  // BUNDLER: non-MEV-bot + extreme sniper + fresh funder + very early entry
+  if (
+    !data.isMevBot &&
+    data.sniperScore >= 80 &&
+    data.fundingSourceType === "FRESH_WALLET" &&
+    data.earlyEntryRatePct !== null && data.earlyEntryRatePct >= 80
+  ) {
+    evidence.push(
+      `sniper_score=${data.sniperScore}`,
+      "fresh_wallet_funder",
+      `early_entry_rate=${data.earlyEntryRatePct}%`
+    );
+    return {
+      style: "BUNDLER",
+      consistency: data.consistency,
+      style_confidence: 0.85,
+      style_evidence: evidence,
+      profile_summary: "likely bundler — extreme early entry, fresh funding chain, no MEV bot pattern",
+    };
+  }
+
+  // INSIDER: very high early entry + high sniper score + strong pump.fun exit discipline
+  if (
+    data.earlyEntryRatePct !== null && data.earlyEntryRatePct >= 70 &&
+    data.sniperScore >= 60 &&
+    data.pumpfunGraduationExitRatePct !== null && data.pumpfunGraduationExitRatePct >= 60
+  ) {
+    evidence.push(
+      `early_entry_rate=${data.earlyEntryRatePct}%`,
+      `sniper_score=${data.sniperScore}`,
+      `pumpfun_exit_rate=${data.pumpfunGraduationExitRatePct}%`
+    );
+    return {
+      style: "INSIDER",
+      consistency: data.consistency,
+      style_confidence: 0.8,
+      style_evidence: evidence,
+      profile_summary: "possible insider — early entries, high sniper score, consistent pre-graduation exits",
+    };
+  }
+
+  // PRO_TRADER: high win rate + large sample + disciplined hold time + non-sniper
+  if (
+    data.winRatePct !== null && data.winRatePct >= 60 &&
+    data.closedCount >= 50 &&
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours >= 1 && data.avgHoldTimeHours <= 72 &&
+    data.sniperScore < 40
+  ) {
+    evidence.push(
+      `win_rate=${data.winRatePct.toFixed(1)}%`,
+      `${data.closedCount} closed positions`,
+      `avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`,
+      `sniper_score=${data.sniperScore} (low)`
+    );
+    return {
+      style: "PRO_TRADER",
+      consistency: data.consistency,
+      style_confidence: Math.min(0.95, 0.6 + data.closedCount / 500),
+      style_evidence: evidence,
+      profile_summary: "experienced trader — high win rate, disciplined hold time, non-sniper entries",
+    };
+  }
+
+  // SNIPER
+  if (data.sniperScore > 60 && data.avgHoldTimeHours !== null && data.avgHoldTimeHours < 2) {
+    evidence.push(`sniper_score=${data.sniperScore}`, `avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`);
+    style = "SNIPER";
+    style_confidence = 0.75;
+  }
+  // FLIPPER
+  else if (
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours < 24 &&
+    data.tokensTradedLast30d > 20
+  ) {
+    evidence.push(`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`, `${data.tokensTradedLast30d} tokens/30d`);
+    style = "FLIPPER";
+    style_confidence = 0.7;
+  }
+  // HODLER
+  else if (
+    data.avgHoldTimeHours !== null &&
+    data.avgHoldTimeHours > 168 &&
+    data.tokensTradedLast30d < 5
+  ) {
+    evidence.push(`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`, `${data.tokensTradedLast30d} tokens/30d`);
+    style = "HODLER";
+    style_confidence = 0.75;
+  }
+  // DEGEN
+  else {
+    const txPerDay =
+      data.walletAgeDays !== null && data.walletAgeDays > 0
+        ? data.totalTx / data.walletAgeDays : null;
+    if (
+      txPerDay !== null && txPerDay > 10 &&
+      data.tokensTradedLast30d > 10 &&
+      data.winRatePct !== null && data.winRatePct < 40
+    ) {
+      evidence.push(
+        `tx_per_day=${txPerDay.toFixed(1)}`,
+        `win_rate=${data.winRatePct.toFixed(1)}%`
+      );
+      style = "DEGEN";
+      style_confidence = 0.65;
+    } else if (data.closedCount < 10) {
+      style = "INCONCLUSIVE";
+      style_confidence = 0.3;
+    } else {
+      style = "INCONCLUSIVE";
+      style_confidence = 0.4;
+    }
+  }
+
+  const profileSummaries: Record<ExtendedBehaviorStyle, string> = {
+    SNIPER: "sniper — buys within minutes of pair creation, short holds",
+    FLIPPER: "flipper — high-frequency trader with short hold times",
+    HODLER: "hodler — long-term holder with infrequent trading",
+    DEGEN: "degen — high-frequency trader with below-average win rate",
+    INCONCLUSIVE: "inconclusive — insufficient data for clear classification",
+    LOW_ACTIVITY: "low activity — too few transactions for classification",
+    MOMENTUM: "momentum — trend-following with medium hold times",
+    BOT: "bot — automated trading pattern",
+    PRO_TRADER: "pro trader — skilled, consistent, disciplined hold time",
+    INSIDER: "possible insider — coordinated early entries",
+    BUNDLER: "possible bundler — fresh-funded, extreme early entry rate",
+  };
+
+  return {
+    style,
+    consistency: data.consistency,
+    style_confidence,
+    style_evidence: evidence,
+    profile_summary: profileSummaries[style] ?? "unknown profile",
+  };
 }
 
 function computeRiskScore(
@@ -463,7 +1157,7 @@ function computeRiskScore(
   if (sniperScore > 70) score += 25;
   else if (sniperScore > 40) score += 15;
 
-  if (winRatePct !== null && winRatePct > 80) score += 10; // insider-level edge
+  if (winRatePct !== null && winRatePct > 80) score += 10;
   if (rugExitRatePct !== null && rugExitRatePct > 80) score += 20;
   if (fundingWalletRisk === "HIGH") score += 20;
 
@@ -544,7 +1238,6 @@ async function computeSniperScore(
   positions: Map<string, TokenPosition>,
   slaDeadlineMs: number
 ): Promise<number> {
-  // Take the most recently traded tokens (up to 5)
   const mints = [...positions.entries()]
     .sort((a, b) => b[1].firstBuyTs - a[1].firstBuyTs)
     .slice(0, 5)
@@ -562,7 +1255,6 @@ async function computeSniperScore(
       if (dex?.pair_created_at_ms) {
         const pos = positions.get(mint)!;
         const pairCreatedSec = dex.pair_created_at_ms / 1000;
-        // Within 2 minutes of pair creation = sniper buy
         if (pos.firstBuyTs <= pairCreatedSec + 120) sniped++;
       }
       checked++;
@@ -572,99 +1264,6 @@ async function computeSniperScore(
   }
 
   return checked === 0 ? 0 : Math.round((sniped / checked) * 100);
-}
-
-async function getFundingWalletRisk(
-  walletAddress: string,
-  oldestSig: string | null,
-  timeoutMs: number
-): Promise<"HIGH" | "MEDIUM" | "LOW"> {
-  if (!oldestSig) return "MEDIUM";
-
-  try {
-    const tx = await rpcWithFallback<any>(
-      {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTransaction",
-        params: [
-          oldestSig,
-          { encoding: "json", maxSupportedTransactionVersion: 0 },
-        ],
-      },
-      timeoutMs
-    );
-    if (!tx) return "MEDIUM";
-
-    const accountKeys: string[] = tx.transaction?.message?.accountKeys ?? [];
-    const preBalances: number[] = tx.meta?.preBalances ?? [];
-    const postBalances: number[] = tx.meta?.postBalances ?? [];
-    const walletIdx = accountKeys.indexOf(walletAddress);
-    if (walletIdx === -1) return "MEDIUM";
-
-    // Find the account whose balance decreased (the funder)
-    let funderIdx = -1;
-    for (let i = 0; i < accountKeys.length; i++) {
-      if (i === walletIdx) continue;
-      if ((postBalances[i] ?? 0) - (preBalances[i] ?? 0) < 0) {
-        funderIdx = i;
-        break;
-      }
-    }
-    if (funderIdx === -1) return "MEDIUM";
-
-    const funderAddress = accountKeys[funderIdx];
-    const funderSigs = await rpcWithFallback<any[]>(
-      {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "getSignaturesForAddress",
-        params: [funderAddress, { limit: 10 }],
-      },
-      timeoutMs
-    );
-
-    if (!funderSigs || funderSigs.length === 0) return "HIGH"; // brand-new funder
-
-    const oldest = funderSigs[funderSigs.length - 1];
-    if (!oldest?.blockTime) return "MEDIUM";
-
-    const funderAgeDays = (Date.now() / 1000 - oldest.blockTime) / 86400;
-    if (funderAgeDays < 7) return "HIGH";
-    if (funderAgeDays > 365) return "LOW";
-    return "MEDIUM";
-  } catch {
-    return "MEDIUM";
-  }
-}
-
-function estimatePnL(
-  positions: Map<string, TokenPosition>,
-  solPriceUsd: number
-): { pnl30d: number | null; largestLoss: number | null } {
-  const cutoff = Date.now() / 1000 - 30 * 86400;
-  let totalLamports = 0;
-  let largestLossLamports = 0;
-  let hasData = false;
-
-  for (const pos of positions.values()) {
-    if (pos.solSpent === 0) continue;
-    if (pos.firstBuyTs < cutoff && !pos.isClosed) continue;
-    hasData = true;
-    const pnl = pos.solReceived - pos.solSpent;
-    totalLamports += pnl;
-    if (pnl < largestLossLamports) largestLossLamports = pnl;
-  }
-
-  if (!hasData) return { pnl30d: null, largestLoss: null };
-
-  const pnl30d = (totalLamports / 1e9) * solPriceUsd;
-  const largestLoss =
-    largestLossLamports < 0
-      ? Math.abs((largestLossLamports / 1e9) * solPriceUsd)
-      : null;
-
-  return { pnl30d, largestLoss };
 }
 
 // ---------------------------------------------------------------------------
@@ -692,50 +1291,37 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const fetchStart = Date.now();
   const SLA_ABORT_MS = fetchStart + 16_000;
 
-  // ── Phase 1: 5 parallel calls, 8 s each ──────────────────────────────────
-  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult] =
+  // ── Phase 1: 6 parallel calls ────────────────────────────────────────────
+  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult] =
     await Promise.allSettled([
       // 1. Recent signatures — wallet age + total tx count
       rpcWithFallback<any[]>(
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignaturesForAddress",
-          params: [address, { limit: 200 }],
-        },
+        { jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params: [address, { limit: 200 }] },
         8000
       ),
       // 2. SOL balance
       rpcWithFallback<any>(
-        {
-          jsonrpc: "2.0",
-          id: 2,
-          method: "getAccountInfo",
-          params: [address, { encoding: "base64" }],
-        },
+        { jsonrpc: "2.0", id: 2, method: "getAccountInfo", params: [address, { encoding: "base64" }] },
         8000
       ),
-      // 3. Token holdings via Helius DAS (Helius-specific RPC method)
+      // 3. Token holdings via Helius DAS
       rpcPost<any>(
         PRIMARY_RPC,
-        {
-          jsonrpc: "2.0",
-          id: 3,
-          method: "getAssetsByOwner",
-          params: { ownerAddress: address, page: 1, limit: 1000 },
-        },
+        { jsonrpc: "2.0", id: 3, method: "getAssetsByOwner", params: { ownerAddress: address, page: 1, limit: 1000 } },
         8000
       ),
-      // 4. Helius Enhanced parsed transactions (requires API key)
+      // 4. Helius Enhanced parsed transactions
       fetchParsedTransactions(address, 8000),
       // 5. SOL price — needed for PnL estimation
       getDexScreenerToken(WSOL, { timeout: 4000 }),
+      // 6. Birdeye wallet portfolio — needed for unrealized PnL
+      getBirdeyeWalletPortfolio(address, { timeout: 4000 }),
     ]);
 
-  if (sigsResult.status    === "rejected") logError("getSignaturesForAddress", sigsResult.reason);
-  if (accountResult.status === "rejected") logError("getAccountInfo",          accountResult.reason);
-  if (assetsResult.status  === "rejected") logError("getAssetsByOwner",        assetsResult.reason);
-  if (parsedTxResult.status === "rejected") logError("parsedTransactions",     parsedTxResult.reason);
+  if (sigsResult.status     === "rejected") logError("getSignaturesForAddress", sigsResult.reason);
+  if (accountResult.status  === "rejected") logError("getAccountInfo",          accountResult.reason);
+  if (assetsResult.status   === "rejected") logError("getAssetsByOwner",        assetsResult.reason);
+  if (parsedTxResult.status === "rejected") logError("parsedTransactions",      parsedTxResult.reason);
 
   // Extract Phase 1 results
   const sigs: any[] | null =
@@ -752,7 +1338,10 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const solPriceUsd: number =
     solPriceResult.status === "fulfilled" && solPriceResult.value?.price_usd != null
       ? solPriceResult.value.price_usd
-      : 150; // fallback price
+      : 150;
+
+  const portfolio: BirdeyeWalletPortfolioItem[] | null =
+    portfolioResult.status === "fulfilled" ? portfolioResult.value : null;
 
   // ── Basic signals from signatures ────────────────────────────────────────
   const totalTx = sigs?.length ?? 0;
@@ -782,60 +1371,84 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   }
 
   const isBot = detectBot(walletAgeDays, totalTx, parsedTxs ?? [], address);
-  const winRatePct = computeWinRate(positions);
+  const { win_rate_pct: winRatePct, win_rate_calculation_status } = resolveWinRate(positions, parsedTxs);
   const avgHoldTimeHours = computeAvgHoldTime(positions);
   const closedCount = [...positions.values()].filter((p) => p.isClosed).length;
 
-  // ── PnL estimate ──────────────────────────────────────────────────────────
-  const { pnl30d, largestLoss } =
-    positions.size > 0
-      ? estimatePnL(positions, solPriceUsd)
-      : { pnl30d: null, largestLoss: null };
+  // ── Structured PnL ────────────────────────────────────────────────────────
+  const { pnl, largestLoss } = positions.size > 0
+    ? estimateStructuredPnL(positions, solPriceUsd, portfolio)
+    : {
+        pnl: {
+          realized_pnl_usdc: null,
+          unrealized_pnl_usdc: null,
+          unrealized_pnl_pct: null,
+          total_pnl_usdc: null,
+          positions_analysed: 0,
+          cost_basis_method: "ESTIMATED" as const,
+          calculation_note: "no positions found",
+        },
+        largestLoss: null,
+      };
+
+  // ── Dusting analysis ──────────────────────────────────────────────────────
+  const dusting_analysis = detectDusting(address, parsedTxs ?? []);
 
   // ── Phase 2: SLA-guarded async signals ────────────────────────────────────
   let sniperScore = 0;
-  let fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW" = "MEDIUM";
+  let fundingSource: FundingSource = {
+    funder_address: null,
+    funder_type: "UNKNOWN",
+    funder_age_days: null,
+    funder_tx_count: null,
+    shared_funder_wallets: 0,
+    cluster_size: 1,
+    risk: "MEDIUM",
+    risk_reason: "funder details unavailable",
+    action_guidance: "verify funding source manually before high-value trades",
+  };
 
   if (Date.now() < SLA_ABORT_MS && positions.size > 0) {
-    // Sniper score + funding wallet run in parallel
     const [sniperResult, fundingResult] = await Promise.allSettled([
       computeSniperScore(positions, SLA_ABORT_MS - 2000),
-      getFundingWalletRisk(address, oldestSig, Math.min(3000, Math.max(500, SLA_ABORT_MS - Date.now() - 2000))),
+      getFundingSource(address, oldestSig, Math.min(3000, Math.max(500, SLA_ABORT_MS - Date.now() - 2000))),
     ]);
 
     sniperScore =
       sniperResult.status === "fulfilled" ? sniperResult.value : 0;
-    fundingWalletRisk =
-      fundingResult.status === "fulfilled" ? fundingResult.value : "MEDIUM";
+    fundingSource =
+      fundingResult.status === "fulfilled" ? fundingResult.value : fundingSource;
   } else if (Date.now() < SLA_ABORT_MS) {
-    // No positions but still try funding wallet trace
-    fundingWalletRisk = await getFundingWalletRisk(
+    fundingSource = await getFundingSource(
       address,
       oldestSig,
       Math.min(3000, Math.max(500, SLA_ABORT_MS - Date.now() - 2000))
     );
   }
 
-  // ── Derived signals ───────────────────────────────────────────────────────
-  const tradingStyle = deriveTradingStyle(
-    isBot,
+  const fundingWalletRisk = fundingSource.risk;  // backwards compat
+
+  // ── FIX 3: Wallet activity type ───────────────────────────────────────────
+  const wallet_activity_type = deriveWalletActivityType({
+    is_bot: isBot,
+    walletAgeDays,
+    totalTx,
+    tokensTradedLast30d,
     sniperScore,
     avgHoldTimeHours,
-    tokensTradedLast30d,
+    closedCount,
     winRatePct,
-    totalTx,
-    walletAgeDays,
-    closedCount
+  });
+
+  // ── Legacy trading style (flat backwards compat) ──────────────────────────
+  const tradingStyle = deriveTradingStyle(
+    isBot, sniperScore, avgHoldTimeHours, tokensTradedLast30d,
+    winRatePct, totalTx, walletAgeDays, closedCount
   );
 
   const riskScore = computeRiskScore(
-    walletAgeDays,
-    sniperScore,
-    winRatePct,
-    null, // rug_exit_rate_pct — skipped (too expensive within SLA)
-    fundingWalletRisk,
-    isBot,
-    whaleStatus
+    walletAgeDays, sniperScore, winRatePct, null,
+    fundingWalletRisk, isBot, whaleStatus
   );
 
   // ── Data confidence ───────────────────────────────────────────────────────
@@ -857,46 +1470,41 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     callsOk === 4 ? "FULL" : callsOk >= 2 ? "PARTIAL" : "LIMITED";
 
   const missing_fields: string[] = [];
-  if (sigs === null)                                                  missing_fields.push("signatures");
-  if (accountInfo === null)                                           missing_fields.push("sol_balance");
-  if (assetsResult.status !== "fulfilled" || assetsResult.value === null) missing_fields.push("token_holdings");
-  if (parsedTxs === null)                                             missing_fields.push("parsed_transactions");
-  // rug_exit_rate_pct and high_risk_tokens_traded require quickScan cross-calls — outside SLA
+  if (sigs === null)                                                       missing_fields.push("signatures");
+  if (accountInfo === null)                                                missing_fields.push("sol_balance");
+  if (assetsResult.status !== "fulfilled" || assetsResult.value === null)  missing_fields.push("token_holdings");
+  if (parsedTxs === null)                                                  missing_fields.push("parsed_transactions");
+  if (portfolio === null)                                                  missing_fields.push("birdeye_portfolio");
   missing_fields.push("rug_exit_rate_pct", "high_risk_tokens_traded");
 
   // ── Scoring factors ───────────────────────────────────────────────────────
   const factors = buildWalletFactors(
-    walletAgeDays,
-    sniperScore,
-    winRatePct,
-    null,
-    fundingWalletRisk,
-    isBot,
-    whaleStatus
+    walletAgeDays, sniperScore, winRatePct, null,
+    fundingWalletRisk, isBot, whaleStatus
   );
 
-  // ── Structured score (CLAUDE.md: calculateWalletScore) ────────────────────
+  // ── Structured score ──────────────────────────────────────────────────────
   let behavioral_risk = 0;
-  if (sniperScore > 70)                                                behavioral_risk += 25;
-  else if (sniperScore > 40)                                           behavioral_risk += 15;
-  if (winRatePct !== null && winRatePct > 80)                          behavioral_risk += 10;
-  if (isBot)                                                           behavioral_risk += 15;
+  if (sniperScore > 70)                                 behavioral_risk += 25;
+  else if (sniperScore > 40)                            behavioral_risk += 15;
+  if (winRatePct !== null && winRatePct > 80)           behavioral_risk += 10;
+  if (isBot)                                            behavioral_risk += 15;
   behavioral_risk = Math.min(100, behavioral_risk);
 
   let history_depth = 0;
-  if (walletAgeDays !== null && walletAgeDays < 7)                     history_depth += 20;
-  else if (walletAgeDays !== null && walletAgeDays < 30)               history_depth += 10;
+  if (walletAgeDays !== null && walletAgeDays < 7)      history_depth += 20;
+  else if (walletAgeDays !== null && walletAgeDays < 30) history_depth += 10;
   history_depth = Math.min(100, history_depth);
 
   let counterparty_exposure = 0;
-  if (fundingWalletRisk === "HIGH")                                     counterparty_exposure += 20;
-  if (whaleStatus && sniperScore > 40)                                  counterparty_exposure += 15;
+  if (fundingWalletRisk === "HIGH")                     counterparty_exposure += 20;
+  if (whaleStatus && sniperScore > 40)                  counterparty_exposure += 15;
   counterparty_exposure = Math.min(100, counterparty_exposure);
 
   const score_overall = Math.min(100, Math.max(0, behavioral_risk + history_depth + counterparty_exposure));
 
-  // ── Classification (CLAUDE.md: classifyWallet) ────────────────────────────
-  const strongSignals = factors.filter(f => f.impact >= 20).length;
+  // ── Classification ────────────────────────────────────────────────────────
+  const strongSignals = factors.filter((f) => f.impact >= 20).length;
   const classification: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN" =
     (totalTx < 10 || (walletAgeDays !== null && walletAgeDays < 7) || walletAgeDays === null)
       ? "UNKNOWN"
@@ -906,35 +1514,46 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
           ? "LOW_RISK"
           : "UNKNOWN";
 
-  // ── Activity profile ──────────────────────────────────────────────────────
+  // ── Activity profile ─────────────────────────────────────────��────────────
   const activeDays = parsedTxs && parsedTxs.length > 0
-    ? new Set(parsedTxs.map(tx => {
-        const ts = (tx as any).timestamp ?? (tx as any).blockTime;
-        return ts ? new Date(ts * 1000).toDateString() : null;
-      }).filter(Boolean)).size
+    ? new Set(
+        parsedTxs
+          .map((tx) => {
+            const ts = (tx as any).timestamp ?? (tx as any).blockTime;
+            return ts ? new Date(ts * 1000).toDateString() : null;
+          })
+          .filter(Boolean)
+      ).size
     : 0;
 
   const lastActiveSig = sigs && sigs.length > 0 ? sigs[0] : null;
-  const lastActiveHoursAgo = lastActiveSig && typeof (lastActiveSig as any).blockTime === "number"
-    ? (Date.now() / 1000 - (lastActiveSig as any).blockTime) / 3600
-    : null;
+  const lastActiveHoursAgo =
+    lastActiveSig && typeof (lastActiveSig as any).blockTime === "number"
+      ? (Date.now() / 1000 - (lastActiveSig as any).blockTime) / 3600
+      : null;
 
-  // ── Behavior classification ───────────────────────────────────────────────
-  const behaviorStyle: "SNIPER" | "MOMENTUM" | "FLIPPER" | "HODLER" | "BOT" | "DEGEN" | "LOW_ACTIVITY" | "INCONCLUSIVE" =
-    totalTx < 10
-      ? "LOW_ACTIVITY"
-      : tradingStyle === "bot"     ? "BOT"
-      : tradingStyle === "sniper"  ? "SNIPER"
-      : tradingStyle === "flipper" ? "FLIPPER"
-      : tradingStyle === "hodler"  ? "HODLER"
-      : tradingStyle === "degen"   ? "DEGEN"
-      : "INCONCLUSIVE";
-
-  // consistency derived from trade amount variance (approximated from closedCount vs tokens)
+  // ── Consistency (approximated from closed count vs tokens traded) ─────────
   const consistency: "LOW" | "MEDIUM" | "HIGH" =
     closedCount >= 10 && tokensTradedLast30d > 0
       ? closedCount / Math.max(tokensTradedLast30d, 1) > 2 ? "HIGH" : "MEDIUM"
       : "LOW";
+
+  // ── FEATURE 6: Extended behavior profile ──────────────────────────────────
+  const behaviorProfile = deriveBehaviorProfile({
+    isBot,
+    sniperScore,
+    avgHoldTimeHours,
+    tokensTradedLast30d,
+    winRatePct,
+    totalTx,
+    walletAgeDays,
+    closedCount,
+    earlyEntryRatePct: null,      // not yet wired from Helius
+    pumpfunGraduationExitRatePct: null, // not yet wired from Helius
+    isMevBot: false,              // not yet wired from Helius
+    fundingSourceType: fundingSource.funder_type,
+    consistency,
+  });
 
   // ── Risk signals ──────────────────────────────────────────────────────────
   const risk_signals: Array<{ name: string; impact: "LOW" | "MEDIUM" | "HIGH"; reason: string }> = [];
@@ -955,21 +1574,37 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     risk_signals.push({ name: "high_win_rate", impact: "MEDIUM", reason: `win rate ${winRatePct.toFixed(1)}% — possible information edge` });
   }
   if (fundingWalletRisk === "HIGH") {
-    risk_signals.push({ name: "high_funding_risk", impact: "HIGH", reason: "funded by deployer or fresh wallet chain" });
+    risk_signals.push({ name: "high_funding_risk", impact: "HIGH", reason: fundingSource.risk_reason });
   }
   if (isBot) {
     risk_signals.push({ name: "bot_detected", impact: "HIGH", reason: "transaction pattern consistent with automated bot activity" });
   }
+  if (dusting_analysis.dusting_risk === "HIGH") {
+    risk_signals.push({ name: "active_dusting", impact: "MEDIUM", reason: dusting_analysis.meaning });
+  }
 
-  // ── Historical exposure (rug_interactions requires cross-token scan — outside SLA) ─
+  // ── Historical exposure (cross-token scan — outside 20s SLA) ─────────────
   const historical_exposure = {
-    rug_interactions: 0,        // populated by cross-token scan — outside 20s SLA
-    high_risk_tokens_traded: 0, // populated by cross-token scan — outside 20s SLA
+    rug_interactions: 0,
+    high_risk_tokens_traded: 0,
   };
 
+  // ── Copy-trade classification ─────────────────────────────────────────────
+  const copy_trading = classifyCopyTrading({
+    total_trades: closedCount,
+    win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
+    win_rate_calculation_status,
+    avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
+    consistency,
+    sniper_score: sniperScore,
+    rug_exit_rate_pct: null,
+    is_bot: isBot,
+    behavior_style: behaviorProfile.style,
+  });
+
   // ── LLM summary ───────────────────────────────────────────────────────────
-  const elapsed = Date.now() - fetchStart;
-  const walletAgeDaysRounded = walletAgeDays !== null ? Math.round(walletAgeDays * 10) / 10 : null;
+  const walletAgeDaysRounded =
+    walletAgeDays !== null ? Math.round(walletAgeDays * 10) / 10 : null;
 
   const llmData: WalletRiskData = {
     classification,
@@ -977,7 +1612,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       wallet_age_days: walletAgeDaysRounded,
       total_trades: totalTx,
       active_days: activeDays,
-      last_active_hours_ago: lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
+      last_active_hours_ago:
+        lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
     },
     wallet_age_days: walletAgeDaysRounded,
     trading_style: tradingStyle,
@@ -987,9 +1623,10 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     funding_wallet_risk: fundingWalletRisk,
     risk_score: riskScore,
     is_bot: isBot,
-    pnl_estimate_30d_usdc: pnl30d !== null ? Math.round(pnl30d * 100) / 100 : null,
+    pnl_estimate_30d_usdc: pnl.realized_pnl_usdc,
   };
 
+  const elapsed = Date.now() - fetchStart;
   let risk_summary: string;
   if (elapsed >= 18_000) {
     console.warn(`[walletRisk] skipping LLM summary — elapsed ${elapsed}ms exceeds 18000ms`);
@@ -1009,7 +1646,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       wallet_age_days: walletAgeDaysRounded,
       total_trades: totalTx,
       active_days: activeDays,
-      last_active_hours_ago: lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
+      last_active_hours_ago:
+        lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
     },
 
     // ── Legacy flat fields ──────────────────────────────────────────────────
@@ -1019,17 +1657,24 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
     // ── Behavioural signals ─────────────────────────────────────────────────
     win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
-    avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
+    win_rate_calculation_status,
+    avg_hold_time_hours:
+      avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
     sniper_score: sniperScore,
     rug_exit_rate_pct: null,
-    pnl_estimate_30d_usdc: pnl30d !== null ? Math.round(pnl30d * 100) / 100 : null,
-    largest_single_loss_usdc: largestLoss !== null ? Math.round(largestLoss * 100) / 100 : null,
+    pnl_estimate_30d_usdc: pnl.realized_pnl_usdc,   // backwards compat
+    pnl,
+    largest_single_loss_usdc: largestLoss,
     is_bot: isBot,
     whale_status: whaleStatus,
-    funding_wallet_risk: fundingWalletRisk,
+    funding_wallet_risk: fundingWalletRisk,           // backwards compat
+    funding_source: fundingSource,
+
+    // ── Wallet activity type ────────────────────────────────────────────────
+    wallet_activity_type,
 
     // ── Behavior classification ─────────────────────────────────────────────
-    behavior: { style: behaviorStyle, consistency },
+    behavior: behaviorProfile,
 
     // ── Legacy flat field ───────────────────────────────────────────────────
     trading_style: tradingStyle,
@@ -1049,25 +1694,20 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     // ── Historical exposure ─────────────────────────────────────────────────
     historical_exposure,
 
-    // ── MEV intelligence (defaults — Helius parsed tx MEV parsing not yet wired) ─
+    // ── MEV intelligence (defaults — Helius MEV parsing not yet wired) ──────
     mev_victim_score: 0,
     is_mev_bot: false,
     mev_bot_confidence: 0,
 
-    // ── Pump.fun intelligence (defaults — requires Helius pump.fun event parsing) ─
+    // ── Pump.fun intelligence (defaults — requires Helius pump.fun parsing) ─
     pumpfun_graduation_exit_rate_pct: null,
     early_entry_rate_pct: null,
 
+    // ── Dusting analysis ────────────────────────────────────────────────────
+    dusting_analysis,
+
     // ── Copy-trade opportunity ───────────────────────────────────────────────
-    copy_trading: classifyCopyTrading({
-      total_trades: closedCount,
-      win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
-      avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
-      consistency,
-      sniper_score: sniperScore,
-      rug_exit_rate_pct: null,
-      is_bot: isBot,
-    }),
+    copy_trading,
 
     // ── Data quality ────────────────────────────────────────────────────────
     data_quality,

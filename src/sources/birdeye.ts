@@ -391,6 +391,189 @@ export async function getBirdeyeOHLCV(
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Token security — metadata immutability + supply info
+// Fields verified via live curl on 2026-04-05:
+//   .data.mutableMetadata = true|false (boolean)
+//   .data.metaplexUpdateAuthority = "..." (wallet address)
+//   .data.creatorAddress = "..." (wallet address)
+//   .data.totalSupply = number
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeTokenSecurity {
+  mutable_metadata: boolean | null;
+  metaplex_update_authority: string | null;
+  creator_address: string | null;
+  total_supply: number | null;
+}
+
+export async function getBirdeyeTokenSecurity(
+  address: string,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeTokenSecurity | null> {
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const url = `${TOKEN_SECURITY_URL}?address=${encodeURIComponent(address)}`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: {
+      mutableMetadata?: boolean | null;
+      metaplexUpdateAuthority?: string | null;
+      creatorAddress?: string | null;
+      totalSupply?: number | null;
+    };
+  };
+
+  if (!json.success || !json.data) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  const d = json.data;
+  return {
+    mutable_metadata: typeof d.mutableMetadata === "boolean" ? d.mutableMetadata : null,
+    metaplex_update_authority: d.metaplexUpdateAuthority ?? null,
+    creator_address: d.creatorAddress ?? null,
+    total_supply: typeof d.totalSupply === "number" ? d.totalSupply : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Holder list — top N holders by balance
+// Fields verified via live curl on 2026-04-05:
+//   .data.items[n].owner = "..." (wallet address)
+//   .data.items[n].ui_amount = number (human-readable balance)
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeHolder {
+  owner: string;
+  ui_amount: number;
+}
+
+export async function getBirdeyeHolderList(
+  address: string,
+  limit = 20,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeHolder[] | null> {
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const url = `https://public-api.birdeye.so/defi/v3/token/holder?address=${encodeURIComponent(address)}&limit=${limit}`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: { items?: Array<{ owner?: string; ui_amount?: number }> };
+  };
+
+  if (!json.success || !json.data?.items) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  return json.data.items
+    .filter((item): item is { owner: string; ui_amount: number } =>
+      typeof item.owner === "string" && typeof item.ui_amount === "number"
+    )
+    .map((item) => ({ owner: item.owner, ui_amount: item.ui_amount }));
+}
+
+// ---------------------------------------------------------------------------
+// Wallet portfolio — current token holdings with live prices
+// Fields verified via live curl on 2026-04-05:
+//   .data.items[n] = { address, symbol, uiAmount, priceUsd, valueUsd }
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeWalletPortfolioItem {
+  address: string;       // token mint address
+  symbol: string | null;
+  ui_amount: number;     // human-readable balance
+  price_usd: number | null;
+  value_usd: number | null;
+}
+
+export async function getBirdeyeWalletPortfolio(
+  walletAddress: string,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeWalletPortfolioItem[] | null> {
+  if (!process.env.BIRDEYE_API_KEY) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 4000;
+  const url = `https://public-api.birdeye.so/v1/wallet/token_list?wallet=${encodeURIComponent(walletAddress)}`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: { items?: Array<{ address?: string; symbol?: string; uiAmount?: number; priceUsd?: number; valueUsd?: number }> };
+  };
+
+  if (!json.success || !json.data?.items) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  return json.data.items
+    .filter((item): item is { address: string; symbol?: string; uiAmount?: number; priceUsd?: number; valueUsd?: number } =>
+      typeof item.address === "string"
+    )
+    .map((item) => ({
+      address: item.address,
+      symbol: item.symbol ?? null,
+      ui_amount: item.uiAmount ?? 0,
+      price_usd: typeof item.priceUsd === "number" ? item.priceUsd : null,
+      value_usd: typeof item.valueUsd === "number" ? item.valueUsd : null,
+    }));
+}
+
 export async function getTokenOHLCV(
   address: string,
   options: { timeout: number }

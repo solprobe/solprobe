@@ -296,6 +296,145 @@ export async function getWalletAgeDays(
  * creation transaction. Returns null on failure or timeout.
  * Uses a hard 2000ms timeout per the SLA requirement.
  */
+// ---------------------------------------------------------------------------
+// Helius Enhanced API — transaction history
+// ---------------------------------------------------------------------------
+
+const HELIUS_ENHANCED_BASE = "https://api.helius.xyz/v0";
+
+/**
+ * Circular wash trading detection via Helius SWAP transactions.
+ * Builds an adjacency map { fromWallet → Map<toWallet, timestamp> } filtered
+ * to this mint, then detects A→B→A cycles within a 60-minute window.
+ * Returns null when HELIUS_API_KEY is missing or on any fetch failure.
+ */
+export interface WashTradingDetectionResult {
+  circular_pairs: number;
+  total_swaps: number;
+}
+
+export async function detectCircularWashTrading(
+  mintAddress: string,
+  options: { timeout?: number } = {}
+): Promise<WashTradingDetectionResult | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 4000;
+  const url = `${HELIUS_ENHANCED_BASE}/addresses/${mintAddress}/transactions?type=SWAP&api-key=${apiKey}&limit=100`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+  } catch {
+    return null;
+  }
+
+  if (!res.ok) return null;
+
+  let result: unknown;
+  try {
+    result = await res.json();
+  } catch {
+    return null;
+  }
+
+  if (!Array.isArray(result)) return null;
+
+  // Build adjacency map: { fromWallet → Map<toWallet, unix_timestamp> }
+  const adjacency = new Map<string, Map<string, number>>();
+
+  for (const tx of result as Array<{ timestamp?: number; tokenTransfers?: Array<{ fromUserAccount?: string; toUserAccount?: string; mint?: string }> }>) {
+    const blockTime = tx.timestamp ?? 0;
+    for (const t of tx.tokenTransfers ?? []) {
+      if (t.mint !== mintAddress) continue;
+      const from = t.fromUserAccount;
+      const to = t.toUserAccount;
+      if (!from || !to || from === to) continue;
+      if (!adjacency.has(from)) adjacency.set(from, new Map());
+      adjacency.get(from)!.set(to, blockTime);
+    }
+  }
+
+  // Detect A→B→A within 60-minute window
+  const WINDOW_SEC = 3600;
+  let circular_pairs = 0;
+
+  for (const [a, targets] of adjacency) {
+    for (const [b, ts_ab] of targets) {
+      const bTargets = adjacency.get(b);
+      if (!bTargets) continue;
+      const ts_ba = bTargets.get(a);
+      if (ts_ba === undefined) continue;
+      if (Math.abs(ts_ab - ts_ba) <= WINDOW_SEC) {
+        circular_pairs++;
+      }
+    }
+  }
+
+  // Each pair counted twice (A→B and B→A), divide by 2
+  return {
+    circular_pairs: Math.floor(circular_pairs / 2),
+    total_swaps: result.length,
+  };
+}
+
+/**
+ * Fetch authority change history from Helius enhanced API.
+ * Queries SET_AUTHORITY and MINT_TO transaction types.
+ * Handles non-array responses (Helius returns error object when no txns exist).
+ * Returns null when HELIUS_API_KEY is missing.
+ */
+export interface AuthorityHistoryResult {
+  mint_authority_changes: number;
+  authority_ever_regranted: boolean;
+  post_launch_mints: number;
+}
+
+export async function getAuthorityHistory(
+  mintAddress: string,
+  options: { timeout?: number } = {}
+): Promise<AuthorityHistoryResult | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 3000;
+
+  const [setAuthRes, mintToRes] = await Promise.allSettled([
+    fetch(
+      `${HELIUS_ENHANCED_BASE}/addresses/${mintAddress}/transactions?type=SET_AUTHORITY&api-key=${apiKey}`,
+      { signal: AbortSignal.timeout(timeout) }
+    ),
+    fetch(
+      `${HELIUS_ENHANCED_BASE}/addresses/${mintAddress}/transactions?type=MINT_TO&api-key=${apiKey}`,
+      { signal: AbortSignal.timeout(timeout) }
+    ),
+  ]);
+
+  let setAuthTxns: unknown[] = [];
+  if (setAuthRes.status === "fulfilled" && setAuthRes.value.ok) {
+    try {
+      const data = await setAuthRes.value.json();
+      setAuthTxns = Array.isArray(data) ? data : [];
+    } catch { /* non-fatal */ }
+  }
+
+  let mintToTxns: unknown[] = [];
+  if (mintToRes.status === "fulfilled" && mintToRes.value.ok) {
+    try {
+      const data = await mintToRes.value.json();
+      mintToTxns = Array.isArray(data) ? data : [];
+    } catch { /* non-fatal */ }
+  }
+
+  const mint_authority_changes = setAuthTxns.length;
+  return {
+    mint_authority_changes,
+    authority_ever_regranted: mint_authority_changes > 0,
+    post_launch_mints: mintToTxns.length,
+  };
+}
+
 export async function getMintCreationBlock(
   mintAddress: string,
   options: { timeout?: number } = {}

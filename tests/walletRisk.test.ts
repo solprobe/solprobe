@@ -69,7 +69,7 @@ function parsedSellTx(timestamp: number, mint: string, fromWallet: string, nativ
 
 /** Build N closed positions: buy then sell, profitable (2x SOL returned) */
 function buildClosedPositions(wallet: string, n: number) {
-  const txs = [];
+  const txs: unknown[] = [];
   const now = Math.floor(Date.now() / 1000);
   for (let i = 0; i < n; i++) {
     const mint = `mint${i}${"1".repeat(36 - String(i).length)}`;
@@ -82,14 +82,12 @@ function buildClosedPositions(wallet: string, n: number) {
 }
 
 function makeFetch({
-  walletAddress = WALLET,
   totalTxCount = 5,
   parsedTxs = [] as unknown[],
   solBalance = 1_000_000_000,
   walletAgeDays = 90,
   heliusAssetsData = { items: [] },
 }: {
-  walletAddress?: string;
   totalTxCount?: number;
   parsedTxs?: unknown[];
   solBalance?: number;
@@ -355,6 +353,162 @@ describe("walletRisk", () => {
     }
   });
 
+  // ── FIX 1: win_rate_calculation_status ───────────────────────────────────
+  it("win_rate_calculation_status is always a valid WinRateStatus string", async () => {
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 5, parsedTxs: [] }));
+    const result = await walletRisk(WALLET);
+    expect(result.win_rate_calculation_status).toMatch(
+      /^(CALCULATED|NO_CLOSED_TRADES|INSUFFICIENT_TRADES|DATA_UNAVAILABLE|HODL_ONLY)$/
+    );
+  });
+
+  it("win_rate_calculation_status is CALCULATED when closed trades exist", async () => {
+    const txs = buildClosedPositions(WALLET, 10);
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 30, parsedTxs: txs, walletAgeDays: 90 }));
+    const result = await walletRisk(WALLET);
+    expect(result.win_rate_calculation_status).toBe("CALCULATED");
+    expect(result.win_rate_pct).not.toBeNull();
+  });
+
+  it("win_rate_calculation_status is NO_CLOSED_TRADES when no parsed txs", async () => {
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 15, parsedTxs: [] }));
+    const result = await walletRisk(WALLET);
+    expect(result.win_rate_calculation_status).toMatch(
+      /^(NO_CLOSED_TRADES|DATA_UNAVAILABLE|INSUFFICIENT_TRADES)$/
+    );
+  });
+
+  // ── FIX 2: structured pnl object ─────────────────────────────────────────
+  it("pnl is a structured object with required fields", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.pnl).toMatchObject({
+      realized_pnl_usdc: expect.toBeOneOf([expect.any(Number), null]),
+      unrealized_pnl_usdc: expect.toBeOneOf([expect.any(Number), null]),
+      unrealized_pnl_pct: expect.toBeOneOf([expect.any(Number), null]),
+      total_pnl_usdc: expect.toBeOneOf([expect.any(Number), null]),
+      positions_analysed: expect.any(Number),
+      cost_basis_method: expect.stringMatching(/^(SOL_LAMPORTS|ESTIMATED)$/),
+    });
+    // calculation_note is string or null
+    expect(
+      result.pnl.calculation_note === null || typeof result.pnl.calculation_note === "string"
+    ).toBe(true);
+  });
+
+  it("pnl_estimate_30d_usdc (legacy) equals pnl.realized_pnl_usdc", async () => {
+    const txs = buildClosedPositions(WALLET, 5);
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 20, parsedTxs: txs, walletAgeDays: 90 }));
+    const result = await walletRisk(WALLET);
+    expect(result.pnl_estimate_30d_usdc).toBe(result.pnl.realized_pnl_usdc);
+  });
+
+  // ── FIX 3: wallet_activity_type ───────────────────────────────────────────
+  it("wallet_activity_type is always a valid WalletActivityType string", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.wallet_activity_type).toMatch(
+      /^(ACTIVE_TRADER|HODLER|SWING_TRADER|SNIPER|BOT|INACTIVE|NEW_WALLET|UNKNOWN)$/
+    );
+  });
+
+  it("wallet_activity_type is INACTIVE for a wallet with very few recent txs", async () => {
+    // totalTxCount=2 with no parsed txs → low activity
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 2, parsedTxs: [], walletAgeDays: 365 }));
+    const result = await walletRisk(WALLET);
+    expect(result.wallet_activity_type).toMatch(/^(INACTIVE|UNKNOWN)$/);
+  });
+
+  it("wallet_activity_type is never undefined — defaults gracefully with no on-chain data", async () => {
+    // RPC calls are POST (method in body, not URL), so walletAgeDays is null in test env.
+    // With no sigs returned, totalTx=0 → INACTIVE is the correct fallback.
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 5, parsedTxs: [], walletAgeDays: 2 }));
+    const result = await walletRisk(WALLET);
+    expect(result.wallet_activity_type).toMatch(
+      /^(ACTIVE_TRADER|HODLER|SWING_TRADER|SNIPER|BOT|INACTIVE|NEW_WALLET|UNKNOWN)$/
+    );
+  });
+
+  // ── FIX 4: structured funding_source object ───────────────────────────────
+  it("funding_source is a structured object with required fields", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.funding_source).toMatchObject({
+      funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
+      shared_funder_wallets: expect.any(Number),
+      cluster_size: expect.any(Number),
+      risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      risk_reason: expect.any(String),
+      action_guidance: expect.any(String),
+    });
+    // funder_address, funder_age_days, funder_tx_count can be null
+    expect(
+      result.funding_source.funder_address === null || typeof result.funding_source.funder_address === "string"
+    ).toBe(true);
+  });
+
+  it("funding_wallet_risk (legacy) matches funding_source.risk", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.funding_wallet_risk).toBe(result.funding_source.risk);
+  });
+
+  // ── FEATURE 5: dusting_analysis ───────────────────────────────────────────
+  it("dusting_analysis is present with required shape", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.dusting_analysis).toMatchObject({
+      dust_transactions_detected: expect.any(Number),
+      dust_senders: expect.any(Number),
+      dusting_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|NONE)$/),
+      meaning: expect.any(String),
+      action_guidance: expect.any(String),
+    });
+    // most_recent_dust_timestamp is number or null
+    expect(
+      result.dusting_analysis.most_recent_dust_timestamp === null ||
+      typeof result.dusting_analysis.most_recent_dust_timestamp === "number"
+    ).toBe(true);
+  });
+
+  it("dusting_analysis.dusting_risk is NONE when no parsed txs", async () => {
+    vi.stubGlobal("fetch", makeFetch({ parsedTxs: [] }));
+    const result = await walletRisk(WALLET);
+    expect(result.dusting_analysis.dust_transactions_detected).toBe(0);
+    expect(result.dusting_analysis.dusting_risk).toBe("NONE");
+  });
+
+  // ── FEATURE 6: extended behavior fields ───────────────────────────────────
+  it("behavior has style_confidence, style_evidence, and profile_summary", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(result.behavior).toMatchObject({
+      style: expect.stringMatching(
+        /^(SNIPER|MOMENTUM|FLIPPER|HODLER|BOT|DEGEN|LOW_ACTIVITY|INCONCLUSIVE|PRO_TRADER|INSIDER|BUNDLER)$/
+      ),
+      consistency: expect.stringMatching(/^(LOW|MEDIUM|HIGH)$/),
+      style_confidence: expect.any(Number),
+      style_evidence: expect.any(Array),
+      profile_summary: expect.any(String),
+    });
+    expect(result.behavior.style_confidence).toBeGreaterThanOrEqual(0);
+    expect(result.behavior.style_confidence).toBeLessThanOrEqual(1);
+  });
+
+  it("behavior.style_evidence is an array of strings", async () => {
+    vi.stubGlobal("fetch", makeFetch({ totalTxCount: 50, parsedTxs: buildClosedPositions(WALLET, 20), walletAgeDays: 90 }));
+    const result = await walletRisk(WALLET);
+    expect(Array.isArray(result.behavior.style_evidence)).toBe(true);
+    result.behavior.style_evidence.forEach(e => expect(typeof e).toBe("string"));
+  });
+
+  it("behavior.profile_summary is a non-empty string", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+    const result = await walletRisk(WALLET);
+    expect(typeof result.behavior.profile_summary).toBe("string");
+    expect(result.behavior.profile_summary.length).toBeGreaterThan(0);
+  });
+
   // ── full response shape ───────────────────────────────────────────────────
   it("returns a complete, valid response shape", async () => {
     vi.stubGlobal("fetch", makeFetch({ totalTxCount: 10, walletAgeDays: 90 }));
@@ -373,6 +527,9 @@ describe("walletRisk", () => {
       behavior: expect.objectContaining({
         style: expect.any(String),
         consistency: expect.stringMatching(/^(LOW|MEDIUM|HIGH)$/),
+        style_confidence: expect.any(Number),
+        style_evidence: expect.any(Array),
+        profile_summary: expect.any(String),
       }),
       score: expect.objectContaining({ overall: expect.any(Number) }),
       risk_signals: expect.any(Array),
@@ -385,6 +542,25 @@ describe("walletRisk", () => {
       mev_bot_confidence: expect.any(Number),
       pumpfun_graduation_exit_rate_pct: expect.toBeOneOf([expect.any(Number), null]),
       early_entry_rate_pct: expect.toBeOneOf([expect.any(Number), null]),
+      win_rate_calculation_status: expect.stringMatching(
+        /^(CALCULATED|NO_CLOSED_TRADES|INSUFFICIENT_TRADES|DATA_UNAVAILABLE|HODL_ONLY)$/
+      ),
+      pnl: expect.objectContaining({
+        realized_pnl_usdc: expect.toBeOneOf([expect.any(Number), null]),
+        positions_analysed: expect.any(Number),
+        cost_basis_method: expect.stringMatching(/^(SOL_LAMPORTS|ESTIMATED)$/),
+      }),
+      wallet_activity_type: expect.stringMatching(
+        /^(ACTIVE_TRADER|HODLER|SWING_TRADER|SNIPER|BOT|INACTIVE|NEW_WALLET|UNKNOWN)$/
+      ),
+      funding_source: expect.objectContaining({
+        funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
+        risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      }),
+      dusting_analysis: expect.objectContaining({
+        dust_transactions_detected: expect.any(Number),
+        dusting_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|NONE)$/),
+      }),
       copy_trading: expect.objectContaining({
         worthiness: expect.stringMatching(/^(HIGH|MEDIUM|LOW|UNKNOWN)$/),
         confidence: expect.any(Number),

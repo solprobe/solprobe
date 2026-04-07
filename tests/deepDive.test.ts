@@ -103,7 +103,30 @@ describe("deepDive", () => {
       summary:                  expect.any(String),
       dev_wallet_analysis:      expect.objectContaining({ sol_balance: expect.any(Number) }),
       liquidity_lock_status:    expect.objectContaining({ locked: expect.any(Boolean) }),
-      trading_pattern:          expect.objectContaining({ wash_trading_score: expect.any(Number) }),
+      trading_pattern:          expect.objectContaining({
+        wash_trading_score: expect.any(Number),
+        circular_pairs:     expect.any(Number),
+        wash_method:        expect.stringMatching(/^(HEURISTIC|CIRCULAR_SWAP)$/),
+      }),
+      metadata_immutability:    expect.objectContaining({
+        is_mutable:  expect.toBeOneOf([true, false, null]),
+        risk:        expect.stringMatching(/^(MUTABLE|IMMUTABLE|UNKNOWN)$/),
+      }),
+      authority_history:        expect.objectContaining({
+        mint_authority_changes:   expect.any(Number),
+        authority_ever_regranted: expect.any(Boolean),
+        post_launch_mints:        expect.any(Number),
+      }),
+      dilution_risk:            expect.objectContaining({
+        post_launch_mints: expect.any(Number),
+        risk:              expect.stringMatching(/^(LOW|MEDIUM|HIGH|UNKNOWN)$/),
+      }),
+      wallet_analysis:          expect.objectContaining({
+        clustered_wallets:       expect.any(Number),
+        dev_wallet_linked:       expect.any(Boolean),
+        funding_wallet_overlap:  expect.toBeOneOf([expect.any(Number), null]),
+        funding_source_risk:     expect.stringMatching(/^(LOW|MEDIUM|HIGH)$/),
+      }),
     });
   });
 
