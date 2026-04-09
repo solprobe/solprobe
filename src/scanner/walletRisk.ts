@@ -2,7 +2,9 @@ import { deduplicate, getOrFetch } from "../cache.js";
 import { getDexScreenerToken } from "../sources/dexscreener.js";
 import {
   getBirdeyeWalletPortfolio,
+  getBirdeyeWalletPnL,
   type BirdeyeWalletPortfolioItem,
+  type BirdeyeWalletPnLSummary,
 } from "../sources/birdeye.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import type { ScoringFactor } from "./types.js";
@@ -47,7 +49,7 @@ export interface FundingSource {
   funder_type: FunderType;
   funder_age_days: number | null;
   funder_tx_count: number | null;
-  shared_funder_wallets: number;
+  shared_funder_wallets: string[];
   cluster_size: number;
   risk: "HIGH" | "MEDIUM" | "LOW";
   risk_reason: string;
@@ -56,7 +58,7 @@ export interface FundingSource {
 
 export interface DustingAnalysis {
   dust_transactions_detected: number;
-  dust_senders: number;
+  dust_senders: string[];
   most_recent_dust_timestamp: number | null;
   dusting_risk: "HIGH" | "MEDIUM" | "LOW" | "NONE";
   meaning: string;
@@ -69,8 +71,11 @@ export interface StructuredPnL {
   unrealized_pnl_pct: number | null;
   total_pnl_usdc: number | null;
   positions_analysed: number;
-  cost_basis_method: "SOL_LAMPORTS" | "ESTIMATED";
+  cost_basis_method: "SOL_LAMPORTS" | "ESTIMATED" | "BIRDEYE_API";
+  method_description: string;
   calculation_note: string | null;
+  spam_token_filter_applied: boolean;
+  filtered_spam_count: number;
 }
 
 export interface WalletRiskResult {
@@ -90,7 +95,7 @@ export interface WalletRiskResult {
   // ── Legacy flat fields (backwards compat) ─────────────────────────────────
   wallet_age_days: number | null;
   total_transactions: number;
-  tokens_traded_30d: number;
+  tokens_traded_30d: number | null;
 
   // ── Behavioural signals ───────────────────────────────────────────────────
   win_rate_pct: number | null;
@@ -146,8 +151,8 @@ export interface WalletRiskResult {
 
   // ── Historical exposure ───────────────────────────────────────────────────
   historical_exposure: {
-    rug_interactions: number;
-    high_risk_tokens_traded: number;
+    rug_interactions: number | null;
+    high_risk_tokens_traded: number | null;
   };
 
   // ── MEV intelligence ──────────────────────────────────────────────────────
@@ -179,6 +184,22 @@ export interface WalletRiskResult {
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
   factors: ScoringFactor[];
   confidence: { model: number; data_completeness: number; signal_consensus: number };
+}
+
+// ---------------------------------------------------------------------------
+// FIX 7: Confidence cap derived from data quality
+// ---------------------------------------------------------------------------
+
+function deriveConfidenceFromQuality(
+  raw: { model: number; data_completeness: number; signal_consensus: number },
+  quality: "FULL" | "PARTIAL" | "LIMITED"
+): { model: number; data_completeness: number; signal_consensus: number } {
+  const cap = quality === "LIMITED" ? 0.4 : quality === "PARTIAL" ? 0.7 : 1.0;
+  return {
+    model: Math.min(raw.model, cap),
+    data_completeness: Math.min(raw.data_completeness, cap),
+    signal_consensus: Math.min(raw.signal_consensus, cap),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +237,22 @@ function resolveWinRate(
     win_rate_pct: (wins / closed.length) * 100,
     win_rate_calculation_status: "CALCULATED",
   };
+}
+
+// ---------------------------------------------------------------------------
+// FIX 6: Win rate calculation status — DATA_UNAVAILABLE only on fetch failure
+// ---------------------------------------------------------------------------
+
+function resolveWinRateStatus(data: {
+  has_any_sells: boolean;
+  closed_trades: number;
+  data_fetch_failed: boolean;
+}): WinRateStatus {
+  if (data.data_fetch_failed) return "DATA_UNAVAILABLE";
+  if (!data.has_any_sells) return "HODL_ONLY";
+  if (data.closed_trades === 0) return "NO_CLOSED_TRADES";
+  if (data.closed_trades < 5) return "INSUFFICIENT_TRADES";
+  return "CALCULATED";
 }
 
 // ---------------------------------------------------------------------------
@@ -497,9 +534,12 @@ function computeTokensTraded30d(
   const cutoff = Date.now() / 1000 - 30 * 86400;
   const mints = new Set<string>();
   for (const tx of txs) {
-    if (tx.timestamp < cutoff) continue;
-    for (const t of tx.tokenTransfers) {
-      if (t.fromUserAccount === walletAddress || t.toUserAccount === walletAddress) {
+    if (tx.timestamp && tx.timestamp < cutoff) continue;
+    for (const t of (tx.tokenTransfers ?? [])) {
+      if (
+        t.mint &&
+        (t.fromUserAccount === walletAddress || t.toUserAccount === walletAddress)
+      ) {
         mints.add(t.mint);
       }
     }
@@ -547,7 +587,7 @@ function deriveTradingStyle(
   isBot: boolean,
   sniperScore: number,
   avgHoldTimeHours: number | null,
-  tokensTradedLast30d: number,
+  tokensTradedLast30d: number | null,
   winRatePct: number | null,
   totalTx: number,
   walletAgeDays: number | null,
@@ -556,14 +596,14 @@ function deriveTradingStyle(
   if (isBot) return "bot";
   if (sniperScore > 60 && avgHoldTimeHours !== null && avgHoldTimeHours < 2)
     return "sniper";
-  if (avgHoldTimeHours !== null && avgHoldTimeHours < 24 && tokensTradedLast30d > 20)
+  if (avgHoldTimeHours !== null && avgHoldTimeHours < 24 && tokensTradedLast30d !== null && tokensTradedLast30d > 20)
     return "flipper";
-  if (avgHoldTimeHours !== null && avgHoldTimeHours > 168 && tokensTradedLast30d < 5)
+  if (avgHoldTimeHours !== null && avgHoldTimeHours > 168 && (tokensTradedLast30d === null || tokensTradedLast30d < 5))
     return "hodler";
   const txPerDay =
     walletAgeDays !== null && walletAgeDays > 0 ? totalTx / walletAgeDays : null;
   if (
-    txPerDay !== null && txPerDay > 10 && tokensTradedLast30d > 10 &&
+    txPerDay !== null && txPerDay > 10 && tokensTradedLast30d !== null && tokensTradedLast30d > 10 &&
     winRatePct !== null && winRatePct < 40
   )
     return "degen";
@@ -575,14 +615,52 @@ function deriveTradingStyle(
 // FIX 2: Structured PnL
 // ---------------------------------------------------------------------------
 
+function filterSpamTokens(
+  tokens: BirdeyeWalletPortfolioItem[]
+): { clean: BirdeyeWalletPortfolioItem[]; spam_filtered: number } {
+  const clean = tokens.filter((t) => !t.is_spam && (t.value_usd ?? 0) > 0.01);
+  return { clean, spam_filtered: tokens.length - clean.length };
+}
+
 function estimateStructuredPnL(
   positions: Map<string, TokenPosition>,
   solPriceUsd: number,
-  portfolio: BirdeyeWalletPortfolioItem[] | null
+  portfolio: BirdeyeWalletPortfolioItem[] | null,
+  birdeyePnL: BirdeyeWalletPnLSummary | null
 ): { pnl: StructuredPnL; largestLoss: number | null } {
+
+  // ── PRIMARY: Birdeye PnL API ──────────────────────────────────────────────
+  if (birdeyePnL !== null) {
+    const spamResult = portfolio !== null
+      ? filterSpamTokens(portfolio)
+      : { clean: [], spam_filtered: 0 };
+
+    return {
+      pnl: {
+        realized_pnl_usdc: birdeyePnL.total_realized_pnl_usd !== null
+          ? Math.round(birdeyePnL.total_realized_pnl_usd * 100) / 100
+          : null,
+        unrealized_pnl_usdc: birdeyePnL.total_unrealized_pnl_usd !== null
+          ? Math.round(birdeyePnL.total_unrealized_pnl_usd * 100) / 100
+          : null,
+        unrealized_pnl_pct: null,   // not returned by PnL summary endpoint
+        total_pnl_usdc: birdeyePnL.total_pnl_usd !== null
+          ? Math.round(birdeyePnL.total_pnl_usd * 100) / 100
+          : null,
+        positions_analysed: birdeyePnL.total_trades ?? 0,
+        cost_basis_method: "BIRDEYE_API",
+        method_description: "Realized and unrealized PnL from Birdeye wallet analytics API",
+        calculation_note: null,
+        spam_token_filter_applied: portfolio !== null,
+        filtered_spam_count: spamResult.spam_filtered,
+      },
+      largestLoss: null,
+    };
+  }
+
+  // ── FALLBACK: SOL lamport positions + portfolio snapshot ──────────────────
   const cutoff = Date.now() / 1000 - 30 * 86400;
 
-  // Realized PnL from closed positions in last 30 days
   let realizedLamports = 0;
   let realizedCount = 0;
   let largestLossLamports = 0;
@@ -591,45 +669,50 @@ function estimateStructuredPnL(
     if (pos.solSpent === 0) continue;
     if (!pos.isClosed) continue;
     if (pos.firstBuyTs < cutoff && !pos.isClosed) continue;
-    const pnl = pos.solReceived - pos.solSpent;
-    realizedLamports += pnl;
+    const positionPnl = pos.solReceived - pos.solSpent;
+    realizedLamports += positionPnl;
     realizedCount++;
-    if (pnl < largestLossLamports) largestLossLamports = pnl;
+    if (positionPnl < largestLossLamports) largestLossLamports = positionPnl;
   }
 
   const realized_pnl_usdc = realizedCount > 0
     ? Math.round((realizedLamports / 1e9) * solPriceUsd * 100) / 100
     : null;
 
-  // Unrealized PnL from open positions (requires portfolio data)
   let unrealized_pnl_usdc: number | null = null;
   let unrealized_cost_basis_usdc = 0;
   let unrealizedCount = 0;
   let portfolioMatched = 0;
-  const notes: string[] = [];
+  const notes: string[] = [
+    "Realized PnL unavailable — Birdeye PnL API not accessible on current tier",
+  ];
 
   const openPositions = [...positions.values()].filter(
     (p) => !p.isClosed && p.solSpent > 0
   );
 
+  let spamFiltered = 0;
+  let spamFilterApplied = false;
+
   if (portfolio !== null && openPositions.length > 0) {
+    const { clean, spam_filtered } = filterSpamTokens(portfolio);
+    spamFiltered = spam_filtered;
+    spamFilterApplied = true;
+
     const portfolioMap = new Map<string, BirdeyeWalletPortfolioItem>();
-    for (const item of portfolio) portfolioMap.set(item.address, item);
+    for (const item of clean) portfolioMap.set(item.address, item);
 
     let unrealizedGross = 0;
-
     for (const pos of openPositions) {
       const item = portfolioMap.get(pos.mint);
       const costUsd = (pos.solSpent / 1e9) * solPriceUsd;
       unrealized_cost_basis_usdc += costUsd;
       unrealizedCount++;
-
       if (item?.value_usd != null) {
         unrealizedGross += item.value_usd - costUsd;
         portfolioMatched++;
       }
     }
-
     if (portfolioMatched > 0) {
       unrealized_pnl_usdc = Math.round(unrealizedGross * 100) / 100;
     }
@@ -663,7 +746,12 @@ function estimateStructuredPnL(
       total_pnl_usdc,
       positions_analysed: realizedCount + unrealizedCount,
       cost_basis_method: portfolio !== null ? "SOL_LAMPORTS" : "ESTIMATED",
-      calculation_note: notes.length > 0 ? notes.join("; ") : null,
+      method_description: portfolio !== null
+        ? "Realized PnL from on-chain SOL lamport net flows; unrealized from Birdeye portfolio snapshot"
+        : "Estimated PnL from on-chain SOL lamport net flows only; no portfolio snapshot available",
+      calculation_note: notes.join("; "),
+      spam_token_filter_applied: spamFilterApplied,
+      filtered_spam_count: spamFiltered,
     },
     largestLoss,
   };
@@ -674,36 +762,33 @@ function estimateStructuredPnL(
 // ---------------------------------------------------------------------------
 
 function deriveWalletActivityType(data: {
+  wallet_age_days: number | null;
+  total_trades: number;
+  avg_hold_time_hours: number | null;
   is_bot: boolean;
-  walletAgeDays: number | null;
-  totalTx: number;
-  tokensTradedLast30d: number;
-  sniperScore: number;
-  avgHoldTimeHours: number | null;
-  closedCount: number;
-  winRatePct: number | null;
+  sniper_score: number;
+  has_any_sells: boolean;
+  last_active_hours_ago: number | null;
+  tokens_traded_30d: number | null;
+  portfolio_has_holdings: boolean;
 }): WalletActivityType {
+  if (data.wallet_age_days !== null && data.wallet_age_days < 7) return "NEW_WALLET";
   if (data.is_bot) return "BOT";
-  if (data.walletAgeDays !== null && data.walletAgeDays < 7) return "NEW_WALLET";
-  if (data.totalTx < 10) return "INACTIVE";
-  if (data.sniperScore > 60) return "SNIPER";
-  if (
-    data.avgHoldTimeHours !== null &&
-    data.avgHoldTimeHours > 168 &&
-    data.tokensTradedLast30d < 5
-  ) return "HODLER";
-  if (
-    data.avgHoldTimeHours !== null &&
-    data.avgHoldTimeHours >= 24 &&
-    data.avgHoldTimeHours <= 168 &&
-    data.closedCount >= 5
-  ) return "SWING_TRADER";
-  if (
-    data.avgHoldTimeHours !== null &&
-    data.avgHoldTimeHours < 24 &&
-    data.tokensTradedLast30d > 10
-  ) return "ACTIVE_TRADER";
-  if (data.closedCount >= 10) return "ACTIVE_TRADER";
+  if (data.last_active_hours_ago !== null && data.last_active_hours_ago > 720) return "INACTIVE";
+
+  // HODLER check before trade count gate — a wallet holding tokens with no
+  // sells is a HODLER regardless of whether we have full parsed tx history
+  if (!data.has_any_sells && data.portfolio_has_holdings) return "HODLER";
+
+  // Only gate on insufficient data AFTER checking HODLER pattern
+  if (data.total_trades < 3 && !data.portfolio_has_holdings) return "UNKNOWN";
+
+  if (data.sniper_score > 60 && data.avg_hold_time_hours !== null
+      && data.avg_hold_time_hours < 2) return "SNIPER";
+  if (data.avg_hold_time_hours !== null && data.avg_hold_time_hours > 48
+      && (data.tokens_traded_30d === null || data.tokens_traded_30d < 10)) return "SWING_TRADER";
+  if (data.avg_hold_time_hours !== null && data.avg_hold_time_hours < 24
+      && data.tokens_traded_30d !== null && data.tokens_traded_30d > 5) return "ACTIVE_TRADER";
   return "UNKNOWN";
 }
 
@@ -711,7 +796,29 @@ function deriveWalletActivityType(data: {
 // FIX 4: Structured funding source
 // ---------------------------------------------------------------------------
 
-interface FundingSourceResult extends FundingSource {}
+function validateFunderAge(
+  funderCreatedAt: number | null,
+  fundingTxTimestamp: number | null
+): number | null {
+  if (funderCreatedAt === null) return null;
+  if (fundingTxTimestamp === null) return null;
+
+  // Funder must have been created before the funding transaction
+  if (funderCreatedAt > fundingTxTimestamp) {
+    console.warn(
+      `[wallet_risk] funder_age invalid: created=${funderCreatedAt} ` +
+      `after funding_tx=${fundingTxTimestamp} — setting to null`
+    );
+    return null;
+  }
+
+  const ageMs = Date.now() - funderCreatedAt * 1000;
+  return Math.floor(ageMs / (1000 * 60 * 60 * 24));
+}
+
+interface FundingSourceResult extends FundingSource {
+  _warnings: string[];
+}
 
 async function getFundingSource(
   walletAddress: string,
@@ -723,11 +830,12 @@ async function getFundingSource(
     funder_type: "UNKNOWN",
     funder_age_days: null,
     funder_tx_count: null,
-    shared_funder_wallets: 0,
+    shared_funder_wallets: [],
     cluster_size: 1,
     risk: "MEDIUM",
     risk_reason: "funder details unavailable",
     action_guidance: "verify funding source manually before high-value trades",
+    _warnings: [],
   };
 
   if (!oldestSig) return _default;
@@ -743,6 +851,9 @@ async function getFundingSource(
       timeoutMs
     );
     if (!tx) return _default;
+
+    const fundingTxTimestamp: number | null =
+      typeof tx.blockTime === "number" ? tx.blockTime : null;
 
     const accountKeys: string[] = tx.transaction?.message?.accountKeys ?? [];
     const preBalances: number[] = tx.meta?.preBalances ?? [];
@@ -776,21 +887,27 @@ async function getFundingSource(
       return {
         funder_address: funderAddress,
         funder_type: "FRESH_WALLET",
-        funder_age_days: 0,
+        funder_age_days: null,
         funder_tx_count: 0,
-        shared_funder_wallets: 0,
+        shared_funder_wallets: [],
         cluster_size: 1,
         risk: "HIGH",
         risk_reason: "funded by brand-new wallet with zero transaction history",
         action_guidance: "treat as high-risk — fresh wallets are common deployer proxies",
+        _warnings: [],
       };
     }
 
     const funderTxCount = funderSigs.length;
     const oldest = funderSigs[funderSigs.length - 1];
-    const funderAgeDays = typeof oldest?.blockTime === "number"
-      ? (Date.now() / 1000 - oldest.blockTime) / 86400
-      : null;
+    const funderCreatedAt: number | null =
+      typeof oldest?.blockTime === "number" ? oldest.blockTime : null;
+
+    const warnings: string[] = [];
+    const funderAgeDays = validateFunderAge(funderCreatedAt, fundingTxTimestamp);
+    if (funderAgeDays === null && funderCreatedAt !== null) {
+      warnings.push("funder_age_validation_failed");
+    }
 
     // Classify funder type
     let funder_type: FunderType;
@@ -834,13 +951,14 @@ async function getFundingSource(
     return {
       funder_address: funderAddress,
       funder_type,
-      funder_age_days: funderAgeDays !== null ? Math.round(funderAgeDays * 10) / 10 : null,
+      funder_age_days: funderAgeDays,
       funder_tx_count: funderTxCount,
-      shared_funder_wallets: 0,  // cluster detection beyond single hop is outside SLA
+      shared_funder_wallets: [],  // cluster detection beyond single hop is outside SLA
       cluster_size: 1,
       risk,
       risk_reason,
       action_guidance,
+      _warnings: warnings,
     };
   } catch {
     return _default;
@@ -858,7 +976,7 @@ function detectDusting(
   if (txs.length === 0) {
     return {
       dust_transactions_detected: 0,
-      dust_senders: 0,
+      dust_senders: [],
       most_recent_dust_timestamp: null,
       dusting_risk: "NONE",
       meaning: "no transaction data available",
@@ -909,7 +1027,7 @@ function detectDusting(
   }
 
   const dust_transactions_detected = dustTxs.length;
-  const dust_senders = dustSenderSet.size;
+  const dust_senders = [...dustSenderSet];
   const most_recent_dust_timestamp = dustTxs.length > 0
     ? Math.max(...dustTxs.map((t) => t.timestamp))
     : null;
@@ -918,17 +1036,17 @@ function detectDusting(
   let meaning: string;
   let action_guidance: string;
 
-  if (dust_senders === 0) {
+  if (dust_senders.length === 0) {
     dusting_risk = "NONE";
     meaning = "no dusting activity detected";
     action_guidance = "no action required";
-  } else if (dust_senders >= 5) {
+  } else if (dust_senders.length >= 5) {
     dusting_risk = "HIGH";
-    meaning = `${dust_senders} unknown senders sent micro-amounts — likely active dusting campaign`;
+    meaning = `${dust_senders.length} unknown senders sent micro-amounts — likely active dusting campaign`;
     action_guidance = "do not interact with dust tokens; avoid approving any contracts from these senders";
-  } else if (dust_senders >= 2) {
+  } else if (dust_senders.length >= 2) {
     dusting_risk = "MEDIUM";
-    meaning = `${dust_senders} unknown senders sent micro-amounts — possible dusting`;
+    meaning = `${dust_senders.length} unknown senders sent micro-amounts — possible dusting`;
     action_guidance = "ignore dust tokens; do not send them or approve any contracts";
   } else {
     dusting_risk = "LOW";
@@ -967,7 +1085,7 @@ function deriveBehaviorProfile(data: {
   isBot: boolean;
   sniperScore: number;
   avgHoldTimeHours: number | null;
-  tokensTradedLast30d: number;
+  tokensTradedLast30d: number | null;
   winRatePct: number | null;
   totalTx: number;
   walletAgeDays: number | null;
@@ -1079,7 +1197,7 @@ function deriveBehaviorProfile(data: {
   else if (
     data.avgHoldTimeHours !== null &&
     data.avgHoldTimeHours < 24 &&
-    data.tokensTradedLast30d > 20
+    data.tokensTradedLast30d !== null && data.tokensTradedLast30d > 20
   ) {
     evidence.push(`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`, `${data.tokensTradedLast30d} tokens/30d`);
     style = "FLIPPER";
@@ -1089,9 +1207,9 @@ function deriveBehaviorProfile(data: {
   else if (
     data.avgHoldTimeHours !== null &&
     data.avgHoldTimeHours > 168 &&
-    data.tokensTradedLast30d < 5
+    (data.tokensTradedLast30d === null || data.tokensTradedLast30d < 5)
   ) {
-    evidence.push(`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`, `${data.tokensTradedLast30d} tokens/30d`);
+    evidence.push(`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`, `${data.tokensTradedLast30d ?? 0} tokens/30d`);
     style = "HODLER";
     style_confidence = 0.75;
   }
@@ -1102,7 +1220,7 @@ function deriveBehaviorProfile(data: {
         ? data.totalTx / data.walletAgeDays : null;
     if (
       txPerDay !== null && txPerDay > 10 &&
-      data.tokensTradedLast30d > 10 &&
+      data.tokensTradedLast30d !== null && data.tokensTradedLast30d > 10 &&
       data.winRatePct !== null && data.winRatePct < 40
     ) {
       evidence.push(
@@ -1291,8 +1409,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const fetchStart = Date.now();
   const SLA_ABORT_MS = fetchStart + 16_000;
 
-  // ── Phase 1: 6 parallel calls ────────────────────────────────────────────
-  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult] =
+  // ── Phase 1: 7 parallel calls ────────────────────────────────────────────
+  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult, birdeyePnLResult] =
     await Promise.allSettled([
       // 1. Recent signatures — wallet age + total tx count
       rpcWithFallback<any[]>(
@@ -1316,6 +1434,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       getDexScreenerToken(WSOL, { timeout: 4000 }),
       // 6. Birdeye wallet portfolio — needed for unrealized PnL
       getBirdeyeWalletPortfolio(address, { timeout: 4000 }),
+      // 7. Birdeye PnL summary — primary PnL source
+      getBirdeyeWalletPnL(address, { timeout: 6000 }),
     ]);
 
   if (sigsResult.status     === "rejected") logError("getSignaturesForAddress", sigsResult.reason);
@@ -1343,6 +1463,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const portfolio: BirdeyeWalletPortfolioItem[] | null =
     portfolioResult.status === "fulfilled" ? portfolioResult.value : null;
 
+  const birdeyePnL: BirdeyeWalletPnLSummary | null =
+    birdeyePnLResult.status === "fulfilled" ? birdeyePnLResult.value : null;
+
   // ── Basic signals from signatures ────────────────────────────────────────
   const totalTx = sigs?.length ?? 0;
   let walletAgeDays: number | null = null;
@@ -1363,7 +1486,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
   // ── Behavioral signals from parsed transactions ───────────────────────────
   let positions = new Map<string, TokenPosition>();
-  let tokensTradedLast30d = 0;
+  let tokensTradedLast30d: number | null = null;
 
   if (parsedTxs && parsedTxs.length > 0) {
     positions = computePositions(address, parsedTxs);
@@ -1371,13 +1494,35 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   }
 
   const isBot = detectBot(walletAgeDays, totalTx, parsedTxs ?? [], address);
-  const { win_rate_pct: winRatePct, win_rate_calculation_status } = resolveWinRate(positions, parsedTxs);
+  let { win_rate_pct: winRatePct, win_rate_calculation_status } = resolveWinRate(positions, parsedTxs);
   const avgHoldTimeHours = computeAvgHoldTime(positions);
+
+  // ── Override with Birdeye PnL data when available ─────────────────────────
+  if (birdeyePnL !== null) {
+    if (birdeyePnL.tokens_traded !== null) {
+      tokensTradedLast30d = birdeyePnL.tokens_traded;
+    }
+    if (birdeyePnL.win_rate_pct !== null) {
+      winRatePct = birdeyePnL.win_rate_pct;
+      win_rate_calculation_status = "CALCULATED";
+    }
+  }
   const closedCount = [...positions.values()].filter((p) => p.isClosed).length;
+  const has_any_sells = [...positions.values()].some((p) => p.solReceived > 0);
+
+  // Override status using correct semantics — DATA_UNAVAILABLE only on fetch failure
+  // (Birdeye PnL override above may have already set CALCULATED; don't downgrade it)
+  if (win_rate_calculation_status !== "CALCULATED") {
+    win_rate_calculation_status = resolveWinRateStatus({
+      has_any_sells,
+      closed_trades: closedCount,
+      data_fetch_failed: parsedTxResult.status === "rejected",
+    });
+  }
 
   // ── Structured PnL ────────────────────────────────────────────────────────
   const { pnl, largestLoss } = positions.size > 0
-    ? estimateStructuredPnL(positions, solPriceUsd, portfolio)
+    ? estimateStructuredPnL(positions, solPriceUsd, portfolio, birdeyePnL)
     : {
         pnl: {
           realized_pnl_usdc: null,
@@ -1386,7 +1531,10 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
           total_pnl_usdc: null,
           positions_analysed: 0,
           cost_basis_method: "ESTIMATED" as const,
+          method_description: "no positions to analyse",
           calculation_note: "no positions found",
+          spam_token_filter_applied: false,
+          filtered_spam_count: 0,
         },
         largestLoss: null,
       };
@@ -1396,16 +1544,17 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
   // ── Phase 2: SLA-guarded async signals ────────────────────────────────────
   let sniperScore = 0;
-  let fundingSource: FundingSource = {
+  let fundingSource: FundingSourceResult = {
     funder_address: null,
     funder_type: "UNKNOWN",
     funder_age_days: null,
     funder_tx_count: null,
-    shared_funder_wallets: 0,
+    shared_funder_wallets: [],
     cluster_size: 1,
     risk: "MEDIUM",
     risk_reason: "funder details unavailable",
     action_guidance: "verify funding source manually before high-value trades",
+    _warnings: [],
   };
 
   if (Date.now() < SLA_ABORT_MS && positions.size > 0) {
@@ -1426,19 +1575,12 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     );
   }
 
+  // Warnings from funding source analysis — wired into the warnings array in Fix 10
+  void fundingSource._warnings;
+
   const fundingWalletRisk = fundingSource.risk;  // backwards compat
 
-  // ── FIX 3: Wallet activity type ───────────────────────────────────────────
-  const wallet_activity_type = deriveWalletActivityType({
-    is_bot: isBot,
-    walletAgeDays,
-    totalTx,
-    tokensTradedLast30d,
-    sniperScore,
-    avgHoldTimeHours,
-    closedCount,
-    winRatePct,
-  });
+  // wallet_activity_type is derived later, after lastActiveHoursAgo is available
 
   // ── Legacy trading style (flat backwards compat) ──────────────────────────
   const tradingStyle = deriveTradingStyle(
@@ -1464,18 +1606,25 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     sources_total: 4,
     data_age_ms: Date.now() - fetchStart,
   });
-  const data_confidence = confidenceToString(confidence.model);
 
+  // Losing parsed_transactions alone disables PnL, active_days, tokens_traded_30d,
+  // and win_rate simultaneously — always LIMITED even if other calls succeeded.
   const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
-    callsOk === 4 ? "FULL" : callsOk >= 2 ? "PARTIAL" : "LIMITED";
+    callsOk === 4 ? "FULL"
+    : parsedTxs === null ? "LIMITED"
+    : callsOk >= 2 ? "PARTIAL"
+    : "LIMITED";
+
+  const cappedConfidence = deriveConfidenceFromQuality(confidence, data_quality);
+  const data_confidence = confidenceToString(cappedConfidence.model);
 
   const missing_fields: string[] = [];
   if (sigs === null)                                                       missing_fields.push("signatures");
   if (accountInfo === null)                                                missing_fields.push("sol_balance");
   if (assetsResult.status !== "fulfilled" || assetsResult.value === null)  missing_fields.push("token_holdings");
-  if (parsedTxs === null)                                                  missing_fields.push("parsed_transactions");
+  if (parsedTxs === null)                                                  missing_fields.push("parsed_transactions", "tokens_traded_30d");
   if (portfolio === null)                                                  missing_fields.push("birdeye_portfolio");
-  missing_fields.push("rug_exit_rate_pct", "high_risk_tokens_traded");
+  missing_fields.push("rug_exit_rate_pct", "historical_exposure");
 
   // ── Scoring factors ───────────────────────────────────────────────────────
   const factors = buildWalletFactors(
@@ -1514,17 +1663,22 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
           ? "LOW_RISK"
           : "UNKNOWN";
 
-  // ── Activity profile ─────────────────────────────────────────��────────────
-  const activeDays = parsedTxs && parsedTxs.length > 0
-    ? new Set(
-        parsedTxs
-          .map((tx) => {
-            const ts = (tx as any).timestamp ?? (tx as any).blockTime;
-            return ts ? new Date(ts * 1000).toDateString() : null;
-          })
-          .filter(Boolean)
-      ).size
-    : 0;
+  // ── Activity profile ──────────────────────────────────────────────────────
+  function calculateActiveDays(transactions: ParsedTx[]): number {
+    if (!transactions.length) return 0;
+    const uniqueDays = new Set(
+      transactions
+        .filter((tx) => tx.timestamp != null)
+        .map((tx) => {
+          const d = new Date(tx.timestamp * 1000);
+          return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+        })
+    );
+    return uniqueDays.size;
+  }
+
+  const activeDays = parsedTxs !== null ? calculateActiveDays(parsedTxs) : 0;
+  if (parsedTxs === null) missing_fields.push("active_days");
 
   const lastActiveSig = sigs && sigs.length > 0 ? sigs[0] : null;
   const lastActiveHoursAgo =
@@ -1532,9 +1686,25 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       ? (Date.now() / 1000 - (lastActiveSig as any).blockTime) / 3600
       : null;
 
+  // ── Wallet activity type ──────────────────────────────────────────────────
+  // has_any_sells already computed above (Fix 6)
+  const portfolio_has_holdings = (portfolio?.length ?? 0) > 0;
+
+  const wallet_activity_type = deriveWalletActivityType({
+    wallet_age_days: walletAgeDays,
+    total_trades: birdeyePnL?.total_trades ?? totalTx,
+    avg_hold_time_hours: avgHoldTimeHours,
+    is_bot: isBot,
+    sniper_score: sniperScore,
+    has_any_sells,
+    last_active_hours_ago: lastActiveHoursAgo,
+    tokens_traded_30d: tokensTradedLast30d,
+    portfolio_has_holdings,
+  });
+
   // ── Consistency (approximated from closed count vs tokens traded) ─────────
   const consistency: "LOW" | "MEDIUM" | "HIGH" =
-    closedCount >= 10 && tokensTradedLast30d > 0
+    closedCount >= 10 && tokensTradedLast30d !== null && tokensTradedLast30d > 0
       ? closedCount / Math.max(tokensTradedLast30d, 1) > 2 ? "HIGH" : "MEDIUM"
       : "LOW";
 
@@ -1584,9 +1754,10 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   }
 
   // ── Historical exposure (cross-token scan — outside 20s SLA) ─────────────
+  // Not computed within the SLA window; null signals "not yet scanned"
   const historical_exposure = {
-    rug_interactions: 0,
-    high_risk_tokens_traded: 0,
+    rug_interactions: null as number | null,
+    high_risk_tokens_traded: null as number | null,
   };
 
   // ── Copy-trade classification ─────────────────────────────────────────────
@@ -1610,7 +1781,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     classification,
     activity: {
       wallet_age_days: walletAgeDaysRounded,
-      total_trades: totalTx,
+      total_trades: birdeyePnL?.total_trades ?? totalTx,
       active_days: activeDays,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
@@ -1644,7 +1815,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     // ── Activity profile ────────────────────────────────────────────────────
     activity: {
       wallet_age_days: walletAgeDaysRounded,
-      total_trades: totalTx,
+      total_trades: birdeyePnL?.total_trades ?? totalTx,
       active_days: activeDays,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
@@ -1716,6 +1887,6 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     risk_summary,
     data_confidence,
     factors,
-    confidence,
+    confidence: cappedConfidence,
   };
 }

@@ -512,9 +512,108 @@ export async function getBirdeyeHolderList(
 }
 
 // ---------------------------------------------------------------------------
+// Wallet PnL summary — Birdeye /wallet/v2/pnl/summary
+// Fields verified via live curl on 2026-04-08:
+//   .data.summary.pnl.realized_profit_usd
+//   .data.summary.pnl.unrealized_usd
+//   .data.summary.pnl.total_usd
+//   .data.summary.counts.win_rate  (0.0–1.0)
+//   .data.summary.counts.total_trade
+//   .data.summary.counts.total_win
+//   .data.summary.counts.total_loss
+//   .data.summary.unique_tokens
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeWalletPnLSummary {
+  total_realized_pnl_usd: number | null;
+  total_unrealized_pnl_usd: number | null;
+  total_pnl_usd: number | null;
+  win_rate_pct: number | null;    // 0–100
+  total_trades: number | null;
+  winning_trades: number | null;
+  losing_trades: number | null;
+  tokens_traded: number | null;
+  source: "birdeye_pnl_api";
+}
+
+export async function getBirdeyeWalletPnL(
+  walletAddress: string,
+  options: { timeout: number }
+): Promise<BirdeyeWalletPnLSummary | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const start = Date.now();
+  const url = `https://public-api.birdeye.so/wallet/v2/pnl/summary` +
+    `?wallet=${encodeURIComponent(walletAddress)}&chain=solana`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "X-API-KEY": apiKey, Accept: "application/json" },
+      signal: AbortSignal.timeout(options.timeout),
+    });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  const json = await res.json() as {
+    data?: {
+      summary?: {
+        unique_tokens?: number;
+        counts?: {
+          total_trade?: number;
+          total_win?: number;
+          total_loss?: number;
+          win_rate?: number;
+        };
+        pnl?: {
+          realized_profit_usd?: number;
+          unrealized_usd?: number;
+          total_usd?: number;
+        };
+      };
+    };
+  };
+
+  const summary = json?.data?.summary;
+  if (!summary) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  recordSuccess("birdeye");
+
+  const winRateRaw = summary.counts?.win_rate ?? null;
+
+  return {
+    total_realized_pnl_usd: summary.pnl?.realized_profit_usd ?? null,
+    total_unrealized_pnl_usd: summary.pnl?.unrealized_usd ?? null,
+    total_pnl_usd: summary.pnl?.total_usd ?? null,
+    win_rate_pct: typeof winRateRaw === "number" ? Math.round(winRateRaw * 10000) / 100 : null,
+    total_trades: summary.counts?.total_trade ?? null,
+    winning_trades: summary.counts?.total_win ?? null,
+    losing_trades: summary.counts?.total_loss ?? null,
+    tokens_traded: summary.unique_tokens ?? null,
+    source: "birdeye_pnl_api",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Wallet portfolio — current token holdings with live prices
-// Fields verified via live curl on 2026-04-05:
+// Fields verified via live curl on 2026-04-08:
 //   .data.items[n] = { address, symbol, uiAmount, priceUsd, valueUsd }
+//   Note: no isSpam field in response — is_spam defaults to false
 // ---------------------------------------------------------------------------
 
 export interface BirdeyeWalletPortfolioItem {
@@ -523,6 +622,7 @@ export interface BirdeyeWalletPortfolioItem {
   ui_amount: number;     // human-readable balance
   price_usd: number | null;
   value_usd: number | null;
+  is_spam: boolean;
 }
 
 export async function getBirdeyeWalletPortfolio(
@@ -571,6 +671,7 @@ export async function getBirdeyeWalletPortfolio(
       ui_amount: item.uiAmount ?? 0,
       price_usd: typeof item.priceUsd === "number" ? item.priceUsd : null,
       value_usd: typeof item.valueUsd === "number" ? item.valueUsd : null,
+      is_spam: false,  // Birdeye v1/wallet/token_list does not expose isSpam field
     }));
 }
 
