@@ -324,10 +324,8 @@ describe("walletRisk", () => {
     const txs = buildClosedPositions(WALLET, 30);
     vi.stubGlobal("fetch", makeFetch({ totalTxCount: 100, parsedTxs: txs, walletAgeDays: 365 }));
     const result = await walletRisk(WALLET);
-    expect(result.historical_exposure).toMatchObject({
-      rug_interactions: expect.any(Number),
-      high_risk_tokens_traded: expect.any(Number),
-    });
+    expect(result.historical_exposure.rug_interactions === null || typeof result.historical_exposure.rug_interactions === "number").toBe(true);
+    expect(result.historical_exposure.high_risk_tokens_traded === null || typeof result.historical_exposure.high_risk_tokens_traded === "number").toBe(true);
   });
 
   // ── copy_trading structured object always present ──────────────────────────
@@ -374,7 +372,7 @@ describe("walletRisk", () => {
     vi.stubGlobal("fetch", makeFetch({ totalTxCount: 15, parsedTxs: [] }));
     const result = await walletRisk(WALLET);
     expect(result.win_rate_calculation_status).toMatch(
-      /^(NO_CLOSED_TRADES|DATA_UNAVAILABLE|INSUFFICIENT_TRADES)$/
+      /^(NO_CLOSED_TRADES|DATA_UNAVAILABLE|INSUFFICIENT_TRADES|HODL_ONLY)$/
     );
   });
 
@@ -435,11 +433,14 @@ describe("walletRisk", () => {
     const result = await walletRisk(WALLET);
     expect(result.funding_source).toMatchObject({
       funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
-      shared_funder_wallets: expect.any(Number),
       cluster_size: expect.any(Number),
       risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       risk_reason: expect.any(String),
       action_guidance: expect.any(String),
+    });
+    expect(Array.isArray(result.funding_source.shared_funder_wallets)).toBe(true);
+    (result.funding_source.shared_funder_wallets as unknown[]).forEach((w) => {
+      expect(typeof w).toBe("string");
     });
     // funder_address, funder_age_days, funder_tx_count can be null
     expect(
@@ -459,11 +460,11 @@ describe("walletRisk", () => {
     const result = await walletRisk(WALLET);
     expect(result.dusting_analysis).toMatchObject({
       dust_transactions_detected: expect.any(Number),
-      dust_senders: expect.any(Number),
       dusting_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|NONE)$/),
       meaning: expect.any(String),
       action_guidance: expect.any(String),
     });
+    expect(Array.isArray(result.dusting_analysis.dust_senders)).toBe(true);
     // most_recent_dust_timestamp is number or null
     expect(
       result.dusting_analysis.most_recent_dust_timestamp === null ||
@@ -533,10 +534,7 @@ describe("walletRisk", () => {
       }),
       score: expect.objectContaining({ overall: expect.any(Number) }),
       risk_signals: expect.any(Array),
-      historical_exposure: expect.objectContaining({
-        rug_interactions: expect.any(Number),
-        high_risk_tokens_traded: expect.any(Number),
-      }),
+      historical_exposure: expect.objectContaining({}),
       mev_victim_score: expect.any(Number),
       is_mev_bot: expect.any(Boolean),
       mev_bot_confidence: expect.any(Number),
@@ -556,9 +554,11 @@ describe("walletRisk", () => {
       funding_source: expect.objectContaining({
         funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
         risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+        shared_funder_wallets: expect.any(Array),
       }),
       dusting_analysis: expect.objectContaining({
         dust_transactions_detected: expect.any(Number),
+        dust_senders: expect.any(Array),
         dusting_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|NONE)$/),
       }),
       copy_trading: expect.objectContaining({
@@ -572,5 +572,8 @@ describe("walletRisk", () => {
       missing_fields: expect.any(Array),
       risk_summary: expect.any(String),
     });
+    const h = result.historical_exposure;
+    expect(h.rug_interactions === null || typeof h.rug_interactions === "number").toBe(true);
+    expect(h.high_risk_tokens_traded === null || typeof h.high_risk_tokens_traded === "number").toBe(true);
   });
 });
