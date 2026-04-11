@@ -536,6 +536,7 @@ export interface BirdeyeTokenPnL {
   total_invested_usd: number | null;
   current_value_usd: number | null;
   holding: number | null;
+  last_trade_unix_time: number | null;
 }
 
 export interface BirdeyeWalletPnLDetails {
@@ -583,6 +584,7 @@ export async function getBirdeyeWalletPnLDetails(
       tokens?: Array<{
         address?: string;
         symbol?: string;
+        last_trade_unix_time?: number;
         pnl?: {
           unrealized_usd?: number;
           unrealized_percent?: number;
@@ -626,6 +628,7 @@ export async function getBirdeyeWalletPnLDetails(
       total_invested_usd: t.cashflow_usd?.total_invested ?? null,
       current_value_usd: t.cashflow_usd?.current_value ?? null,
       holding: t.quantity?.holding ?? null,
+      last_trade_unix_time: t.last_trade_unix_time ?? null,
     }));
 
   const summary = json?.data?.summary;

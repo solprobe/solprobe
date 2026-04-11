@@ -171,7 +171,7 @@ export interface WalletRiskResult {
 
   // ── Copy-trade opportunity ────────────────────────────────────────────────
   copy_trading: {
-    worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+    worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN" | "NOT_APPLICABLE";
     confidence: number;       // 0.0–1.0; capped at 0.5 when sample_size < 50
     sample_size: number;
     key_signals: string[];
@@ -181,6 +181,7 @@ export interface WalletRiskResult {
   // ── Data quality ──────────────────────────────────────────────────────────
   data_quality: "FULL" | "PARTIAL" | "LIMITED";
   missing_fields: string[];
+  warnings: string[];
 
   risk_summary: string;
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
@@ -262,7 +263,7 @@ function resolveWinRateStatus(data: {
 // ---------------------------------------------------------------------------
 
 interface CopyTradingResult {
-  worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
+  worthiness: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN" | "NOT_APPLICABLE";
   confidence: number;
   sample_size: number;
   key_signals: string[];
@@ -279,7 +280,20 @@ function classifyCopyTrading(data: {
   rug_exit_rate_pct: number | null;
   is_bot: boolean;
   behavior_style: string;
+  wallet_activity_type: WalletActivityType;
 }): CopyTradingResult {
+  // FIX 6: HODLER wallets — copy-trade concept does not apply.
+  // Distinct from UNKNOWN (insufficient data); here the concept itself is inapplicable.
+  if (data.wallet_activity_type === "HODLER") {
+    return {
+      worthiness: "NOT_APPLICABLE",
+      confidence: 0,
+      sample_size: data.total_trades,
+      key_signals: [],
+      reason: "wallet is a buy-and-hold address with no trading activity — copy-trade signal not applicable",
+    };
+  }
+
   if (data.is_bot) {
     return {
       worthiness: "UNKNOWN", confidence: 0, sample_size: data.total_trades,
@@ -1320,6 +1334,7 @@ function buildWalletFactors(
   walletAgeDays: number | null,
   sniperScore: number,
   winRatePct: number | null,
+  winRateStatus: WinRateStatus,
   rugExitRatePct: number | null,
   fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW",
   isBot: boolean,
@@ -1335,8 +1350,14 @@ function buildWalletFactors(
     sf.push({ name: "sniper_score", value: sniperScore, impact: 0, interpretation: "low sniper activity" });
   }
 
-  if (winRatePct !== null && winRatePct > 80) {
+  // FIX 8: HODL_ONLY wallets have no sells — Birdeye returns 0 which is misleading.
+  // Treat as non-applicable rather than penalising.
+  if (winRateStatus === "HODL_ONLY") {
+    sf.push({ name: "win_rate", value: null, impact: 0, interpretation: "no closed trades — HODL wallet, win rate not applicable" });
+  } else if (winRatePct !== null && winRatePct > 80) {
     sf.push({ name: "win_rate", value: winRatePct, impact: 10, interpretation: "suspiciously high win rate — possible insider" });
+  } else if (winRatePct !== null && winRatePct === 0) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: -15, interpretation: "0% win rate with closed trades — poor performance" });
   } else {
     sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: winRatePct !== null ? "normal win rate" : "win rate unavailable" });
   }
@@ -1530,18 +1551,28 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   let { win_rate_pct: winRatePct, win_rate_calculation_status } = resolveWinRate(positions, parsedTxs);
   const avgHoldTimeHours = computeAvgHoldTime(positions);
 
+  // Pre-compute closed positions count before Birdeye override — needed by FIX 1 guard.
+  const closedCount = [...positions.values()].filter((p) => p.isClosed).length;
+  const has_any_sells = [...positions.values()].some((p) => p.solReceived > 0);
+
   // ── Override with Birdeye PnL data when available ─────────────────────────
   if (birdeyePnL !== null) {
     if (birdeyePnL.tokens_traded !== null) {
       tokensTradedLast30d = birdeyePnL.tokens_traded;
     }
-    if (birdeyePnL.win_rate_pct !== null) {
+    // FIX 1: Do not let Birdeye's misleading win_rate=0 override when there are no
+    // on-chain closed positions. Birdeye returns 0 for HODL-only wallets (no sells),
+    // but that's a sentinel, not a real 0% win rate. Only accept Birdeye's 0% when
+    // we can confirm closed positions exist; always accept non-zero values.
+    const birdeyeWinRateValid =
+      birdeyePnL.win_rate_pct !== null &&
+      win_rate_calculation_status !== "HODL_ONLY" &&
+      (birdeyePnL.win_rate_pct > 0 || closedCount > 0);
+    if (birdeyeWinRateValid) {
       winRatePct = birdeyePnL.win_rate_pct;
       win_rate_calculation_status = "CALCULATED";
     }
   }
-  const closedCount = [...positions.values()].filter((p) => p.isClosed).length;
-  const has_any_sells = [...positions.values()].some((p) => p.solReceived > 0);
 
   // Override status using correct semantics — DATA_UNAVAILABLE only on fetch failure
   // (Birdeye PnL override above may have already set CALCULATED; don't downgrade it)
@@ -1611,8 +1642,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     );
   }
 
-  // Warnings from funding source analysis — wired into the warnings array in Fix 10
-  void fundingSource._warnings;
+  // FIX 4: Collect funding source warnings; strip _warnings from the public shape.
+  const topLevelWarnings: string[] = [...fundingSource._warnings];
 
   const fundingWalletRisk = fundingSource.risk;  // backwards compat
 
@@ -1654,17 +1685,28 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const cappedConfidence = deriveConfidenceFromQuality(confidence, data_quality);
   const data_confidence = confidenceToString(cappedConfidence.model);
 
+  // FIX 7: Build missing_fields from final computed values, not intermediate fetch failures.
+  // tokens_traded_30d is sourced from Birdeye PnL when parsedTxs is null — only mark
+  // missing if the final value is still null.
   const missing_fields: string[] = [];
   if (sigs === null)                                                       missing_fields.push("signatures");
   if (accountInfo === null)                                                missing_fields.push("sol_balance");
   if (assetsResult.status !== "fulfilled" || assetsResult.value === null)  missing_fields.push("token_holdings");
-  if (parsedTxs === null)                                                  missing_fields.push("parsed_transactions", "tokens_traded_30d");
+  if (parsedTxs === null)                                                  missing_fields.push("parsed_transactions");
+  if (tokensTradedLast30d === null)                                        missing_fields.push("tokens_traded_30d");
   if (portfolio === null)                                                  missing_fields.push("birdeye_portfolio");
+  // FIX 5: rug_exit_rate_pct and historical_exposure are not computed within the SLA window.
+  // Promote them to warnings so callers know the gap exists and why.
   missing_fields.push("rug_exit_rate_pct", "historical_exposure");
+  topLevelWarnings.push(
+    "rug_exit_rate_pct not computed within SLA window — cross-token rug scan requires extended analysis",
+    "historical_exposure not computed within SLA window — requires full transaction history scan"
+  );
 
   // ── Scoring factors ───────────────────────────────────────────────────────
+  // FIX 8: Pass win_rate_calculation_status so the factor uses correct semantics.
   const factors = buildWalletFactors(
-    walletAgeDays, sniperScore, winRatePct, null,
+    walletAgeDays, sniperScore, winRatePct, win_rate_calculation_status, null,
     fundingWalletRisk, isBot, whaleStatus
   );
 
@@ -1713,8 +1755,32 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     return uniqueDays.size;
   }
 
-  const activeDays: number | null = parsedTxs !== null ? calculateActiveDays(parsedTxs) : null;
-  if (parsedTxs === null) missing_fields.push("active_days");
+  // FIX 2: resolveActiveDays — Helius txs primary, Birdeye PnL token timestamps secondary.
+  // Returns null only when neither source has timestamp data.
+  function resolveActiveDays(
+    transactions: ParsedTx[] | null,
+    tokenPnLDetails: BirdeyeWalletPnLDetails | null
+  ): number | null {
+    // Non-null means Helius responded (even with 0 txs) — use it as authoritative.
+    if (transactions !== null) {
+      return calculateActiveDays(transactions);
+    }
+    // Secondary: derive unique active days from Birdeye per-token last_trade timestamps
+    if (tokenPnLDetails !== null && tokenPnLDetails.tokens.length > 0) {
+      const uniqueDays = new Set<string>();
+      for (const t of tokenPnLDetails.tokens) {
+        if (t.last_trade_unix_time !== null) {
+          const d = new Date(t.last_trade_unix_time * 1000);
+          uniqueDays.add(`${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`);
+        }
+      }
+      // Only return a count if we have at least one timestamp; otherwise stay null.
+      if (uniqueDays.size > 0) return uniqueDays.size;
+    }
+    return null;
+  }
+
+  const activeDays: number | null = resolveActiveDays(parsedTxs, pnlDetails);
 
   const lastActiveSig = sigs && sigs.length > 0 ? sigs[0] : null;
   const lastActiveHoursAgo =
@@ -1738,6 +1804,26 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     portfolio_has_holdings,
   });
 
+  // ── HODLER win-rate correction ────────────────────────────────────────────
+  // wallet_activity_type is now known. If the wallet is HODLER but win_rate was
+  // computed as CALCULATED (possible when tokens were transferred out without
+  // receiving SOL — isClosed=true but solReceived=0, so has_any_sells=false),
+  // the 0% win rate is a data artefact, not a real signal. Force HODL_ONLY and
+  // patch the factors[] entry that was built before this determination was available.
+  if (wallet_activity_type === "HODLER" && win_rate_calculation_status !== "HODL_ONLY") {
+    winRatePct = null;
+    win_rate_calculation_status = "HODL_ONLY";
+    const wrIdx = factors.findIndex((f) => f.name === "win_rate");
+    if (wrIdx >= 0) {
+      factors[wrIdx] = {
+        name: "win_rate",
+        value: null,
+        impact: 0,
+        interpretation: "no closed trades — HODL wallet, win rate not applicable",
+      };
+    }
+  }
+
   // ── Consistency (approximated from closed count vs tokens traded) ─────────
   const consistency: "LOW" | "MEDIUM" | "HIGH" =
     closedCount >= 10 && tokensTradedLast30d !== null && tokensTradedLast30d > 0
@@ -1745,7 +1831,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       : "LOW";
 
   // ── FEATURE 6: Extended behavior profile ──────────────────────────────────
-  const behaviorProfile = deriveBehaviorProfile({
+  const rawBehaviorProfile = deriveBehaviorProfile({
     isBot,
     sniperScore,
     avgHoldTimeHours,
@@ -1760,6 +1846,29 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     fundingSourceType: fundingSource.funder_type,
     consistency,
   });
+
+  // FIX 3: syncBehaviorStyle — ensure behavior.style matches wallet_activity_type
+  // when the activity type is definitively HODLER. deriveBehaviorProfile may return
+  // INCONCLUSIVE for HODL wallets because avgHoldTimeHours is null (no sells to measure).
+  // BOT/INSIDER/BUNDLER take precedence over the activity-type override.
+  const behaviorProfile: BehaviorProfile = (() => {
+    if (
+      wallet_activity_type === "HODLER" &&
+      rawBehaviorProfile.style !== "BOT" &&
+      rawBehaviorProfile.style !== "INSIDER" &&
+      rawBehaviorProfile.style !== "BUNDLER"
+    ) {
+      return {
+        ...rawBehaviorProfile,
+        style: "HODLER" as const,
+        consistency: "HIGH" as const,
+        style_confidence: 0.9,
+        style_evidence: [...rawBehaviorProfile.style_evidence, "wallet_activity_type=HODLER"],
+        profile_summary: "hodler — long-term holder with infrequent trading",
+      };
+    }
+    return rawBehaviorProfile;
+  })();
 
   // ── Risk signals ──────────────────────────────────────────────────────────
   const risk_signals: Array<{ name: string; impact: "LOW" | "MEDIUM" | "HIGH"; reason: string }> = [];
@@ -1807,6 +1916,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     rug_exit_rate_pct: null,
     is_bot: isBot,
     behavior_style: behaviorProfile.style,
+    wallet_activity_type,
   });
 
   // ── LLM summary ───────────────────────────────────────────────────────────
@@ -1875,7 +1985,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     is_bot: isBot,
     whale_status: whaleStatus,
     funding_wallet_risk: fundingWalletRisk,           // backwards compat
-    funding_source: fundingSource,
+    // FIX 4: Strip internal _warnings field before returning.
+    funding_source: (({ _warnings: _w, ...rest }) => rest)(fundingSource),
 
     // ── Wallet activity type ────────────────────────────────────────────────
     wallet_activity_type,
@@ -1919,6 +2030,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     // ── Data quality ────────────────────────────────────────────────────────
     data_quality,
     missing_fields,
+    warnings: topLevelWarnings,
 
     risk_summary,
     data_confidence,
