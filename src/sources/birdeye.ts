@@ -512,6 +512,134 @@ export async function getBirdeyeHolderList(
 }
 
 // ---------------------------------------------------------------------------
+// Wallet PnL details — Birdeye POST /wallet/v2/pnl/details
+// Fields verified via live curl on 2026-04-11:
+//   .data.tokens[n].address
+//   .data.tokens[n].symbol
+//   .data.tokens[n].pnl.unrealized_usd
+//   .data.tokens[n].pnl.unrealized_percent
+//   .data.tokens[n].pnl.realized_profit_usd
+//   .data.tokens[n].pnl.total_usd
+//   .data.tokens[n].cashflow_usd.total_invested
+//   .data.tokens[n].cashflow_usd.current_value
+//   .data.tokens[n].quantity.holding
+//   .data.summary.pnl.unrealized_usd  (same as summary endpoint)
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeTokenPnL {
+  address: string;
+  symbol: string | null;
+  unrealized_usd: number | null;
+  unrealized_percent: number | null;
+  realized_profit_usd: number | null;
+  total_usd: number | null;
+  total_invested_usd: number | null;
+  current_value_usd: number | null;
+  holding: number | null;
+}
+
+export interface BirdeyeWalletPnLDetails {
+  tokens: BirdeyeTokenPnL[];
+  total_unrealized_usd: number | null;
+  total_realized_usd: number | null;
+  total_pnl_usd: number | null;
+  tokens_with_unrealized: number;
+  source: "birdeye_pnl_details";
+}
+
+export async function getBirdeyeWalletPnLDetails(
+  walletAddress: string,
+  options: { timeout: number }
+): Promise<BirdeyeWalletPnLDetails | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const start = Date.now();
+  const url = `https://public-api.birdeye.so/wallet/v2/pnl/details`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "X-API-KEY": apiKey, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ wallet: walletAddress }),
+      signal: AbortSignal.timeout(options.timeout),
+    });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  const json = await res.json() as {
+    data?: {
+      tokens?: Array<{
+        address?: string;
+        symbol?: string;
+        pnl?: {
+          unrealized_usd?: number;
+          unrealized_percent?: number;
+          realized_profit_usd?: number;
+          total_usd?: number;
+        };
+        cashflow_usd?: {
+          total_invested?: number;
+          current_value?: number;
+        };
+        quantity?: { holding?: number };
+      }>;
+      summary?: {
+        pnl?: {
+          unrealized_usd?: number;
+          realized_profit_usd?: number;
+          total_usd?: number;
+        };
+      };
+    };
+  };
+
+  const rawTokens = json?.data?.tokens ?? [];
+  if (rawTokens.length === 0 && !json?.data?.summary) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  recordSuccess("birdeye");
+
+  const tokens: BirdeyeTokenPnL[] = rawTokens
+    .filter((t): t is typeof t & { address: string } => typeof t.address === "string")
+    .map((t) => ({
+      address: t.address,
+      symbol: t.symbol ?? null,
+      unrealized_usd: t.pnl?.unrealized_usd ?? null,
+      unrealized_percent: t.pnl?.unrealized_percent ?? null,
+      realized_profit_usd: t.pnl?.realized_profit_usd ?? null,
+      total_usd: t.pnl?.total_usd ?? null,
+      total_invested_usd: t.cashflow_usd?.total_invested ?? null,
+      current_value_usd: t.cashflow_usd?.current_value ?? null,
+      holding: t.quantity?.holding ?? null,
+    }));
+
+  const summary = json?.data?.summary;
+  return {
+    tokens,
+    total_unrealized_usd: summary?.pnl?.unrealized_usd ?? null,
+    total_realized_usd: summary?.pnl?.realized_profit_usd ?? null,
+    total_pnl_usd: summary?.pnl?.total_usd ?? null,
+    tokens_with_unrealized: tokens.filter((t) => (t.unrealized_usd ?? 0) !== 0).length,
+    source: "birdeye_pnl_details",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Wallet PnL summary — Birdeye /wallet/v2/pnl/summary
 // Fields verified via live curl on 2026-04-08:
 //   .data.summary.pnl.realized_profit_usd

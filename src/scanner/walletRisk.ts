@@ -3,8 +3,10 @@ import { getDexScreenerToken } from "../sources/dexscreener.js";
 import {
   getBirdeyeWalletPortfolio,
   getBirdeyeWalletPnL,
+  getBirdeyeWalletPnLDetails,
   type BirdeyeWalletPortfolioItem,
   type BirdeyeWalletPnLSummary,
+  type BirdeyeWalletPnLDetails,
 } from "../sources/birdeye.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
 import type { ScoringFactor } from "./types.js";
@@ -88,7 +90,7 @@ export interface WalletRiskResult {
   activity: {
     wallet_age_days: number | null;
     total_trades: number;
-    active_days: number;
+    active_days: number | null;
     last_active_hours_ago: number | null;
   };
 
@@ -626,7 +628,8 @@ function estimateStructuredPnL(
   positions: Map<string, TokenPosition>,
   solPriceUsd: number,
   portfolio: BirdeyeWalletPortfolioItem[] | null,
-  birdeyePnL: BirdeyeWalletPnLSummary | null
+  birdeyePnL: BirdeyeWalletPnLSummary | null,
+  pnlDetails: BirdeyeWalletPnLDetails | null
 ): { pnl: StructuredPnL; largestLoss: number | null } {
 
   // ── PRIMARY: Birdeye PnL API ──────────────────────────────────────────────
@@ -634,6 +637,29 @@ function estimateStructuredPnL(
     const spamResult = portfolio !== null
       ? filterSpamTokens(portfolio)
       : { clean: [], spam_filtered: 0 };
+
+    // Compute unrealized_pnl_pct from per-token details when available.
+    // Weight by total_invested_usd so large positions dominate the average.
+    let unrealized_pnl_pct: number | null = null;
+    if (pnlDetails !== null && pnlDetails.tokens.length > 0) {
+      let totalInvested = 0;
+      let weightedPct = 0;
+      for (const t of pnlDetails.tokens) {
+        const invested = t.total_invested_usd ?? 0;
+        const pct = t.unrealized_percent ?? null;
+        if (invested > 0 && pct !== null) {
+          weightedPct += pct * invested;
+          totalInvested += invested;
+        }
+      }
+      if (totalInvested > 0) {
+        unrealized_pnl_pct = Math.round((weightedPct / totalInvested) * 100) / 100;
+      }
+    }
+
+    const positions_analysed = pnlDetails !== null
+      ? pnlDetails.tokens.length
+      : (birdeyePnL.total_trades ?? 0);
 
     return {
       pnl: {
@@ -643,13 +669,15 @@ function estimateStructuredPnL(
         unrealized_pnl_usdc: birdeyePnL.total_unrealized_pnl_usd !== null
           ? Math.round(birdeyePnL.total_unrealized_pnl_usd * 100) / 100
           : null,
-        unrealized_pnl_pct: null,   // not returned by PnL summary endpoint
+        unrealized_pnl_pct,
         total_pnl_usdc: birdeyePnL.total_pnl_usd !== null
           ? Math.round(birdeyePnL.total_pnl_usd * 100) / 100
           : null,
-        positions_analysed: birdeyePnL.total_trades ?? 0,
+        positions_analysed,
         cost_basis_method: "BIRDEYE_API",
-        method_description: "Realized and unrealized PnL from Birdeye wallet analytics API",
+        method_description: pnlDetails !== null
+          ? "Realized and unrealized PnL from Birdeye wallet analytics API (per-token details)"
+          : "Realized and unrealized PnL from Birdeye wallet analytics API",
         calculation_note: null,
         spam_token_filter_applied: portfolio !== null,
         filtered_spam_count: spamResult.spam_filtered,
@@ -1409,8 +1437,8 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const fetchStart = Date.now();
   const SLA_ABORT_MS = fetchStart + 16_000;
 
-  // ── Phase 1: 7 parallel calls ────────────────────────────────────────────
-  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult, birdeyePnLResult] =
+  // ── Phase 1: 8 parallel calls ────────────────────────────────────────────
+  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult, birdeyePnLResult, pnlDetailsResult] =
     await Promise.allSettled([
       // 1. Recent signatures — wallet age + total tx count
       rpcWithFallback<any[]>(
@@ -1432,10 +1460,12 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       fetchParsedTransactions(address, 8000),
       // 5. SOL price — needed for PnL estimation
       getDexScreenerToken(WSOL, { timeout: 4000 }),
-      // 6. Birdeye wallet portfolio — needed for unrealized PnL
+      // 6. Birdeye wallet portfolio — needed for unrealized PnL fallback
       getBirdeyeWalletPortfolio(address, { timeout: 4000 }),
-      // 7. Birdeye PnL summary — primary PnL source
+      // 7. Birdeye PnL summary — primary PnL source (win rate, totals)
       getBirdeyeWalletPnL(address, { timeout: 6000 }),
+      // 8. Birdeye PnL details — per-token breakdown for unrealized_pnl_pct
+      getBirdeyeWalletPnLDetails(address, { timeout: 6000 }),
     ]);
 
   if (sigsResult.status     === "rejected") logError("getSignaturesForAddress", sigsResult.reason);
@@ -1465,6 +1495,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
   const birdeyePnL: BirdeyeWalletPnLSummary | null =
     birdeyePnLResult.status === "fulfilled" ? birdeyePnLResult.value : null;
+
+  const pnlDetails: BirdeyeWalletPnLDetails | null =
+    pnlDetailsResult.status === "fulfilled" ? pnlDetailsResult.value : null;
 
   // ── Basic signals from signatures ────────────────────────────────────────
   const totalTx = sigs?.length ?? 0;
@@ -1521,8 +1554,11 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   }
 
   // ── Structured PnL ────────────────────────────────────────────────────────
-  const { pnl, largestLoss } = positions.size > 0
-    ? estimateStructuredPnL(positions, solPriceUsd, portfolio, birdeyePnL)
+  // Gate: call estimateStructuredPnL when we have on-chain positions OR Birdeye
+  // PnL data. Without this, wallets with no parsed transactions but real Birdeye
+  // PnL data (e.g. HODL-only wallets) would always return positions_analysed: 0.
+  const { pnl, largestLoss } = positions.size > 0 || birdeyePnL !== null || pnlDetails !== null
+    ? estimateStructuredPnL(positions, solPriceUsd, portfolio, birdeyePnL, pnlDetails)
     : {
         pnl: {
           realized_pnl_usdc: null,
@@ -1677,7 +1713,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     return uniqueDays.size;
   }
 
-  const activeDays = parsedTxs !== null ? calculateActiveDays(parsedTxs) : 0;
+  const activeDays: number | null = parsedTxs !== null ? calculateActiveDays(parsedTxs) : null;
   if (parsedTxs === null) missing_fields.push("active_days");
 
   const lastActiveSig = sigs && sigs.length > 0 ? sigs[0] : null;

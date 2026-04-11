@@ -283,7 +283,7 @@ export interface WalletRiskData {
   activity?: {
     wallet_age_days: number | null;
     total_trades: number;
-    active_days: number;
+    active_days: number | null;
     last_active_hours_ago: number | null;
   };
   wallet_age_days: number | null;
@@ -311,8 +311,11 @@ export function fallbackWalletRiskSummary(data: WalletRiskData): string {
 }
 
 export async function generateWalletRiskSummary(data: WalletRiskData): Promise<string> {
-  const system =
-    "You are a DeFi counterparty risk analyst. Output exactly one sentence assessing wallet risk. Reference the most impactful risk factor from the factors list when available. Never hedge or use qualifiers like 'appears to' or 'may be'. Be specific and direct.";
+  const isHodler = data.trading_style === "hodler";
+
+  const system = isHodler
+    ? "You are a DeFi counterparty risk analyst. This wallet is a long-term holder with no sell transactions — win rate is inapplicable. Output exactly one sentence describing: (1) how long the wallet has held, (2) unrealized position size if known, (3) counterparty risk classification. Never say 'win rate unknown' for hodlers — instead say 'no exits recorded'. Never use 'strong', 'safe', or 'excellent'."
+    : "You are a DeFi counterparty risk analyst. Output exactly one sentence assessing wallet risk. Reference the most impactful risk factor from the factors list when available. Never hedge or use qualifiers like 'appears to' or 'may be'. Be specific and direct. Never use 'strong', 'safe', or 'excellent'.";
 
   const topFactors = [...(data.factors ?? [])]
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
@@ -322,12 +325,16 @@ export async function generateWalletRiskSummary(data: WalletRiskData): Promise<s
     ? `\n\nTop risk factors:\n${topFactors.map(f => `- ${f.name}: ${f.value} (impact: ${f.impact}) — ${f.interpretation}`).join("\n")}`
     : "";
 
+  const winRateLine = isHodler
+    ? "Trading pattern: long-term holder — no sell transactions recorded, win rate not applicable."
+    : `Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}.`;
+
   const userMsg = [
     `Wallet age: ${data.wallet_age_days != null ? Math.round(data.wallet_age_days) + " days" : "unknown"}.`,
     `Trading style: ${data.trading_style}.`,
-    `Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}.`,
+    winRateLine,
     `Sniper score: ${data.sniper_score}/100.`,
-    `Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "unknown"}.`,
+    `Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "not applicable (no exits)"}.`,
     `Funding risk: ${data.funding_wallet_risk}.`,
     `Risk score: ${data.risk_score}/100.`,
     `Is bot: ${data.is_bot}.`,
