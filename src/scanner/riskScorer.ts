@@ -1,5 +1,5 @@
 import type { LPModel, LPStatus } from "../sources/dexscreener.js";
-import type { ScoringFactor, HistoricalFlag } from "./types.js";
+import type { ScoringFactor, HistoricalFlag, FunderType } from "./types.js";
 
 export type { ScoringFactor };
 
@@ -20,6 +20,10 @@ export interface RiskFactors {
   dex_id: string | null;                    // dexId of the primary pair
   dev_wallet_age_days: number | null;       // deep dive only; null for quick scan
   launch_pattern?: "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN"; // quick scan only
+  // Deep dive adjusted holder concentration (protocol addresses excluded)
+  adjusted_top_10_holder_pct?: number | null;
+  // Dev wallet funding source type (deep dive only)
+  dev_funder_type?: FunderType | null;
   // Deep dive supplemental signals
   is_mutable_metadata?: boolean | null;             // Birdeye token_security.mutableMetadata
   update_authority_is_deployer?: boolean | null;    // metaplexUpdateAuthority === creatorAddress
@@ -120,6 +124,35 @@ export function calculateRiskGrade(
         value: factors.top_10_holder_pct,
         impact: 0,
         interpretation: `top-10 hold ${holderPct.toFixed(0)}% — healthy distribution`,
+      });
+    }
+  }
+
+  // Adjusted holder concentration (protocol/DEX addresses excluded) — deep dive only, not exempt
+  if (!exempt && factors.adjusted_top_10_holder_pct != null) {
+    const adj = factors.adjusted_top_10_holder_pct;
+    if (adj > 40) {
+      score -= 25;
+      sf.push({
+        name: "adjusted_holder_concentration",
+        value: adj,
+        impact: -25,
+        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — high insider concentration`,
+      });
+    } else if (adj > 20) {
+      score -= 10;
+      sf.push({
+        name: "adjusted_holder_concentration",
+        value: adj,
+        impact: -10,
+        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — elevated insider concentration`,
+      });
+    } else {
+      sf.push({
+        name: "adjusted_holder_concentration",
+        value: adj,
+        impact: 0,
+        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — normal after exclusions`,
       });
     }
   }
@@ -441,6 +474,22 @@ export function calculateRiskGrade(
         impact: 0,
         interpretation: "no post-launch minting detected",
       });
+    }
+  }
+
+  // Dev wallet funding source (deep dive only — undefined when not fetched)
+  if (factors.dev_funder_type !== undefined && factors.dev_funder_type !== null) {
+    if (factors.dev_funder_type === "MIXER") {
+      score -= 25;
+      sf.push({ name: "dev_funding_source", value: "MIXER", impact: -25, interpretation: "dev wallet funded via mixer — anonymous funding chain" });
+    } else if (factors.dev_funder_type === "DEPLOYER") {
+      score -= 15;
+      sf.push({ name: "dev_funding_source", value: "DEPLOYER", impact: -15, interpretation: "dev wallet funded by deployer-pattern wallet" });
+    } else if (factors.dev_funder_type === "FRESH_WALLET") {
+      score -= 10;
+      sf.push({ name: "dev_funding_source", value: "FRESH_WALLET", impact: -10, interpretation: "dev wallet funded by fresh wallet — possible proxy" });
+    } else {
+      sf.push({ name: "dev_funding_source", value: factors.dev_funder_type, impact: 0, interpretation: `dev funding source: ${factors.dev_funder_type}` });
     }
   }
 

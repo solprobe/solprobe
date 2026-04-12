@@ -9,7 +9,8 @@ import {
   type BirdeyeWalletPnLDetails,
 } from "../sources/birdeye.js";
 import { calculateConfidence, confidenceToString } from "./riskScorer.js";
-import type { ScoringFactor } from "./types.js";
+import type { ScoringFactor, FunderType, FundingSource } from "./types.js";
+import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
 import {
   generateWalletRiskSummary,
   fallbackWalletRiskSummary,
@@ -37,26 +38,8 @@ export type WalletActivityType =
   | "NEW_WALLET"
   | "UNKNOWN";
 
-export type FunderType =
-  | "CEX"
-  | "MIXER"
-  | "FRESH_WALLET"
-  | "DEPLOYER"
-  | "KNOWN_PROTOCOL"
-  | "PEER_WALLET"
-  | "UNKNOWN";
-
-export interface FundingSource {
-  funder_address: string | null;
-  funder_type: FunderType;
-  funder_age_days: number | null;
-  funder_tx_count: number | null;
-  shared_funder_wallets: string[];
-  cluster_size: number;
-  risk: "HIGH" | "MEDIUM" | "LOW";
-  risk_reason: string;
-  action_guidance: string;
-}
+// FunderType and FundingSource are defined in types.ts — re-exported for backwards compat
+export type { FunderType, FundingSource } from "./types.js";
 
 export interface DustingAnalysis {
   dust_transactions_detected: number;
@@ -838,25 +821,6 @@ function deriveWalletActivityType(data: {
 // FIX 4: Structured funding source
 // ---------------------------------------------------------------------------
 
-function validateFunderAge(
-  funderCreatedAt: number | null,
-  fundingTxTimestamp: number | null
-): number | null {
-  if (funderCreatedAt === null) return null;
-  if (fundingTxTimestamp === null) return null;
-
-  // Funder must have been created before the funding transaction
-  if (funderCreatedAt > fundingTxTimestamp) {
-    console.warn(
-      `[wallet_risk] funder_age invalid: created=${funderCreatedAt} ` +
-      `after funding_tx=${fundingTxTimestamp} — setting to null`
-    );
-    return null;
-  }
-
-  const ageMs = Date.now() - funderCreatedAt * 1000;
-  return Math.floor(ageMs / (1000 * 60 * 60 * 24));
-}
 
 interface FundingSourceResult extends FundingSource {
   _warnings: string[];
@@ -867,144 +831,8 @@ async function getFundingSource(
   oldestSig: string | null,
   timeoutMs: number
 ): Promise<FundingSourceResult> {
-  const _default: FundingSourceResult = {
-    funder_address: null,
-    funder_type: "UNKNOWN",
-    funder_age_days: null,
-    funder_tx_count: null,
-    shared_funder_wallets: [],
-    cluster_size: 1,
-    risk: "MEDIUM",
-    risk_reason: "funder details unavailable",
-    action_guidance: "verify funding source manually before high-value trades",
-    _warnings: [],
-  };
-
-  if (!oldestSig) return _default;
-
-  try {
-    const tx = await rpcWithFallback<any>(
-      {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTransaction",
-        params: [oldestSig, { encoding: "json", maxSupportedTransactionVersion: 0 }],
-      },
-      timeoutMs
-    );
-    if (!tx) return _default;
-
-    const fundingTxTimestamp: number | null =
-      typeof tx.blockTime === "number" ? tx.blockTime : null;
-
-    const accountKeys: string[] = tx.transaction?.message?.accountKeys ?? [];
-    const preBalances: number[] = tx.meta?.preBalances ?? [];
-    const postBalances: number[] = tx.meta?.postBalances ?? [];
-    const walletIdx = accountKeys.indexOf(walletAddress);
-    if (walletIdx === -1) return _default;
-
-    let funderIdx = -1;
-    for (let i = 0; i < accountKeys.length; i++) {
-      if (i === walletIdx) continue;
-      if ((postBalances[i] ?? 0) - (preBalances[i] ?? 0) < 0) {
-        funderIdx = i;
-        break;
-      }
-    }
-    if (funderIdx === -1) return _default;
-
-    const funderAddress = accountKeys[funderIdx];
-
-    const funderSigs = await rpcWithFallback<any[]>(
-      {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "getSignaturesForAddress",
-        params: [funderAddress, { limit: 200 }],
-      },
-      timeoutMs
-    );
-
-    if (!funderSigs || funderSigs.length === 0) {
-      return {
-        funder_address: funderAddress,
-        funder_type: "FRESH_WALLET",
-        funder_age_days: null,
-        funder_tx_count: 0,
-        shared_funder_wallets: [],
-        cluster_size: 1,
-        risk: "HIGH",
-        risk_reason: "funded by brand-new wallet with zero transaction history",
-        action_guidance: "treat as high-risk — fresh wallets are common deployer proxies",
-        _warnings: [],
-      };
-    }
-
-    const funderTxCount = funderSigs.length;
-    const oldest = funderSigs[funderSigs.length - 1];
-    const funderCreatedAt: number | null =
-      typeof oldest?.blockTime === "number" ? oldest.blockTime : null;
-
-    const warnings: string[] = [];
-    const funderAgeDays = validateFunderAge(funderCreatedAt, fundingTxTimestamp);
-    if (funderAgeDays === null && funderCreatedAt !== null) {
-      warnings.push("funder_age_validation_failed");
-    }
-
-    // Classify funder type
-    let funder_type: FunderType;
-    if (funderTxCount > 10_000) {
-      funder_type = "CEX";
-    } else if (funderAgeDays !== null && funderAgeDays < 3 && funderTxCount < 10) {
-      funder_type = "FRESH_WALLET";
-    } else if (funderAgeDays !== null && funderAgeDays < 30 && funderTxCount < 100) {
-      funder_type = "DEPLOYER";
-    } else {
-      funder_type = "PEER_WALLET";
-    }
-
-    // Risk classification
-    let risk: "HIGH" | "MEDIUM" | "LOW";
-    let risk_reason: string;
-    let action_guidance: string;
-
-    if (funder_type === "FRESH_WALLET") {
-      risk = "HIGH";
-      risk_reason = "funder is a fresh wallet (<3 days, <10 txns) — probable deployer proxy";
-      action_guidance = "avoid high-value trades — fresh funder chain is a common rug setup";
-    } else if (funder_type === "DEPLOYER") {
-      risk = "HIGH";
-      risk_reason = "funder has deployer-like activity pattern (<30 days, <100 txns)";
-      action_guidance = "verify funder is not associated with token deployers you are trading";
-    } else if (funder_type === "CEX") {
-      risk = "LOW";
-      risk_reason = "funded from a high-volume account (likely CEX withdrawal)";
-      action_guidance = "no unusual funding risk detected";
-    } else if (funderAgeDays !== null && funderAgeDays > 365) {
-      risk = "LOW";
-      risk_reason = "funded by an aged wallet (>1 year) — low chain risk";
-      action_guidance = "no unusual funding risk detected";
-    } else {
-      risk = "MEDIUM";
-      risk_reason = "funder is a peer wallet with limited history";
-      action_guidance = "standard caution — no specific risk signal detected";
-    }
-
-    return {
-      funder_address: funderAddress,
-      funder_type,
-      funder_age_days: funderAgeDays,
-      funder_tx_count: funderTxCount,
-      shared_funder_wallets: [],  // cluster detection beyond single hop is outside SLA
-      cluster_size: 1,
-      risk,
-      risk_reason,
-      action_guidance,
-      _warnings: warnings,
-    };
-  } catch {
-    return _default;
-  }
+  const result = await classifyWalletFundingSource(walletAddress, oldestSig, timeoutMs);
+  return { ...result, _warnings: [] };
 }
 
 // ---------------------------------------------------------------------------

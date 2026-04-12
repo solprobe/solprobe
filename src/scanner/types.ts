@@ -46,7 +46,8 @@ export type HistoricalFlag =
   | "SUSPICIOUS_LAUNCH_PATTERN"          // stealth launch + sniper concentration
   | "SAME_BLOCK_LAUNCH"                  // mint and pool created in same block
   | "MUTABLE_METADATA"                   // token metadata is mutable post-launch (deep dive only)
-  | "AUTHORITY_REGRANTED";               // mint authority was regranted after revocation (deep dive only)
+  | "AUTHORITY_REGRANTED"               // mint authority was regranted after revocation (deep dive only)
+  | "DEV_MIXER_FUNDED";                  // dev wallet funded via known mixer pattern (deep dive only)
 
 /**
  * Top contributing factor in agent-friendly shape (deep dive only).
@@ -105,6 +106,47 @@ export interface TradingVelocity {
   /** True when usd_per_tx < $1 AND txns_per_hour > 500 — probable bot wash activity. */
   bot_activity_flag: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Wallet Funding Source Types (walletRisk.ts + deepDive.ts)
+// ---------------------------------------------------------------------------
+
+export type FunderType =
+  | "CEX"
+  | "MIXER"
+  | "FRESH_WALLET"
+  | "DEPLOYER"
+  | "KNOWN_PROTOCOL"
+  | "PEER_WALLET"
+  | "UNKNOWN";
+
+export interface FundingSource {
+  funder_address: string | null;
+  funder_type: FunderType;
+  funder_age_days: number | null;
+  funder_tx_count: number | null;
+  shared_funder_wallets: string[];
+  cluster_size: number;
+  risk: "HIGH" | "MEDIUM" | "LOW";
+  risk_reason: string;
+  action_guidance: string;
+}
+
+// ---------------------------------------------------------------------------
+// Holder Concentration Types (deepDive.ts only)
+// ---------------------------------------------------------------------------
+
+export type ExclusionCategory = "BURN" | "DEX_POOL" | "CEX" | "KNOWN_PROTOCOL" | "INSIDER";
+
+export interface AdjustedHolderConcentration {
+  adjusted_top_10_pct: number | null;
+  excluded_count: number;
+  excluded_pct: number;
+  exclusions: Array<{ address: string; category: ExclusionCategory; pct: number }>;
+  method: "BIRDEYE_SUPPLY" | "RUGCHECK_FALLBACK" | "UNAVAILABLE";
+}
+
+// ---------------------------------------------------------------------------
 
 /** Multi-timeframe momentum alignment composite. */
 export interface MomentumAlignment {

@@ -512,6 +512,66 @@ export async function getBirdeyeHolderList(
 }
 
 // ---------------------------------------------------------------------------
+// Top holders with token_account field — for deepDive adjusted concentration
+// Fields verified via live curl on 2026-04-12:
+//   .data.items[n].owner = "..." (wallet/program address)
+//   .data.items[n].token_account = "..." (ATA address)
+//   .data.items[n].ui_amount = number (human-readable balance)
+//   NOTE: percentage field is null — must compute from total_supply
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeTopHolder {
+  owner: string;
+  token_account: string;
+  ui_amount: number;
+}
+
+export async function getBirdeyeTopHolders(
+  address: string,
+  limit = 20,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeTopHolder[] | null> {
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const url = `https://public-api.birdeye.so/defi/v3/token/holder?address=${encodeURIComponent(address)}&limit=${limit}`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: { items?: Array<{ owner?: string; token_account?: string; ui_amount?: number }> };
+  };
+
+  if (!json.success || !json.data?.items) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  return json.data.items
+    .filter((item): item is { owner: string; token_account: string; ui_amount: number } =>
+      typeof item.owner === "string" &&
+      typeof item.token_account === "string" &&
+      typeof item.ui_amount === "number"
+    )
+    .map((item) => ({ owner: item.owner, token_account: item.token_account, ui_amount: item.ui_amount }));
+}
+
+// ---------------------------------------------------------------------------
 // Wallet PnL details — Birdeye POST /wallet/v2/pnl/details
 // Fields verified via live curl on 2026-04-11:
 //   .data.tokens[n].address

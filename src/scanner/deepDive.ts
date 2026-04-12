@@ -1,7 +1,7 @@
 import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory } from "../sources/helius.js";
-import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList } from "../sources/birdeye.js";
+import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
   calculateRiskGrade,
@@ -10,7 +10,8 @@ import {
   buildHistoricalFlags,
   type RiskFactors,
 } from "./riskScorer.js";
-import type { ScoringFactor, HistoricalFlag, KeyDriver } from "./types.js";
+import type { ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory, FundingSource } from "./types.js";
+import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
@@ -32,6 +33,8 @@ export interface DevWalletAnalysis {
   created_tokens_count: number | null;
   previous_rugs: boolean;
   is_protocol_address?: boolean;
+  funding_source: FundingSource | null;
+  funding_risk_note: string | null;
 }
 
 export interface LiquidityLockStatus {
@@ -141,6 +144,8 @@ export interface DeepDiveResult {
   data_quality: "FULL" | "PARTIAL" | "LIMITED";
   /** Fields that could not be populated */
   missing_fields: string[];
+  /** Holder concentration after excluding burn/DEX/protocol addresses */
+  adjusted_holder_concentration: AdjustedHolderConcentration;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +302,69 @@ function logError(source: string, reason: unknown, address: string): void {
   console.error(`${ts} source=${source} address=${address} error=${msg}`);
 }
 
+// Known DEX program owners — their ATAs are DEX_POOL, not INSIDER
+const DEX_PROGRAMS = new Set([
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // Raydium AMM V4
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Orca Whirlpool
+  "LBUZKhRxPF3XUpBCjp4YzTKgLLjLsrHnHDEhGSoeVJu",  // Meteora DLMM
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun
+]);
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
+
+async function classifyHolderAddress(ownerAddress: string, timeoutMs: number): Promise<ExclusionCategory> {
+  // Burn addresses have no account
+  const result = await rpcCall("getAccountInfo", [ownerAddress, { encoding: "base58" }], timeoutMs);
+  if (result?.value === null || result?.value === undefined) return "BURN";
+  const accountOwner: string | undefined = result?.value?.owner;
+  if (!accountOwner) return "INSIDER";
+  if (DEX_PROGRAMS.has(accountOwner)) return "DEX_POOL";
+  if (accountOwner === SYSTEM_PROGRAM) return "INSIDER";
+  return "INSIDER";
+}
+
+async function computeAdjustedConcentration(
+  holders: Array<{ owner: string; ui_amount: number }>,
+  totalSupply: number | null
+): Promise<AdjustedHolderConcentration> {
+  if (totalSupply === null || totalSupply === 0 || holders.length === 0) {
+    return { adjusted_top_10_pct: null, excluded_count: 0, excluded_pct: 0, exclusions: [], method: "UNAVAILABLE" };
+  }
+
+  // Classify all holders in parallel (1500ms each, 6000ms total budget)
+  const classifications = await Promise.allSettled(
+    holders.map(h => classifyHolderAddress(h.owner, 1500))
+  );
+
+  const exclusions: AdjustedHolderConcentration["exclusions"] = [];
+  let excludedPct = 0;
+  let adjustedPct = 0;
+  let insiderCount = 0;
+
+  for (let i = 0; i < holders.length; i++) {
+    const h = holders[i];
+    const settled = classifications[i];
+    const category: ExclusionCategory = settled.status === "fulfilled" ? settled.value : "INSIDER";
+    const pct = (h.ui_amount / totalSupply) * 100;
+
+    if (category !== "INSIDER") {
+      exclusions.push({ address: h.owner, category, pct });
+      excludedPct += pct;
+    } else {
+      insiderCount++;
+      if (insiderCount <= 10) adjustedPct += pct;
+    }
+  }
+
+  return {
+    adjusted_top_10_pct: adjustedPct,
+    excluded_count: exclusions.length,
+    excluded_pct: excludedPct,
+    exclusions,
+    method: "BIRDEYE_SUPPLY",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -311,7 +379,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   // All sources run in parallel. getTokenMintInfo is NOT sequential.
   const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult,
-         securityResult, holderListResult, washTradingResult, authHistoryResult] =
+         securityResult, holderListResult, washTradingResult, authHistoryResult,
+         topHoldersResult, tokenSupplyResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
@@ -323,6 +392,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       getBirdeyeHolderList(address, 20, { timeout: 4000 }),
       detectCircularWashTrading(address, { timeout: 5000 }),
       getAuthorityHistory(address, { timeout: 5000 }),
+      getBirdeyeTopHolders(address, 20, { timeout: 6000 }),
+      rpcCall("getTokenSupply", [address], 3000),
     ]);
 
   const dexData       = dexResult.status         === "fulfilled" ? dexResult.value         : null;
@@ -368,14 +439,47 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
         ? Promise.resolve(true as boolean | null)
         : (lpMint ? checkLPBurned(lpMint, { timeout: 2000 }) : Promise.resolve(null));
 
-  const [lpBurnResult, walletAgeResult] = await Promise.allSettled([
+  const [lpBurnResult, walletAgeResult, devWalletSigsResult] = await Promise.allSettled([
     lpBurnPromise,
     devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 5000 }) : Promise.resolve(null),
+    devWalletForAge ? rpcCall("getSignaturesForAddress", [devWalletForAge, { limit: 200 }], 4000) : Promise.resolve(null),
   ]);
 
   const lp_burned           = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
   const lp_status           = deriveLPStatus(lp_burned, lp_model);
+
+  // Oldest dev wallet sig — needed for funding source classification
+  const devWalletSigs: any[] | null = devWalletSigsResult.status === "fulfilled" ? devWalletSigsResult.value : null;
+  const devWalletOldestSig: string | null = Array.isArray(devWalletSigs) && devWalletSigs.length > 0
+    ? (devWalletSigs[devWalletSigs.length - 1]?.signature ?? null)
+    : null;
+
+  // Top holders and total supply from Phase 1
+  const topHoldersData = topHoldersResult.status === "fulfilled" ? topHoldersResult.value : null;
+  const tokenSupplyRaw = tokenSupplyResult.status === "fulfilled" ? tokenSupplyResult.value : null;
+  const totalSupplyValue: number | null = typeof tokenSupplyRaw?.value?.uiAmount === "number"
+    ? tokenSupplyRaw.value.uiAmount
+    : null;
+
+  // Funding source + adjusted concentration — run in parallel
+  const _defaultFundingSource: FundingSource = {
+    funder_address: null, funder_type: "UNKNOWN", funder_age_days: null,
+    funder_tx_count: null, shared_funder_wallets: [], cluster_size: 1,
+    risk: "MEDIUM", risk_reason: "dev wallet unavailable", action_guidance: "verify funding source manually",
+  };
+  const [fundingSourceResult, adjustedConcentrationResult] = await Promise.allSettled([
+    devWalletForAge
+      ? classifyWalletFundingSource(devWalletForAge, devWalletOldestSig, 6000)
+      : Promise.resolve(_defaultFundingSource),
+    computeAdjustedConcentration(topHoldersData ?? [], totalSupplyValue),
+  ]);
+  const dev_funding_source = fundingSourceResult.status === "fulfilled"
+    ? fundingSourceResult.value
+    : _defaultFundingSource;
+  const adjusted_holder_concentration = adjustedConcentrationResult.status === "fulfilled"
+    ? adjustedConcentrationResult.value
+    : { adjusted_top_10_pct: null, excluded_count: 0, excluded_pct: 0, exclusions: [], method: "UNAVAILABLE" as const };
 
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
@@ -468,6 +572,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     authority_ever_regranted: authority_history.authority_ever_regranted,
     wash_trading_circular_pairs: circular_pairs,
     post_launch_mints: authority_history.post_launch_mints,
+    adjusted_top_10_holder_pct: adjusted_holder_concentration.adjusted_top_10_pct,
+    dev_funder_type: devWalletForAge ? dev_funding_source.funder_type : null,
   };
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
   const { grade: risk_grade, scoringFactors } = calculateRiskGrade(factors, authority_exempt);
@@ -485,16 +591,25 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       sol_balance: null,
       created_tokens_count: null,
       previous_rugs: false,
+      funding_source: null,
+      funding_risk_note: null,
     };
   } else {
     const devSolBalance = mintAuthAddress
       ? await getSolBalance(mintAuthAddress, 3000)
+      : null;
+    const funding_risk_note: string | null =
+      dev_funding_source.funder_type === "MIXER"        ? "Dev wallet funded via mixer — high anonymous funding risk"
+      : dev_funding_source.funder_type === "DEPLOYER"   ? "Dev wallet funded by deployer-pattern wallet — elevated risk"
+      : dev_funding_source.funder_type === "FRESH_WALLET" ? "Dev wallet funded by fresh wallet — possible proxy setup"
       : null;
     dev_wallet_analysis = {
       address: mintAuthAddress ?? "unknown",
       sol_balance: devSolBalance ?? 0,
       created_tokens_count: 0, // requires tx history — unavailable on public RPC
       previous_rugs: has_rug_history,
+      funding_source: devWalletForAge ? dev_funding_source : null,
+      funding_risk_note,
     };
   }
 
@@ -545,6 +660,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   });
   if (is_mutable === true) historical_flags.push("MUTABLE_METADATA");
   if (authority_history.authority_ever_regranted) historical_flags.push("AUTHORITY_REGRANTED");
+  if (devWalletForAge && dev_funding_source.funder_type === "MIXER") historical_flags.push("DEV_MIXER_FUNDED");
 
   // ── Risk breakdown ────────────────────────────────────────────────────────
   const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
@@ -702,5 +818,6 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     metadata_immutability,
     authority_history,
     dilution_risk,
+    adjusted_holder_concentration,
   };
 }

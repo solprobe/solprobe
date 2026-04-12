@@ -127,7 +127,25 @@ describe("deepDive", () => {
         funding_wallet_overlap:  expect.toBeOneOf([expect.any(Number), null]),
         funding_source_risk:     expect.stringMatching(/^(LOW|MEDIUM|HIGH)$/),
       }),
+      adjusted_holder_concentration: expect.objectContaining({
+        adjusted_top_10_pct: expect.toBeOneOf([expect.any(Number), null]),
+        excluded_count:      expect.any(Number),
+        excluded_pct:        expect.any(Number),
+        exclusions:          expect.any(Array),
+        method:              expect.stringMatching(/^(BIRDEYE_SUPPLY|RUGCHECK_FALLBACK|UNAVAILABLE)$/),
+      }),
     });
+
+    // dev_wallet_analysis must have funding_source + funding_risk_note fields
+    expect(result.dev_wallet_analysis).toHaveProperty("funding_source");
+    expect(result.dev_wallet_analysis).toHaveProperty("funding_risk_note");
+    // When funding_source is present it must have the required shape
+    if (result.dev_wallet_analysis.funding_source !== null) {
+      expect(result.dev_wallet_analysis.funding_source).toMatchObject({
+        funder_type: expect.any(String),
+        risk:        expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      });
+    }
   });
 
   it("recommendation is never undefined — defaults to DYOR on LOW confidence", async () => {
