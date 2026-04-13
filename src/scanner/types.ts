@@ -157,3 +157,59 @@ export interface MomentumAlignment {
   direction: "BULL" | "BEAR" | "MIXED" | "UNKNOWN";
   timeframes_used: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Taint Analysis Types (walletRisk.ts — analysis/taintTracker.ts output)
+// ---------------------------------------------------------------------------
+
+/**
+ * BFS taint propagation result for a wallet address.
+ * Seeded from known rug deployers and exploit wallets.
+ * Score decays by 0.6 per hop; capped at MAX_HOPS=3.
+ */
+export interface TaintAnalysis {
+  /** 0.0–1.0 composite taint score. 1.0 = direct seed connection. */
+  taint_score: number;
+  taint_level: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  /** Shortest path in hops to any seed address; null if no path found. */
+  hops_from_seed: number | null;
+  /** Address of the nearest known bad actor; null if no connection found. */
+  closest_seed: string | null;
+  /** Number of distinct seed addresses that can reach this wallet. */
+  seeds_reachable: number;
+  /** True when the BFS hit MAX_NODES_VISITED before completing — result may be incomplete. */
+  graph_limit_hit: boolean;
+  /** Human-readable explanation of what the taint level means. */
+  meaning: string;
+  /** Recommended action given the taint level. */
+  action_guidance: string;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster Group Types (deepDive.ts — analysis/clusterDetection.ts output)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single signal that contributed to forming a wallet cluster.
+ */
+export interface ClusterSignal {
+  type: "FEE_PAYER" | "FAN_OUT" | "TEMPORAL";
+  strength: "STRONG" | "MEDIUM" | "WEAK";
+  description: string;
+}
+
+/**
+ * A detected cluster of wallets with enriched metadata.
+ * Used in wallet_analysis.cluster_groups in WalletRiskResult.
+ */
+export interface ClusterGroup {
+  cluster_id: string;
+  wallets: string[];
+  /** 0.0–1.0 average connection strength across all pairs in the cluster. */
+  confidence: number;
+  /** Which detection signals contributed to forming this cluster. */
+  signals: ClusterSignal[];
+  common_fee_payer: string | null;
+  /** Combined supply % held by this cluster; null until deep dive populates it. */
+  supply_pct_combined: number | null;
+}

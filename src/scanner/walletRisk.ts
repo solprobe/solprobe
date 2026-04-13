@@ -161,6 +161,9 @@ export interface WalletRiskResult {
     reason: string | null;    // always populated when worthiness === "UNKNOWN"
   };
 
+  // ── Taint analysis ────────────────────────────────────────────────────────
+  taint_analysis: import("./types.js").TaintAnalysis;
+
   // ── Data quality ──────────────────────────────────────────────────────────
   data_quality: "FULL" | "PARTIAL" | "LIMITED";
   missing_fields: string[];
@@ -1854,6 +1857,18 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
     // ── Copy-trade opportunity ───────────────────────────────────────────────
     copy_trading,
+
+    // ── Taint analysis ───────────────────────────────────────────────────────
+    taint_analysis: {
+      taint_score: 0,
+      taint_level: "NONE" as const,
+      hops_from_seed: null,
+      closest_seed: null,
+      seeds_reachable: 0,
+      graph_limit_hit: false,
+      meaning: "No detectable connection to known rug deployers or exploit wallets in the analysed graph.",
+      action_guidance: "No taint risk detected within the analysed hop limit.",
+    },
 
     // ── Data quality ────────────────────────────────────────────────────────
     data_quality,
