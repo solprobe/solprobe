@@ -301,6 +301,48 @@ export async function getWalletAgeDays(
 // ---------------------------------------------------------------------------
 
 const HELIUS_ENHANCED_BASE = "https://api.helius.xyz/v0";
+const HELIUS_DAS_BASE = "https://mainnet.helius-rpc.com";
+
+/**
+ * Fetch the mint deployer (Metaplex update authority) via Helius DAS getAsset.
+ *
+ * For pump.fun tokens the mint authority is burned post-launch, so getMintAuthorityAddress
+ * returns null. The Metaplex update authority stored in getAsset.authorities[0] is the
+ * token creator and serves as the dev wallet address in that case.
+ *
+ * Returns null when HELIUS_API_KEY is missing, on any fetch failure, or when the
+ * authority is a known program address (executable accounts are filtered out by the caller).
+ */
+export async function getMintDeployer(
+  mintAddress: string,
+  options: { timeout?: number } = {}
+): Promise<string | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 3000;
+  const url = `${HELIUS_DAS_BASE}/?api-key=${apiKey}`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getAsset",
+        params: { id: mintAddress },
+      }),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!res.ok) return null;
+    const json = await res.json() as { result?: { authorities?: Array<{ address: string; scopes: string[] }> } };
+    const authorities = json?.result?.authorities ?? [];
+    return authorities[0]?.address ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Circular wash trading detection via Helius SWAP transactions.
@@ -377,6 +419,74 @@ export async function detectCircularWashTrading(
     circular_pairs: Math.floor(circular_pairs / 2),
     total_swaps: result.length,
   };
+}
+
+/**
+ * Fetch the earliest parsed transactions for a token address from the Helius enhanced API.
+ * Omits type filter so it captures all transaction types (TRANSFER, SWAP, MINT, etc.)
+ * to cover the initial token distribution at launch — the key window for cluster detection.
+ * Returns null when HELIUS_API_KEY is missing or the request fails.
+ */
+export async function getTokenSwapTransactions(
+  mintAddress: string,
+  options: { timeout?: number; limit?: number; order?: "asc" | "desc" } = {}
+): Promise<any[] | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 5000;
+  const limit = options.limit ?? 100;
+  const order = options.order ?? "asc";
+  // No type filter — include SWAP, TRANSFER, MINT etc. to capture initial distribution
+  const url = `${HELIUS_ENHANCED_BASE}/addresses/${mintAddress}/transactions?api-key=${apiKey}&limit=${limit}&order=${order}`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+  } catch {
+    return null;
+  }
+
+  if (!res.ok) return null;
+
+  try {
+    const result = await res.json();
+    return Array.isArray(result) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch the fee payer for a wallet's earliest known swaps.
+ * Used by deepDive Phase 1b to detect shared fee payers across top holders,
+ * which is the primary on-chain signal for coordinated/bundled buying.
+ * Returns null on any error or when HELIUS_API_KEY is missing.
+ */
+export async function getWalletSwapFeePayers(
+  walletAddress: string,
+  options: { timeout?: number; limit?: number } = {}
+): Promise<Array<{ fee_payer: string; block_time: number }> | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 1500;
+  const limit = options.limit ?? 5;
+  // order=asc → earliest swaps first (capturing bundled launch purchases)
+  const url = `${HELIUS_ENHANCED_BASE}/addresses/${walletAddress}/transactions?type=SWAP&api-key=${apiKey}&limit=${limit}&order=asc`;
+
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+    if (!res.ok) return null;
+    const txs = await res.json();
+    if (!Array.isArray(txs)) return null;
+    return txs.map(tx => ({
+      fee_payer: (tx.feePayer ?? tx.fee_payer ?? "") as string,
+      block_time: (tx.timestamp ?? tx.blockTime ?? 0) as number,
+    }));
+  } catch {
+    return null;
+  }
 }
 
 /**

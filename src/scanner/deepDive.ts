@@ -1,6 +1,8 @@
 import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
 import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory } from "../sources/helius.js";
+import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer } from "../sources/helius.js";
+import { buildTxGraph, heliusTxsToEdges } from "../analysis/walletGraph.js";
+import { detectClusters } from "../analysis/clusterDetection.js";
 import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
@@ -10,7 +12,11 @@ import {
   buildHistoricalFlags,
   type RiskFactors,
 } from "./riskScorer.js";
-import type { ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory, FundingSource } from "./types.js";
+import type {
+  ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory,
+  FundingSource, LiquidityLockStatus, WashTradingRisk, TradingPattern,
+  AuthorityHistory, MetadataImmutability,
+} from "./types.js";
 import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
@@ -26,7 +32,7 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface DevWalletAnalysis {
-  address: string;
+  address: string | null;   // null when deployer genuinely cannot be retrieved
   /** null when the address is a Virtuals Protocol address */
   sol_balance: number | null;
   /** null when the address is a Virtuals Protocol address */
@@ -37,31 +43,8 @@ export interface DevWalletAnalysis {
   funding_risk_note: string | null;
 }
 
-export interface LiquidityLockStatus {
-  locked: boolean;
-  lock_duration_days: number;
-  locked_pct: number;
-}
-
-export interface TradingPattern {
-  buy_sell_ratio_1h: number;
-  unique_buyers_24h: number;
-  wash_trading_score: number;
-  circular_pairs: number;
-  wash_method: "HEURISTIC" | "CIRCULAR_SWAP";
-}
-
-export interface MetadataImmutability {
-  is_mutable: boolean | null;
-  update_authority: string | null;
-  risk: "MUTABLE" | "IMMUTABLE" | "UNKNOWN";
-}
-
-export interface AuthorityHistory {
-  mint_authority_changes: number;
-  authority_ever_regranted: boolean;
-  post_launch_mints: number;
-}
+// LiquidityLockStatus, WashTradingRisk, TradingPattern, AuthorityChange,
+// AuthorityHistory, MetadataImmutability — imported from ./types.js
 
 export interface DilutionRisk {
   total_supply: number | null;
@@ -189,44 +172,51 @@ async function getSolBalance(address: string, timeoutMs: number): Promise<number
 // ---------------------------------------------------------------------------
 
 /** 0–100 momentum score derived entirely from on-chain/DEX signals. */
-function deriveMomentumScore(
-  volume_1h: number | null,
-  volume_24h: number | null,
-  price_change_1h: number | null,
-  buy_sell_ratio: number | null
-): number {
-  let score = 50;
+function calculateMomentumScore(data: {
+  price_change_24h_pct: number | null;
+  volume_24h: number | null;
+  buy_sell_ratio_1h: number | null;
+  unique_buyers_24h: number | null;
+  liquidity_usd: number | null;
+}): number {
+  let score = 50;  // neutral baseline
 
-  // Volume acceleration vs 24 h average
-  if (volume_1h != null && volume_24h != null && volume_24h > 0) {
-    const hourlyAvg = volume_24h / 24;
-    if (hourlyAvg > 0) {
-      const ratio = volume_1h / hourlyAvg;
-      if (ratio > 3) score += 20;
-      else if (ratio > 1.5) score += 10;
-      else if (ratio < 0.25) score -= 20;
-      else if (ratio < 0.5) score -= 10;
-    }
+  // Component 1: Price momentum (weight 40)
+  // Normalise: ±50% maps to ±40 points
+  const price = data.price_change_24h_pct ?? 0;
+  const price_component = Math.max(-40, Math.min(40, price * 0.8));
+  score += price_component;
+
+  // Component 2: Volume relative to liquidity (weight 25)
+  // volume/liquidity > 1 = very active, < 0.1 = dormant
+  if (data.volume_24h !== null && data.liquidity_usd && data.liquidity_usd > 0) {
+    const vol_ratio = data.volume_24h / data.liquidity_usd;
+    const vol_component = vol_ratio >= 2   ?  25
+                        : vol_ratio >= 0.5 ?  12
+                        : vol_ratio >= 0.1 ?   0
+                        : -10;
+    score += vol_component;
   }
 
-  // Price change contribution
-  if (price_change_1h != null) {
-    if (price_change_1h > 10) score += 15;
-    else if (price_change_1h > 5) score += 10;
-    else if (price_change_1h > 0) score += 5;
-    else if (price_change_1h < -10) score -= 15;
-    else if (price_change_1h < -5) score -= 10;
-  }
+  // Component 3: Buy pressure (weight 20)
+  const bsr = data.buy_sell_ratio_1h ?? 0.5;
+  const buy_component = bsr > 0.7  ?  20
+                      : bsr > 0.55 ?  10
+                      : bsr > 0.45 ?   0
+                      : bsr > 0.3  ? -10
+                      : -20;
+  score += buy_component;
 
-  // Buy/sell pressure
-  if (buy_sell_ratio != null) {
-    if (buy_sell_ratio > 0.7) score += 15;
-    else if (buy_sell_ratio > 0.6) score += 10;
-    else if (buy_sell_ratio < 0.3) score -= 15;
-    else if (buy_sell_ratio < 0.4) score -= 10;
-  }
+  // Component 4: Unique buyer momentum (weight 15)
+  // > 3000 unique buyers in 24h = high organic interest
+  const buyers = data.unique_buyers_24h ?? 0;
+  const buyer_component = buyers > 5000 ?  15
+                        : buyers > 2000 ?   8
+                        : buyers > 500  ?   0
+                        : -5;
+  score += buyer_component;
 
-  return Math.max(0, Math.min(100, score));
+  return Math.max(0, Math.min(100, Math.round(score)));
 }
 
 /**
@@ -257,6 +247,42 @@ function deriveWashTradingScore(
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
+const WASH_TRADING_MEANING: Record<WashTradingRisk, string> = {
+  NONE:     "No wash trading signals detected.",
+  LOW:      "Minor wash trading indicators; likely noise or thin liquidity.",
+  ELEVATED: "Moderate wash trading signals; buy/sell ratio or volume patterns suggest artificial activity.",
+  HIGH:     "Strong wash trading signals; significant circular or self-trading patterns detected.",
+  EXTREME:  "Severe wash trading detected; volume is likely fabricated and not indicative of real demand.",
+};
+
+const WASH_TRADING_ACTION_GUIDANCE: Record<WashTradingRisk, string> = {
+  NONE:     "No action required for wash trading risk.",
+  LOW:      "Monitor volume; thin liquidity can create false signals.",
+  ELEVATED: "Discount volume figures by 30–50%; verify with independent sources before acting on volume signals.",
+  HIGH:     "Do not rely on volume or buy pressure signals; wash trading likely inflates apparent demand.",
+  EXTREME:  "Treat all volume and buy pressure data as unreliable; avoid large positions.",
+};
+
+const METADATA_RISK_MEANING: Record<"MUTABLE" | "IMMUTABLE" | "UNKNOWN", string> = {
+  MUTABLE:   "Token metadata can be changed by the update authority — name, symbol, or URI could be altered post-launch.",
+  IMMUTABLE: "Token metadata is permanently locked — name, symbol, and URI cannot be changed.",
+  UNKNOWN:   "Metadata mutability status could not be determined from available sources.",
+};
+
+const METADATA_RISK_ACTION: Record<"MUTABLE" | "IMMUTABLE" | "UNKNOWN", string> = {
+  MUTABLE:   "Verify the update authority is a trusted party or revoked before taking a position.",
+  IMMUTABLE: "No metadata risk — proceed based on other signals.",
+  UNKNOWN:   "Treat as mutable until confirmed — check Metaplex metadata on-chain.",
+};
+
+function deriveWashTradingRisk(score: number): WashTradingRisk {
+  if (score === 0)  return "NONE";
+  if (score <= 20)  return "LOW";
+  if (score <= 45)  return "ELEVATED";
+  if (score <= 70)  return "HIGH";
+  return "EXTREME";
+}
+
 /**
  * Derive recommendation — never undefined, defaults to DYOR on low confidence.
  */
@@ -285,8 +311,40 @@ function buildRecommendation(data: {
   return { action: "DYOR", reason: "INCONCLUSIVE_SIGNALS", confidence: Math.min(data.confidence_model, 0.5), time_horizon: "SHORT_TERM" };
 }
 
-function buildKeyDrivers(factors: ScoringFactor[]): KeyDriver[] {
-  return [...factors]
+function buildKeyDrivers(
+  factors: ScoringFactor[],
+  marketData?: {
+    price_change_24h_pct: number | null;
+    volume_24h: number | null;
+    liquidity_usd: number | null;
+    adjusted_top_10_pct: number | null;
+  },
+): KeyDriver[] {
+  // Synthesise positive market signal factors so clean tokens surface real drivers
+  const synthetic: ScoringFactor[] = [];
+  if (marketData) {
+    const { price_change_24h_pct, volume_24h, liquidity_usd, adjusted_top_10_pct } = marketData;
+
+    if (price_change_24h_pct !== null) {
+      const abs = Math.abs(price_change_24h_pct);
+      if (abs >= 20) synthetic.push({ name: "price_change_24h", value: price_change_24h_pct, impact: price_change_24h_pct > 0 ? 25 : -25, interpretation: `24h price change ${price_change_24h_pct > 0 ? "+" : ""}${price_change_24h_pct.toFixed(1)}%` });
+      else if (abs >= 5) synthetic.push({ name: "price_change_24h", value: price_change_24h_pct, impact: price_change_24h_pct > 0 ? 12 : -12, interpretation: `24h price change ${price_change_24h_pct > 0 ? "+" : ""}${price_change_24h_pct.toFixed(1)}%` });
+    }
+
+    if (volume_24h !== null && liquidity_usd !== null && liquidity_usd > 0) {
+      const ratio = volume_24h / liquidity_usd;
+      if (ratio >= 5)       synthetic.push({ name: "volume_to_liquidity_ratio", value: ratio, impact: 25, interpretation: `High volume/liquidity ratio ${ratio.toFixed(1)}x — strong activity` });
+      else if (ratio >= 1)  synthetic.push({ name: "volume_to_liquidity_ratio", value: ratio, impact: 12, interpretation: `Moderate volume/liquidity ratio ${ratio.toFixed(1)}x` });
+    }
+
+    if (adjusted_top_10_pct !== null) {
+      if (adjusted_top_10_pct < 30)       synthetic.push({ name: "adjusted_holder_concentration", value: adjusted_top_10_pct, impact: 20, interpretation: `Top-10 hold ${adjusted_top_10_pct.toFixed(1)}% — well distributed` });
+      else if (adjusted_top_10_pct < 50)  synthetic.push({ name: "adjusted_holder_concentration", value: adjusted_top_10_pct, impact: 10, interpretation: `Top-10 hold ${adjusted_top_10_pct.toFixed(1)}% — moderate concentration` });
+    }
+  }
+
+  const combined = [...factors, ...synthetic];
+  return combined
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
     .slice(0, 5)
     .map(f => ({
@@ -302,29 +360,77 @@ function logError(source: string, reason: unknown, address: string): void {
   console.error(`${ts} source=${source} address=${address} error=${msg}`);
 }
 
-// Known DEX program owners — their ATAs are DEX_POOL, not INSIDER
+// Known DEX program owners — if a wallet's owner program or a token account's
+// owner program is in this set, the holder is a DEX pool vault, not an insider.
 const DEX_PROGRAMS = new Set([
   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // Raydium AMM V4
   "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM
   "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Orca Whirlpool
   "LBUZKhRxPF3XUpBCjp4YzTKgLLjLsrHnHDEhGSoeVJu",  // Meteora DLMM
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",   // Pump.fun AMM
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",   // PumpSwap (Pump.fun v2)
+  "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", // Orca AMM v1
 ]);
-const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 
-async function classifyHolderAddress(ownerAddress: string, timeoutMs: number): Promise<ExclusionCategory> {
-  // Burn addresses have no account
-  const result = await rpcCall("getAccountInfo", [ownerAddress, { encoding: "base58" }], timeoutMs);
-  if (result?.value === null || result?.value === undefined) return "BURN";
-  const accountOwner: string | undefined = result?.value?.owner;
-  if (!accountOwner) return "INSIDER";
-  if (DEX_PROGRAMS.has(accountOwner)) return "DEX_POOL";
-  if (accountOwner === SYSTEM_PROGRAM) return "INSIDER";
+// Known burn/black-hole addresses — any holder matching these is excluded as BURN.
+const BURN_ADDRESSES = new Set([
+  "1nc1nerator11111111111111111111111111111111",
+  "11111111111111111111111111111111",
+  "So11111111111111111111111111111111111111112",   // native SOL mint (placeholder burns)
+]);
+
+// Known CEX hot-wallet addresses — any holder matching these is excluded as CEX.
+// Extend as new addresses are confirmed.
+const KNOWN_CEX_ADDRESSES = new Set([
+  "5tzFkiKscXHK5ZXCGbXZxdw7gSLEW1sZXJKFHe2YNs",  // Binance hot wallet (confirmed)
+  "AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtW2", // Coinbase Prime (confirmed)
+]);
+
+/**
+ * Classify a token account holder as BURN, CEX, DEX_POOL, or INSIDER.
+ *
+ * Two-level check:
+ * 1. Token account's raw program owner — new AMMs (e.g. PumpSwap) may own their vault
+ *    accounts directly with the AMM program rather than using SPL ATA ownership.
+ * 2. Wallet address's program owner — for standard Raydium/Orca pools the vault
+ *    account is an SPL ATA whose *authority* (owner field) is a PDA; that PDA's
+ *    program owner will be the DEX program.
+ */
+async function classifyHolderAddress(
+  ownerAddress: string,
+  tokenAccountAddress: string,
+  timeoutMs: number,
+): Promise<ExclusionCategory> {
+  // Fast-path: static sets require no RPC
+  if (BURN_ADDRESSES.has(ownerAddress)) return "BURN";
+  if (KNOWN_CEX_ADDRESSES.has(ownerAddress)) return "CEX";
+
+  // Level 1: check the token account's raw program owner.
+  // For AMMs that own vault accounts directly (PumpSwap, some Meteora variants),
+  // getAccountInfo(tokenAccountAddress).owner === DEX program ID.
+  const tokenAcctInfo = await rpcCall("getAccountInfo", [tokenAccountAddress, { encoding: "base58" }], timeoutMs);
+  if (tokenAcctInfo?.value === null || tokenAcctInfo?.value === undefined) return "BURN";
+  const tokenAcctOwner: string | undefined = tokenAcctInfo?.value?.owner;
+  if (tokenAcctOwner && DEX_PROGRAMS.has(tokenAcctOwner)) return "DEX_POOL";
+
+  // Level 2: check the wallet/authority address itself.
+  // For Raydium AMM V4, Orca, etc. the vault ATA is owned by the Token Program,
+  // but its authority is a PDA whose program owner is the DEX program.
+  const ownerInfo = await rpcCall("getAccountInfo", [ownerAddress, { encoding: "base58" }], timeoutMs);
+  if (ownerInfo?.value === null || ownerInfo?.value === undefined) return "BURN";
+  const ownerProgram: string | undefined = ownerInfo?.value?.owner;
+  if (!ownerProgram) return "INSIDER";
+
+  // Executable programs that hold tokens are pools/protocols, not wallets
+  if (ownerInfo?.value?.executable === true) return "DEX_POOL";
+  // PDA owned by a DEX program — pool vault authority
+  if (DEX_PROGRAMS.has(ownerProgram)) return "DEX_POOL";
+
   return "INSIDER";
 }
 
 async function computeAdjustedConcentration(
-  holders: Array<{ owner: string; ui_amount: number }>,
+  holders: Array<{ owner: string; token_account: string; ui_amount: number }>,
   totalSupply: number | null
 ): Promise<AdjustedHolderConcentration> {
   if (totalSupply === null || totalSupply === 0 || holders.length === 0) {
@@ -333,7 +439,7 @@ async function computeAdjustedConcentration(
 
   // Classify all holders in parallel (1500ms each, 6000ms total budget)
   const classifications = await Promise.allSettled(
-    holders.map(h => classifyHolderAddress(h.owner, 1500))
+    holders.map(h => classifyHolderAddress(h.owner, h.token_account, 1500))
   );
 
   const exclusions: AdjustedHolderConcentration["exclusions"] = [];
@@ -380,7 +486,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // All sources run in parallel. getTokenMintInfo is NOT sequential.
   const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult,
          securityResult, holderListResult, washTradingResult, authHistoryResult,
-         topHoldersResult, tokenSupplyResult] =
+         topHoldersResult, tokenSupplyResult, swapTxsResult, mintDeployerResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
@@ -394,6 +500,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       getAuthorityHistory(address, { timeout: 5000 }),
       getBirdeyeTopHolders(address, 20, { timeout: 6000 }),
       rpcCall("getTokenSupply", [address], 3000),
+      getTokenSwapTransactions(address, { timeout: 5000, limit: 100, order: "asc" }),
+      getMintDeployer(address, { timeout: 3000 }),   // DAS getAsset — deployer fallback for pump.fun
     ]);
 
   const dexData       = dexResult.status         === "fulfilled" ? dexResult.value         : null;
@@ -401,6 +509,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const mintData      = mintResult.status        === "fulfilled" ? mintResult.value        : null;
   const birdData      = birdResult.status        === "fulfilled" ? birdResult.value        : null;
   const mintAuthAddress = mintAuthResult.status  === "fulfilled" ? mintAuthResult.value    : null;
+  const mintDeployerAddress = mintDeployerResult.status === "fulfilled" ? mintDeployerResult.value : null;
   const securityData  = securityResult.status    === "fulfilled" ? securityResult.value    : null;
   const holderListData = holderListResult.status === "fulfilled" ? holderListResult.value  : null;
   const washTradingData = washTradingResult.status === "fulfilled" ? washTradingResult.value : null;
@@ -417,19 +526,28 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const lp_model = dexData?.lp_model ?? "UNKNOWN";
   const dex_id   = dexData?.dex_id   ?? null;
   const lpMint   = dexData?.lp_mint_address ?? null;
-  const devWalletForAge = (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
-    ? mintAuthAddress
-    : null;
 
-  // Infer launch program from dexId heuristic (no Helius getAsset call here yet).
-  // When creatorProgramId is wired from Helius getAsset, replace inferredProgramId
-  // with the real value and drop this heuristic.
+  // Infer launch program from dexId heuristic.
+  // Used here (before pump_fun_launched is declared) to decide whether to apply
+  // the DAS deployer fallback for tokens with no live mint authority.
   const inferredProgramId = dexData?.pairs.some((p) =>
     p.dexId?.toLowerCase().includes("pump")
   ) ? PROGRAMS.PUMP_FUN : null;
   const launchedFromLPBurnPad = inferredProgramId
     ? isLPBurnLaunchpad(inferredProgramId)
     : false;
+
+  // For pump.fun tokens the mint authority is burned post-launch — mintAuthAddress is null.
+  // Fall back to the DAS update authority (deployer) fetched in Phase 1.
+  // For all other tokens, mintAuthAddress is the canonical dev wallet.
+  const isPumpFunToken = inferredProgramId === PROGRAMS.PUMP_FUN;
+  const effectiveDevAddress: string | null =
+    (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
+      ? mintAuthAddress
+      : (isPumpFunToken && mintDeployerAddress && !isProtocolAddress(mintDeployerAddress))
+        ? mintDeployerAddress
+        : null;
+  const devWalletForAge = effectiveDevAddress;
 
   // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
   const lpBurnPromise: Promise<boolean | null> =
@@ -455,9 +573,10 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? (devWalletSigs[devWalletSigs.length - 1]?.signature ?? null)
     : null;
 
-  // Top holders and total supply from Phase 1
+  // Top holders, total supply, and swap transactions from Phase 1
   const topHoldersData = topHoldersResult.status === "fulfilled" ? topHoldersResult.value : null;
   const tokenSupplyRaw = tokenSupplyResult.status === "fulfilled" ? tokenSupplyResult.value : null;
+  const swapTxsData    = swapTxsResult.status    === "fulfilled" ? swapTxsResult.value    : null;
   const totalSupplyValue: number | null = typeof tokenSupplyRaw?.value?.uiAmount === "number"
     ? tokenSupplyRaw.value.uiAmount
     : null;
@@ -495,10 +614,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   // ── Price / volume (priority: DexScreener → Birdeye) ─────────────────────
   const liquidity_usd        = dexData?.liquidity_usd        ?? birdData?.liquidity_usd        ?? null;
-  const volume_1h_usd        = dexData?.volume_1h_usd        ?? birdData?.volume_1h_usd        ?? null;
   const volume_24h           = dexData?.volume_24h_usd       ?? birdData?.volume_24h_usd       ?? 0;
   const price_change_24h_pct = dexData?.price_change_24h_pct ?? birdData?.price_change_24h_pct ?? 0;
-  const price_change_1h_pct  = dexData?.price_change_1h_pct  ?? birdData?.price_change_1h_pct  ?? null;
   const buy_sell_ratio_1h    = dexData?.buy_sell_ratio_1h ?? null;
 
   // ── Token age ─────────────────────────────────────────────────────────────
@@ -512,25 +629,31 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // Metadata immutability (Birdeye token_security)
   const is_mutable = securityData?.mutable_metadata ?? null;
   const update_authority = securityData?.metaplex_update_authority ?? null;
+  const metaRisk: "MUTABLE" | "IMMUTABLE" | "UNKNOWN" =
+    is_mutable === null ? "UNKNOWN" : is_mutable ? "MUTABLE" : "IMMUTABLE";
   const metadata_immutability: MetadataImmutability = {
     is_mutable,
     update_authority,
-    risk: is_mutable === null ? "UNKNOWN" : is_mutable ? "MUTABLE" : "IMMUTABLE",
+    risk: metaRisk,
+    meaning:        METADATA_RISK_MEANING[metaRisk],
+    action_guidance: METADATA_RISK_ACTION[metaRisk],
   };
 
   // Authority history (Helius SET_AUTHORITY + MINT_TO)
+  // authHistoryData.mint_authority_changes is a count — we expose an empty array
+  // since we do not yet fetch per-change tx details from Helius.
+  const post_launch_mints: number = authHistoryData?.post_launch_mints ?? 0;
   const authority_history: AuthorityHistory = {
-    mint_authority_changes: authHistoryData?.mint_authority_changes ?? 0,
+    mint_authority_changes: [],   // populated when per-tx Helius data available
     authority_ever_regranted: authHistoryData?.authority_ever_regranted ?? false,
-    post_launch_mints: authHistoryData?.post_launch_mints ?? 0,
   };
 
   // Dilution risk
   const total_supply = securityData?.total_supply ?? null;
   const dilution_risk: DilutionRisk = {
     total_supply,
-    post_launch_mints: authority_history.post_launch_mints,
-    risk: authority_history.post_launch_mints > 0 ? "HIGH"
+    post_launch_mints,
+    risk: post_launch_mints > 0 ? "HIGH"
       : total_supply === null ? "UNKNOWN"
       : "LOW",
   };
@@ -571,7 +694,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       : null,
     authority_ever_regranted: authority_history.authority_ever_regranted,
     wash_trading_circular_pairs: circular_pairs,
-    post_launch_mints: authority_history.post_launch_mints,
+    post_launch_mints,
     adjusted_top_10_holder_pct: adjusted_holder_concentration.adjusted_top_10_pct,
     dev_funder_type: devWalletForAge ? dev_funding_source.funder_type : null,
   };
@@ -595,16 +718,18 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       funding_risk_note: null,
     };
   } else {
-    const devSolBalance = mintAuthAddress
-      ? await getSolBalance(mintAuthAddress, 3000)
+    // Use effectiveDevAddress: mintAuthAddress for standard tokens,
+    // DAS update authority for pump.fun tokens where mintAuthority is burned.
+    const devSolBalance = effectiveDevAddress
+      ? await getSolBalance(effectiveDevAddress, 3000)
       : null;
     const funding_risk_note: string | null =
-      dev_funding_source.funder_type === "MIXER"        ? "Dev wallet funded via mixer — high anonymous funding risk"
-      : dev_funding_source.funder_type === "DEPLOYER"   ? "Dev wallet funded by deployer-pattern wallet — elevated risk"
+      dev_funding_source.funder_type === "MIXER"          ? "Dev wallet funded via mixer — high anonymous funding risk"
+      : dev_funding_source.funder_type === "DEPLOYER"     ? "Dev wallet funded by deployer-pattern wallet — elevated risk"
       : dev_funding_source.funder_type === "FRESH_WALLET" ? "Dev wallet funded by fresh wallet — possible proxy setup"
       : null;
     dev_wallet_analysis = {
-      address: mintAuthAddress ?? "unknown",
+      address: effectiveDevAddress,   // null when genuinely unavailable — never "unknown"
       sol_balance: devSolBalance ?? 0,
       created_tokens_count: 0, // requires tx history — unavailable on public RPC
       previous_rugs: has_rug_history,
@@ -613,27 +738,24 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     };
   }
 
-  // LP lock — cannot be verified via on-chain lock program without specialised API
-  const liquidity_lock_status: LiquidityLockStatus = {
-    locked: false,
-    lock_duration_days: 0,
-    locked_pct: 0,
-  };
+  // LP lock — derive from lp_burned; on-chain lock program verification not available
+  const liquidity_lock_status: LiquidityLockStatus = lp_burned === true
+    ? { locked: true, lock_type: "PERMANENT_BURN", lock_duration_days: Infinity, locked_pct: 100, note: "LP tokens sent to burn address — liquidity permanently locked." }
+    : { locked: false, lock_type: "NONE", lock_duration_days: 0, locked_pct: 0, note: null };
 
-  // ── Trading pattern ───────────────────────────────────────────────────────
+  // ── Trading pattern scalars (needed by momentum_score below) ─────────────
+  // Full trading_pattern object is assembled after clusterResult (see below).
   const unique_buyers_24h = dexData?.pair?.txns?.h24?.buys ?? 0;
   const wash_trading_score = deriveWashTradingScore(buy_sell_ratio_1h, volume_24h || null, liquidity_usd);
-  const wash_method: "HEURISTIC" | "CIRCULAR_SWAP" = circular_pairs > 0 ? "CIRCULAR_SWAP" : "HEURISTIC";
-  const trading_pattern: TradingPattern = {
-    buy_sell_ratio_1h: buy_sell_ratio_1h ?? 0.5,
-    unique_buyers_24h,
-    wash_trading_score,
-    circular_pairs,
-    wash_method,
-  };
 
   // ── Momentum score ────────────────────────────────────────────────────────
-  const momentum_score = deriveMomentumScore(volume_1h_usd, volume_24h || null, price_change_1h_pct, buy_sell_ratio_1h);
+  const momentum_score = calculateMomentumScore({
+    price_change_24h_pct,
+    volume_24h: volume_24h || null,
+    buy_sell_ratio_1h,
+    unique_buyers_24h,
+    liquidity_usd,
+  });
 
   // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
@@ -686,11 +808,114 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   const risk_breakdown = { contract_risk, liquidity_risk, market_risk, behavioral_risk };
 
+  // ── Graph-based cluster detection (Phase 2 — runs after all source fetches) ──
+  // Strategy: fetch each top holder's earliest swap fee payers in parallel (Phase 1b).
+  // Shared fee payers among multiple holders are the primary on-chain signal for
+  // coordinated/bundled buying — more reliable than token-level swap history.
+
+  // Token creation time for temporal cluster boost (unix seconds)
+  const tokenCreationTime = dexData?.pair_created_at_ms != null
+    ? Math.floor(dexData.pair_created_at_ms / 1000)
+    : null;
+
+  // DEX pool addresses from DexScreener — exclude from target wallets
+  const knownPoolAddresses = new Set(
+    (dexData?.pairs ?? []).map((p: { pairAddress: string }) => p.pairAddress).filter(Boolean)
+  );
+
+  // Build target wallet list: top holders minus protocol + DEX pool addresses
+  const targetWallets = (topHoldersData ?? [])
+    .map((h: { owner: string }) => h.owner)
+    .filter((addr: string) => !isProtocolAddress(addr) && !knownPoolAddresses.has(addr));
+
+  // Phase 1b: parallel fee payer lookups (1500ms each, max 20 wallets)
+  const feePayerResults = await Promise.allSettled(
+    targetWallets.map(w => getWalletSwapFeePayers(w, { timeout: 1500, limit: 5 }))
+  );
+
+  // Build fee_payer → wallets[] map from Phase 1b results.
+  // Shared fee payer = strong bundled-launch signal.
+  const feePayerToWallets = new Map<string, Array<{ wallet: string; block_time: number }>>();
+  for (let i = 0; i < targetWallets.length; i++) {
+    const result = feePayerResults[i];
+    if (result.status !== "fulfilled" || !result.value) continue;
+    for (const { fee_payer, block_time } of result.value) {
+      if (!fee_payer || fee_payer === targetWallets[i]) continue;
+      if (!feePayerToWallets.has(fee_payer)) feePayerToWallets.set(fee_payer, []);
+      feePayerToWallets.get(fee_payer)!.push({ wallet: targetWallets[i], block_time });
+    }
+  }
+
+  // Create pairwise edges between holders that share a fee payer.
+  // fee_payer_map in TxGraph requires two DIFFERENT wallets per entry — self-edges won't work.
+  const syntheticEdges: import("../analysis/walletGraph.js").TxEdge[] = [];
+  for (const [fee_payer, entries] of feePayerToWallets.entries()) {
+    const unique = [...new Map(entries.map(e => [e.wallet, e])).values()];
+    if (unique.length < 2) continue;
+    // Create edges between all pairs sharing this fee payer
+    for (let i = 0; i < unique.length; i++) {
+      for (let j = i + 1; j < unique.length; j++) {
+        const block_time = Math.min(unique[i].block_time, unique[j].block_time);
+        syntheticEdges.push({
+          from: unique[i].wallet,
+          to: unique[j].wallet,
+          value_lamports: 0,
+          block_time,
+          program: "FEE_PAYER_LINK",
+          tx_signature: `feepair_${i}_${j}_${fee_payer.slice(0, 8)}`,
+          fee_payer,
+        });
+      }
+    }
+  }
+
+  // Supplement with token-level swap edges for temporal + fan-out signals
+  const allEdges = swapTxsData ? heliusTxsToEdges(swapTxsData, address) : [];
+  const txGraph = buildTxGraph([...allEdges, ...syntheticEdges]);
+
+  const clusterResult = detectClusters(txGraph, targetWallets, tokenCreationTime);
+
+  // Populate cluster supply_pct_combined from holder percentages
+  const holderPctMap = new Map<string, number>();
+  if (topHoldersData && typeof (topHoldersData[0] as any)?.ui_amount === "number" && totalSupplyValue) {
+    for (const h of topHoldersData as Array<{ owner: string; ui_amount: number }>) {
+      holderPctMap.set(h.owner, (h.ui_amount / totalSupplyValue) * 100);
+    }
+  }
+  for (const cluster of clusterResult.clusters) {
+    cluster.supply_pct_combined = cluster.wallets.reduce(
+      (sum, w) => sum + (holderPctMap.get(w) ?? 0), 0
+    );
+  }
+
+  // ── Trading pattern (assembled here — needs clusterResult for wash_method) ──
+  // wash_method: "GRAPH_ANALYSIS" when graph ran (targetWallets were analysed),
+  // "HEURISTIC" when no holder data was available (score is ratio/volume only).
+  const wash_trading_risk = deriveWashTradingRisk(wash_trading_score);
+  const wash_method: TradingPattern["wash_method"] =
+    targetWallets.length > 0 ? "GRAPH_ANALYSIS" : "HEURISTIC";
+  const trading_pattern: TradingPattern = {
+    buy_sell_ratio_1h: buy_sell_ratio_1h ?? 0.5,
+    unique_buyers_24h,
+    wash_trading_score,
+    wash_trading_risk,
+    wash_trading_meaning:        WASH_TRADING_MEANING[wash_trading_risk],
+    wash_trading_action_guidance: WASH_TRADING_ACTION_GUIDANCE[wash_trading_risk],
+    circular_pairs,
+    wash_method,
+  };
+
   // ── Wallet analysis (adversarial layer) ───────────────────────────────────
   const dev_wallet_linked = dev_wallet_analysis.sol_balance !== null && dev_wallet_analysis.sol_balance > 0;
+
+  // insider_control_percent: sum supply % across all detected clusters
+  const insider_control_percent = clusterResult.clusters.length > 0
+    ? clusterResult.clusters.reduce((sum, c) => sum + (c.supply_pct_combined ?? 0), 0)
+    : (rugData?.insider_flags ? 15 : null);
+
   const wallet_analysis = {
-    clustered_wallets: bundled_launch_detected ? 3 : 0,   // heuristic — bundled = coordinated wallets
-    insider_control_percent: rugData?.insider_flags ? 15 : null, // heuristic from flag
+    clustered_wallets: clusterResult.total_clustered_wallets,
+    insider_control_percent,
     dev_wallet_linked,
     funding_wallet_overlap,
     funding_source_risk,
@@ -709,7 +934,12 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     : "LOW";
 
   // ── Key drivers ───────────────────────────────────────────────────────────
-  const key_drivers = buildKeyDrivers(scoringFactors);
+  const key_drivers = buildKeyDrivers(scoringFactors, {
+    price_change_24h_pct: price_change_24h_pct ?? null,
+    volume_24h: volume_24h ?? null,
+    liquidity_usd: liquidity_usd ?? null,
+    adjusted_top_10_pct: adjusted_holder_concentration.adjusted_top_10_pct,
+  });
 
   // ── Structured recommendation ─────────────────────────────────────────────
   const recommendation = buildRecommendation({
@@ -728,6 +958,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   if (rugData  === null) missing_fields.push("rugcheck_risk_score", "bundled_launch", "single_holder_danger");
   if (mintData === null) missing_fields.push("mint_authority_revoked", "freeze_authority_revoked");
   if (birdData === null) missing_fields.push("birdeye_price");
+  if (effectiveDevAddress === null) missing_fields.push("dev_wallet_address");
 
   // ── Quick-scan-style one-liner summary ─────────────────────────────────────
   const flags: string[] = [];

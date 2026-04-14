@@ -138,6 +138,52 @@ export interface FundingSource {
 
 export type ExclusionCategory = "BURN" | "DEX_POOL" | "CEX" | "KNOWN_PROTOCOL" | "INSIDER";
 
+// ---------------------------------------------------------------------------
+// Deep Dive Supplemental Types (deepDive.ts only)
+// ---------------------------------------------------------------------------
+
+export type LockType = "PERMANENT_BURN" | "TIMELOCK" | "NONE";
+
+export interface LiquidityLockStatus {
+  locked: boolean;
+  lock_type: LockType;
+  lock_duration_days: number;
+  locked_pct: number;
+  note: string | null;
+}
+
+export type WashTradingRisk = "NONE" | "LOW" | "ELEVATED" | "HIGH" | "EXTREME";
+
+export interface TradingPattern {
+  buy_sell_ratio_1h: number;
+  unique_buyers_24h: number;
+  wash_trading_score: number;
+  wash_trading_risk: WashTradingRisk;
+  wash_trading_meaning: string;
+  wash_trading_action_guidance: string;
+  circular_pairs: number;
+  wash_method: "GRAPH_ANALYSIS" | "HEURISTIC" | "UNKNOWN";
+}
+
+export interface AuthorityChange {
+  tx_signature: string | null;
+  slot: number | null;
+  type: "SET_AUTHORITY" | "MINT_TO";
+}
+
+export interface AuthorityHistory {
+  mint_authority_changes: AuthorityChange[];
+  authority_ever_regranted: boolean;
+}
+
+export interface MetadataImmutability {
+  is_mutable: boolean | null;
+  update_authority: string | null;
+  risk: "MUTABLE" | "IMMUTABLE" | "UNKNOWN";
+  meaning: string;
+  action_guidance: string;
+}
+
 export interface AdjustedHolderConcentration {
   adjusted_top_10_pct: number | null;
   excluded_count: number;

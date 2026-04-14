@@ -102,20 +102,29 @@ describe("deepDive", () => {
       full_risk_report:         expect.any(String),
       summary:                  expect.any(String),
       dev_wallet_analysis:      expect.objectContaining({ sol_balance: expect.any(Number) }),
-      liquidity_lock_status:    expect.objectContaining({ locked: expect.any(Boolean) }),
+      liquidity_lock_status:    expect.objectContaining({
+        locked:            expect.any(Boolean),
+        lock_type:         expect.stringMatching(/^(PERMANENT_BURN|TIMELOCK|NONE)$/),
+        lock_duration_days: expect.any(Number),
+        locked_pct:        expect.any(Number),
+      }),
       trading_pattern:          expect.objectContaining({
-        wash_trading_score: expect.any(Number),
-        circular_pairs:     expect.any(Number),
-        wash_method:        expect.stringMatching(/^(HEURISTIC|CIRCULAR_SWAP)$/),
+        wash_trading_score:          expect.any(Number),
+        wash_trading_risk:           expect.stringMatching(/^(NONE|LOW|ELEVATED|HIGH|EXTREME)$/),
+        wash_trading_meaning:        expect.any(String),
+        wash_trading_action_guidance: expect.any(String),
+        circular_pairs:              expect.any(Number),
+        wash_method:                 expect.stringMatching(/^(GRAPH_ANALYSIS|HEURISTIC|UNKNOWN)$/),
       }),
       metadata_immutability:    expect.objectContaining({
-        is_mutable:  expect.toBeOneOf([true, false, null]),
-        risk:        expect.stringMatching(/^(MUTABLE|IMMUTABLE|UNKNOWN)$/),
+        is_mutable:      expect.toBeOneOf([true, false, null]),
+        risk:            expect.stringMatching(/^(MUTABLE|IMMUTABLE|UNKNOWN)$/),
+        meaning:         expect.any(String),
+        action_guidance: expect.any(String),
       }),
       authority_history:        expect.objectContaining({
-        mint_authority_changes:   expect.any(Number),
+        mint_authority_changes:   expect.any(Array),
         authority_ever_regranted: expect.any(Boolean),
-        post_launch_mints:        expect.any(Number),
       }),
       dilution_risk:            expect.objectContaining({
         post_launch_mints: expect.any(Number),
@@ -250,7 +259,7 @@ describe("deepDive", () => {
           ...dexPair({
             volume: { h1: 999_999_999, h24: 1_000 }, // massive 1h spike
             priceChange: { h1: 99, h24: 200 },        // extreme price change
-            txns: { h1: { buys: 10000, sells: 1 } },  // extreme buy ratio
+            txns: { h1: { buys: 10000, sells: 1 }, h24: { buys: 10000, sells: 1 } },  // extreme buy ratio
           }),
         }],
       },
@@ -259,6 +268,42 @@ describe("deepDive", () => {
     const result = await deepDive(TOKEN);
 
     expect(result.momentum_score).toBe(100); // clamped at 100
+  });
+
+  it("liquidity_lock_status.lock_type is consistent with lp_burned", async () => {
+    vi.stubGlobal("fetch", makeFetch());
+
+    const result = await deepDive(TOKEN);
+
+    // lock_type must be PERMANENT_BURN when lp_burned, NONE otherwise
+    if (result.lp_burned === true) {
+      expect(result.liquidity_lock_status.locked).toBe(true);
+      expect(result.liquidity_lock_status.lock_type).toBe("PERMANENT_BURN");
+      expect(result.liquidity_lock_status.locked_pct).toBe(100);
+    } else {
+      expect(result.liquidity_lock_status.lock_type).toBe("NONE");
+      expect(result.liquidity_lock_status.locked).toBe(false);
+    }
+  });
+
+  it("key_drivers includes at least one POSITIVE direction when strong market signals exist", async () => {
+    vi.stubGlobal("fetch", makeFetch({
+      dexData: {
+        pairs: [{
+          ...dexPair({
+            priceChange: { h1: 30, h24: 50 },  // strong positive 24h change
+            volume: { h1: 500_000, h24: 5_000_000 },
+            liquidity: { usd: 1_000_000 },
+            txns: { h1: { buys: 500, sells: 100 }, h24: { buys: 5000, sells: 1000 } },
+          }),
+        }],
+      },
+    }));
+
+    const result = await deepDive(TOKEN);
+
+    const positiveDrivers = result.key_drivers.filter((d: { direction: string }) => d.direction === "POSITIVE");
+    expect(positiveDrivers.length).toBeGreaterThan(0);
   });
 
   it("full_risk_report is 3–5 sentences", async () => {
