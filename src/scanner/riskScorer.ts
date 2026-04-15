@@ -30,6 +30,9 @@ export interface RiskFactors {
   authority_ever_regranted?: boolean;               // any SET_AUTHORITY tx post-launch
   wash_trading_circular_pairs?: number;             // A→B→A circular swap pairs detected
   post_launch_mints?: number;                       // MINT_TO events after token creation
+  // LP false-positive correction metadata (FIX 4)
+  rugcheck_lp_stripped?: boolean;                   // true when LP risks were removed from RugCheck score
+  rugcheck_raw_score?: number | null;               // raw RugCheck score before LP correction
 }
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
@@ -158,6 +161,11 @@ export function calculateRiskGrade(
   }
 
   // RugCheck risk score — never skipped for exempt tokens
+  // rugcheck_risk_score is the adjusted score (LP false positives already stripped).
+  // rugcheck_lp_stripped and rugcheck_raw_score carry the correction metadata.
+  const lpCorrectionSuffix = factors.rugcheck_lp_stripped
+    ? ` (LP-adj from ${factors.rugcheck_raw_score ?? "?"})`
+    : "";
   if (factors.rugcheck_risk_score !== null && factors.rugcheck_risk_score !== undefined) {
     if (factors.rugcheck_risk_score > 5_000) {
       score -= 30;
@@ -165,7 +173,7 @@ export function calculateRiskGrade(
         name: "rugcheck_score",
         value: factors.rugcheck_risk_score,
         impact: -30,
-        interpretation: "extreme rug risk score (>5000)",
+        interpretation: `extreme rug risk score (>5000)${lpCorrectionSuffix}`,
       });
     } else if (factors.rugcheck_risk_score > 2_000) {
       score -= 20;
@@ -173,7 +181,7 @@ export function calculateRiskGrade(
         name: "rugcheck_score",
         value: factors.rugcheck_risk_score,
         impact: -20,
-        interpretation: "high rug risk score (>2000)",
+        interpretation: `high rug risk score (>2000)${lpCorrectionSuffix}`,
       });
     } else if (factors.rugcheck_risk_score > 1_000) {
       score -= 10;
@@ -181,14 +189,16 @@ export function calculateRiskGrade(
         name: "rugcheck_score",
         value: factors.rugcheck_risk_score,
         impact: -10,
-        interpretation: "elevated rug risk score (>1000)",
+        interpretation: `elevated rug risk score (>1000)${lpCorrectionSuffix}`,
       });
     } else {
       sf.push({
         name: "rugcheck_score",
         value: factors.rugcheck_risk_score,
         impact: 0,
-        interpretation: "low risk score",
+        interpretation: factors.rugcheck_lp_stripped
+          ? `low risk score${lpCorrectionSuffix}`
+          : "low risk score",
       });
     }
   } else {

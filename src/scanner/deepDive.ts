@@ -1,9 +1,9 @@
-import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
-import { getRugCheckSummary } from "../sources/rugcheck.js";
-import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer } from "../sources/helius.js";
+import { getDexScreenerToken, deriveLPStatus, classifyLPModel, type LPModel, type LPStatus } from "../sources/dexscreener.js";
+import { getRugCheckSummary, stripLPFalsePositives } from "../sources/rugcheck.js";
+import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer, checkPoolLiquiditySafety, type PoolLiquiditySafety } from "../sources/helius.js";
 import { buildTxGraph, heliusTxsToEdges } from "../analysis/walletGraph.js";
 import { detectClusters } from "../analysis/clusterDetection.js";
-import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders } from "../sources/birdeye.js";
+import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders, getTokenCreationInfo } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
   calculateRiskGrade,
@@ -14,7 +14,7 @@ import {
 } from "./riskScorer.js";
 import type {
   ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory,
-  FundingSource, LiquidityLockStatus, WashTradingRisk, TradingPattern,
+  FundingSource, LiquidityLockStatus, PoolSafetyBreakdown, WashTradingRisk, TradingPattern,
   AuthorityHistory, MetadataImmutability,
 } from "./types.js";
 import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
@@ -129,6 +129,20 @@ export interface DeepDiveResult {
   missing_fields: string[];
   /** Holder concentration after excluding burn/DEX/protocol addresses */
   adjusted_holder_concentration: AdjustedHolderConcentration;
+  /** True when RugCheck LP false positives were stripped before scoring */
+  rugcheck_lp_adjusted: boolean;
+  /** Raw RugCheck score before LP correction; null when RugCheck was unavailable */
+  rugcheck_raw_score: number | null;
+  /** All LP model types detected across all pools (not just the primary pool) */
+  pool_types_detected: Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">;
+  /** Detailed RugCheck score correction metadata; null when RugCheck unavailable */
+  rugcheck_score_details: {
+    raw_score: number | null;
+    adjusted_score: number | null;
+    lp_false_positive_stripped: boolean;
+    stripped_score_amount: number;
+    reason: string | null;
+  } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +179,89 @@ async function getMintAuthorityAddress(mintAddress: string, timeoutMs: number): 
 async function getSolBalance(address: string, timeoutMs: number): Promise<number | null> {
   const result = await rpcCall("getBalance", [address], timeoutMs);
   return typeof result?.value === "number" ? result.value / 1e9 : null;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-pool liquidity lock aggregation
+// ---------------------------------------------------------------------------
+
+/**
+ * Aggregate per-pool safety results into a single LiquidityLockStatus.
+ * Called after all pool checks have settled.
+ */
+function deriveOverallLockType(
+  pools: PoolLiquiditySafety[],
+  dexId: string | null
+): LiquidityLockStatus {
+  if (pools.length === 0) {
+    return {
+      locked: false, lock_type: "UNKNOWN", lock_duration_days: null,
+      locked_pct: 0, note: "No pool data available.",
+      pools_assessed: 0, pools_safe: 0, pool_safety_breakdown: [],
+    };
+  }
+
+  const breakdown: PoolSafetyBreakdown[] = pools.map((p) => ({
+    pool_address: p.pool_address,
+    dex: dexId,
+    pool_type: p.pool_type,
+    safety: p.safety,
+    safety_note: p.safety_note,
+  }));
+
+  const safePools = pools.filter(
+    (p) => p.safety === "BURNED" || p.safety === "PROGRAM_CONTROLLED"
+  );
+  const unsafePools = pools.filter(
+    (p) => p.safety === "UNLOCKED"
+  );
+
+  const allSafe    = safePools.length === pools.length;
+  const noneSafe   = safePools.length === 0;
+  const allBurned  = pools.every((p) => p.safety === "BURNED");
+  const allProgCtl = pools.every((p) => p.safety === "PROGRAM_CONTROLLED");
+
+  let lock_type: LiquidityLockStatus["lock_type"];
+  let locked: boolean;
+  let note: string | null;
+
+  if (allBurned) {
+    lock_type = "PERMANENT_BURN";
+    locked = true;
+    note = `All ${pools.length} pool(s) have LP tokens burned — liquidity permanently locked.`;
+  } else if (allProgCtl) {
+    lock_type = "PROGRAM_CONTROLLED";
+    locked = true;
+    note = `All ${pools.length} pool(s) are CLMM/DLMM — no fungible LP token; liquidity is program-controlled.`;
+  } else if (allSafe && !allBurned && !allProgCtl) {
+    // Mix of burned + program-controlled — all safe
+    lock_type = "PERMANENT_BURN";
+    locked = true;
+    note = `All ${pools.length} pool(s) are safe (burned or program-controlled).`;
+  } else if (noneSafe && unsafePools.length > 0) {
+    lock_type = "UNLOCKED";
+    locked = false;
+    note = `${unsafePools.length} of ${pools.length} pool(s) have unlocked LP — rug risk.`;
+  } else if (!allSafe && !noneSafe) {
+    lock_type = "MIXED";
+    locked = false;
+    note = `${safePools.length} of ${pools.length} pool(s) are safe; ${unsafePools.length} pool(s) have unlocked LP.`;
+  } else {
+    lock_type = "UNKNOWN";
+    locked = false;
+    note = "LP lock status could not be fully determined.";
+  }
+
+  return {
+    locked,
+    lock_type,
+    lock_duration_days: locked ? null : 0,
+    locked_pct: locked ? 100 : 0,
+    note,
+    pools_assessed: pools.length,
+    pools_safe: safePools.length,
+    pool_safety_breakdown: breakdown,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +583,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // All sources run in parallel. getTokenMintInfo is NOT sequential.
   const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult,
          securityResult, holderListResult, washTradingResult, authHistoryResult,
-         topHoldersResult, tokenSupplyResult, swapTxsResult, mintDeployerResult] =
+         topHoldersResult, tokenSupplyResult, swapTxsResult, mintDeployerResult,
+         creationInfoResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
@@ -502,6 +600,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       rpcCall("getTokenSupply", [address], 3000),
       getTokenSwapTransactions(address, { timeout: 5000, limit: 100, order: "asc" }),
       getMintDeployer(address, { timeout: 3000 }),   // DAS getAsset — deployer fallback for pump.fun
+      getTokenCreationInfo(address, { timeout: 3000 }), // Birdeye — primary source for creator wallet
     ]);
 
   const dexData       = dexResult.status         === "fulfilled" ? dexResult.value         : null;
@@ -510,6 +609,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const birdData      = birdResult.status        === "fulfilled" ? birdResult.value        : null;
   const mintAuthAddress = mintAuthResult.status  === "fulfilled" ? mintAuthResult.value    : null;
   const mintDeployerAddress = mintDeployerResult.status === "fulfilled" ? mintDeployerResult.value : null;
+  const creationInfo  = creationInfoResult.status === "fulfilled" ? creationInfoResult.value : null;
   const securityData  = securityResult.status    === "fulfilled" ? securityResult.value    : null;
   const holderListData = holderListResult.status === "fulfilled" ? holderListResult.value  : null;
   const washTradingData = washTradingResult.status === "fulfilled" ? washTradingResult.value : null;
@@ -537,16 +637,20 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? isLPBurnLaunchpad(inferredProgramId)
     : false;
 
-  // For pump.fun tokens the mint authority is burned post-launch — mintAuthAddress is null.
-  // Fall back to the DAS update authority (deployer) fetched in Phase 1.
-  // For all other tokens, mintAuthAddress is the canonical dev wallet.
+  // Priority for dev wallet address:
+  //   1. Birdeye token_creation_info.creator — always the original deployer, works for
+  //      both standard and pump.fun tokens (no authority-burned edge case).
+  //   2. mintAuthAddress — live on-chain mint authority; fallback when Birdeye is down.
+  //   3. mintDeployerAddress (DAS) — pump.fun fallback when both above are unavailable.
   const isPumpFunToken = inferredProgramId === PROGRAMS.PUMP_FUN;
   const effectiveDevAddress: string | null =
-    (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
-      ? mintAuthAddress
-      : (isPumpFunToken && mintDeployerAddress && !isProtocolAddress(mintDeployerAddress))
-        ? mintDeployerAddress
-        : null;
+    (creationInfo?.creator && !isProtocolAddress(creationInfo.creator))
+      ? creationInfo.creator
+      : (mintAuthAddress && !isProtocolAddress(mintAuthAddress))
+        ? mintAuthAddress
+        : (isPumpFunToken && mintDeployerAddress && !isProtocolAddress(mintDeployerAddress))
+          ? mintDeployerAddress
+          : null;
   const devWalletForAge = effectiveDevAddress;
 
   // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
@@ -566,6 +670,11 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const lp_burned           = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
   const lp_status           = deriveLPStatus(lp_burned, lp_model);
+
+  // Strip LP-related false positives from RugCheck now that lp_burned + lp_model are known.
+  const rugcheckAdjusted = rugData
+    ? stripLPFalsePositives(rugData, { lp_burned, lp_model })
+    : null;
 
   // Oldest dev wallet sig — needed for funding source classification
   const devWalletSigs: any[] | null = devWalletSigsResult.status === "fulfilled" ? devWalletSigsResult.value : null;
@@ -681,7 +790,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     bundled_launch: bundled_launch_detected,
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
-    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
     single_holder_danger: rugData?.single_holder_danger ?? false,
     lp_burned,
     lp_model,
@@ -697,6 +806,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     post_launch_mints,
     adjusted_top_10_holder_pct: adjusted_holder_concentration.adjusted_top_10_pct,
     dev_funder_type: devWalletForAge ? dev_funding_source.funder_type : null,
+    rugcheck_lp_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
+    rugcheck_raw_score: rugData?.score ?? null,
   };
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
   const { grade: risk_grade, scoringFactors } = calculateRiskGrade(factors, authority_exempt);
@@ -738,10 +849,20 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     };
   }
 
-  // LP lock — derive from lp_burned; on-chain lock program verification not available
-  const liquidity_lock_status: LiquidityLockStatus = lp_burned === true
-    ? { locked: true, lock_type: "PERMANENT_BURN", lock_duration_days: Infinity, locked_pct: 100, note: "LP tokens sent to burn address — liquidity permanently locked." }
-    : { locked: false, lock_type: "NONE", lock_duration_days: 0, locked_pct: 0, note: null };
+  // LP lock — multi-pool assessment (up to 5 highest-liquidity pools)
+  const poolsToCheck = (dexData?.pairs ?? [])
+    .slice()
+    .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))
+    .slice(0, 5);
+  const poolSafetyResults = await Promise.allSettled(
+    poolsToCheck.map((p) =>
+      checkPoolLiquiditySafety(p.pairAddress, (p as any).info?.liquidityToken?.address ?? null, { timeout: 3000 })
+    )
+  );
+  const poolSafeties: PoolLiquiditySafety[] = poolSafetyResults
+    .filter((r): r is PromiseFulfilledResult<PoolLiquiditySafety> => r.status === "fulfilled")
+    .map((r) => r.value);
+  const liquidity_lock_status = deriveOverallLockType(poolSafeties, dex_id);
 
   // ── Trading pattern scalars (needed by momentum_score below) ─────────────
   // Full trading_pattern object is assembled after clusterResult (see below).
@@ -787,7 +908,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // ── Risk breakdown ────────────────────────────────────────────────────────
   const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
     (is_honeypot || has_rug_history || !mint_authority_revoked || !freeze_authority_revoked || authority_history.authority_ever_regranted) ? "HIGH"
-    : (rugData?.rugcheck_risk_score ?? 0) > 2000 ? "MEDIUM"
+    : (rugcheckAdjusted?.adjusted_score ?? 0) > 2000 ? "MEDIUM"
     : "LOW";
 
   const liquidity_risk: "LOW" | "MEDIUM" | "HIGH" =
@@ -988,7 +1109,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     bundled_launch_detected,
     data_confidence,
     recommendation: recommendation.action,
-    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
     insider_flags: rugData?.insider_flags ?? false,
     authority_exempt,
     authority_exempt_reason,
@@ -1050,5 +1171,21 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     authority_history,
     dilution_risk,
     adjusted_holder_concentration,
+    rugcheck_lp_adjusted: rugcheckAdjusted?.lp_risks_stripped ?? false,
+    rugcheck_raw_score: rugData?.score ?? null,
+    pool_types_detected: [...new Set(
+      (dexData?.pairs ?? []).map(pair => classifyLPModel(pair.dexId))
+    )] as Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">,
+    rugcheck_score_details: rugData ? {
+      raw_score: rugData.score,
+      adjusted_score: rugcheckAdjusted?.adjusted_score ?? rugData.score,
+      lp_false_positive_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
+      stripped_score_amount: rugData.score - (rugcheckAdjusted?.adjusted_score ?? rugData.score),
+      reason: rugcheckAdjusted?.lp_risks_stripped
+        ? lp_burned === true
+          ? "LP tokens confirmed burned on-chain — RugCheck LP unlock flag is a false positive"
+          : "DLMM/CLMM pool confirmed — no LP token exists, RugCheck LP assessment does not apply"
+        : null,
+    } : null,
   };
 }

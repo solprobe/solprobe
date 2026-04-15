@@ -1,5 +1,5 @@
-import { getDexScreenerToken, deriveLPStatus, type LPModel, type LPStatus } from "../sources/dexscreener.js";
-import { getRugCheckSummary } from "../sources/rugcheck.js";
+import { getDexScreenerToken, deriveLPStatus, classifyLPModel, type LPModel, type LPStatus } from "../sources/dexscreener.js";
+import { getRugCheckSummary, stripLPFalsePositives } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned, getMintCreationBlock } from "../sources/helius.js";
 import { getTokenCreationInfo } from "../sources/birdeye.js";
 import {
@@ -206,6 +206,22 @@ export interface QuickScanResult {
   missing_fields: string[];
   /** Launch timing anomaly — mint vs pool creation block comparison */
   launch_anomaly: LaunchAnomaly;
+  /** LP lock status — multi-pool assessment */
+  liquidity_lock_status: import("./types.js").LiquidityLockStatus;
+  /** True when RugCheck LP false positives were stripped before scoring */
+  rugcheck_lp_adjusted: boolean;
+  /** Raw RugCheck score before LP correction; null when RugCheck was unavailable */
+  rugcheck_raw_score: number | null;
+  /** All LP model types detected across all pools (not just the primary pool) */
+  pool_types_detected: Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">;
+  /** Detailed RugCheck score correction metadata; null when RugCheck unavailable */
+  rugcheck_score_details: {
+    raw_score: number | null;
+    adjusted_score: number | null;
+    lp_false_positive_stripped: boolean;
+    stripped_score_amount: number;
+    reason: string | null;
+  } | null;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -267,6 +283,48 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   const lp_status = deriveLPStatus(lp_burned, lp_model);
 
+  // Strip LP-related false positives from RugCheck now that lp_burned + lp_model are known.
+  const rugcheckAdjusted = rugData
+    ? stripLPFalsePositives(rugData, { lp_burned, lp_model })
+    : null;
+
+  // ── Liquidity lock status (single-pool view for quick scan) ──────────────
+  const primaryPairAddress = dexData?.pairs.slice()
+    .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0]?.pairAddress ?? null;
+  const liquidity_lock_status: import("./types.js").LiquidityLockStatus = (() => {
+    if (lp_model === "CLMM_DLMM") {
+      return {
+        locked: true, lock_type: "PROGRAM_CONTROLLED" as const, lock_duration_days: null,
+        locked_pct: 100, note: "CLMM/DLMM pool — no fungible LP token; liquidity is program-controlled.",
+        pools_assessed: primaryPairAddress ? 1 : 0, pools_safe: primaryPairAddress ? 1 : 0,
+        pool_safety_breakdown: primaryPairAddress ? [{
+          pool_address: primaryPairAddress, dex: dex_id, pool_type: "DLMM_CLMM" as const,
+          safety: "PROGRAM_CONTROLLED" as const, safety_note: "CLMM/DLMM — no fungible LP token",
+        }] : [],
+      };
+    }
+    if (lp_burned === true) {
+      return {
+        locked: true, lock_type: "PERMANENT_BURN" as const, lock_duration_days: null,
+        locked_pct: 100, note: "LP tokens sent to burn address — liquidity permanently locked.",
+        pools_assessed: primaryPairAddress ? 1 : 0, pools_safe: primaryPairAddress ? 1 : 0,
+        pool_safety_breakdown: primaryPairAddress ? [{
+          pool_address: primaryPairAddress, dex: dex_id, pool_type: "TRADITIONAL_AMM" as const,
+          safety: "BURNED" as const, safety_note: "LP tokens confirmed burned",
+        }] : [],
+      };
+    }
+    return {
+      locked: false, lock_type: "NONE" as const, lock_duration_days: 0,
+      locked_pct: 0, note: null,
+      pools_assessed: primaryPairAddress ? 1 : 0, pools_safe: 0,
+      pool_safety_breakdown: primaryPairAddress ? [{
+        pool_address: primaryPairAddress, dex: dex_id, pool_type: "TRADITIONAL_AMM" as const,
+        safety: "UNLOCKED" as const, safety_note: "LP not burned",
+      }] : [],
+    };
+  })();
+
   // ── Authority flags: Helius only, unconditionally ─────────────────────────
   // On null (RPC failure), default to false (conservative — treat as not revoked).
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
@@ -313,7 +371,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     bundled_launch: rugData?.bundled_launch_detected ?? false,
     buy_sell_ratio: dexData?.buy_sell_ratio_1h ?? null,
     token_age_days,
-    rugcheck_risk_score: rugData?.rugcheck_risk_score ?? null,
+    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
     single_holder_danger: rugData?.single_holder_danger ?? false,
     lp_burned,
     lp_model,
@@ -321,6 +379,8 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     dex_id,
     dev_wallet_age_days: null, // quickScan never fetches this
     launch_pattern: launch_anomaly.launch_pattern,
+    rugcheck_lp_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
+    rugcheck_raw_score: rugData?.score ?? null,
   };
 
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
@@ -422,5 +482,22 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     data_quality,
     missing_fields,
     launch_anomaly,
+    liquidity_lock_status,
+    rugcheck_lp_adjusted: rugcheckAdjusted?.lp_risks_stripped ?? false,
+    rugcheck_raw_score: rugData?.score ?? null,
+    pool_types_detected: [...new Set(
+      (dexData?.pairs ?? []).map(pair => classifyLPModel(pair.dexId))
+    )] as Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">,
+    rugcheck_score_details: rugData ? {
+      raw_score: rugData.score,
+      adjusted_score: rugcheckAdjusted?.adjusted_score ?? rugData.score,
+      lp_false_positive_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
+      stripped_score_amount: rugData.score - (rugcheckAdjusted?.adjusted_score ?? rugData.score),
+      reason: rugcheckAdjusted?.lp_risks_stripped
+        ? lp_burned === true
+          ? "LP tokens confirmed burned on-chain — RugCheck LP unlock flag is a false positive"
+          : "DLMM/CLMM pool confirmed — no LP token exists, RugCheck LP assessment does not apply"
+        : null,
+    } : null,
   };
 }

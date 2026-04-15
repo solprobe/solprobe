@@ -175,6 +175,25 @@ describe("quickScan", () => {
       historical_flags:        expect.any(Array),
     });
 
+    // pool_types_detected: array with at least one valid LP model type
+    expect(result.pool_types_detected).toBeInstanceOf(Array);
+    expect(result.pool_types_detected.length).toBeGreaterThanOrEqual(1);
+    result.pool_types_detected.forEach((t: string) => {
+      expect(t).toMatch(/^(TRADITIONAL_AMM|CLMM_DLMM|UNKNOWN)$/);
+    });
+
+    // rugcheck_score_details present when rugcheck data available
+    expect(result.rugcheck_score_details).not.toBeNull();
+    if (result.rugcheck_score_details !== null) {
+      expect(result.rugcheck_score_details).toMatchObject({
+        lp_false_positive_stripped: expect.any(Boolean),
+        stripped_score_amount:      expect.any(Number),
+      });
+      if (result.rugcheck_score_details.lp_false_positive_stripped) {
+        expect(result.rugcheck_score_details.reason).toBeTruthy();
+      }
+    }
+
     // confidence.model is 0.0–1.0
     expect(result.confidence.model).toBeGreaterThanOrEqual(0);
     expect(result.confidence.model).toBeLessThanOrEqual(1);

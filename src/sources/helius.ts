@@ -234,6 +234,123 @@ export async function checkLPBurned(
   }
 }
 
+// BPF Upgradeable Loader — pool accounts owned by this cannot be withdrawn by any wallet
+const BPF_UPGRADEABLE_LOADER = "BPFLoaderUpgradeab1e11111111111111111111111";
+
+// Known DLMM/CLMM program IDs — pools belonging to these have no fungible LP token
+const DLMM_PROGRAM_IDS = new Set([
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  // Meteora DLMM
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",   // Orca Whirlpool
+]);
+
+export interface PoolLiquiditySafety {
+  pool_address: string;
+  pool_type: "TRADITIONAL_AMM" | "DLMM_CLMM" | "UNKNOWN";
+  lp_token_exists: boolean;
+  lp_burned: boolean | null;
+  program_owned: boolean;        // owned by BPF = no one can withdraw
+  owner_program: string | null;
+  safety: "BURNED" | "PROGRAM_CONTROLLED" | "LOCKED" | "UNLOCKED" | "UNKNOWN";
+  safety_note: string;
+}
+
+function buildUnknownSafety(poolAddress: string): PoolLiquiditySafety {
+  return {
+    pool_address: poolAddress,
+    pool_type: "UNKNOWN",
+    lp_token_exists: false,
+    lp_burned: null,
+    program_owned: false,
+    owner_program: null,
+    safety: "UNKNOWN",
+    safety_note: "Pool safety could not be determined",
+  };
+}
+
+/**
+ * Determine liquidity safety for a pool by inspecting the pool account's owner program.
+ *
+ * DLMM/CLMM pools (Meteora, Raydium CLMM, Orca Whirlpool) have no fungible LP token.
+ * When the pool account is owned by a known DLMM program or BPF Upgradeable Loader,
+ * no wallet can unilaterally withdraw liquidity.
+ *
+ * Traditional AMM pools (Raydium AMM v4, PumpSwap) mint an LP token — safety depends
+ * on whether those LP tokens have been burned.
+ */
+export async function checkPoolLiquiditySafety(
+  poolAddress: string,
+  lpMintAddress: string | null,
+  options: { timeout?: number } = {}
+): Promise<PoolLiquiditySafety> {
+  if (!isAvailable("helius_rpc")) return buildUnknownSafety(poolAddress);
+
+  const timeout = options.timeout ?? 3000;
+  const start = Date.now();
+
+  type SingleResponse = { id: number; result?: any; error?: any };
+
+  try {
+    const accountResult = await rpcWithRetry<SingleResponse>(
+      (endpoint) => rpcPost<SingleResponse>(endpoint, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getAccountInfo",
+        params: [poolAddress, { encoding: "base64", commitment: "confirmed" }],
+      }, timeout)
+    );
+
+    if (!accountResult?.result?.value) {
+      recordSourceResult("helius", false, Date.now() - start);
+      return buildUnknownSafety(poolAddress);
+    }
+
+    recordSourceResult("helius", true, Date.now() - start);
+    const ownerProgram: string = accountResult.result.value.owner;
+    const isProgramOwned = ownerProgram === BPF_UPGRADEABLE_LOADER ||
+      DLMM_PROGRAM_IDS.has(ownerProgram);
+
+    // No LP mint = DLMM pool — no fungible LP token can be burned or withdrawn
+    if (!lpMintAddress) {
+      return {
+        pool_address: poolAddress,
+        pool_type: "DLMM_CLMM",
+        lp_token_exists: false,
+        lp_burned: null,
+        program_owned: isProgramOwned,
+        owner_program: ownerProgram,
+        safety: isProgramOwned ? "PROGRAM_CONTROLLED" : "UNKNOWN",
+        safety_note: isProgramOwned
+          ? "DLMM pool owned by system program — no LP token exists, liquidity cannot be withdrawn by any wallet"
+          : "DLMM pool with unknown ownership — verify independently",
+      };
+    }
+
+    // Traditional AMM — check whether LP tokens are burned
+    const lp_burned = await checkLPBurned(lpMintAddress, { timeout: Math.max(1000, timeout - (Date.now() - start)) });
+
+    return {
+      pool_address: poolAddress,
+      pool_type: "TRADITIONAL_AMM",
+      lp_token_exists: true,
+      lp_burned,
+      program_owned: isProgramOwned,
+      owner_program: ownerProgram,
+      safety: lp_burned === true ? "BURNED"
+            : isProgramOwned   ? "PROGRAM_CONTROLLED"
+            : "UNLOCKED",
+      safety_note: lp_burned === true
+        ? "LP tokens permanently burned — liquidity cannot be removed"
+        : isProgramOwned
+        ? "Pool controlled by program — withdrawal requires program upgrade"
+        : "LP tokens not burned and not locked — liquidity can be removed",
+    };
+  } catch {
+    recordSourceResult("helius", false, Date.now() - start);
+    return buildUnknownSafety(poolAddress);
+  }
+}
+
 /**
  * Estimate wallet age in days by finding its oldest transaction signature.
  *

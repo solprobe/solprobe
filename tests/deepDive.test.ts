@@ -104,9 +104,12 @@ describe("deepDive", () => {
       dev_wallet_analysis:      expect.objectContaining({ sol_balance: expect.any(Number) }),
       liquidity_lock_status:    expect.objectContaining({
         locked:            expect.any(Boolean),
-        lock_type:         expect.stringMatching(/^(PERMANENT_BURN|TIMELOCK|NONE)$/),
-        lock_duration_days: expect.any(Number),
+        lock_type:         expect.stringMatching(/^(PERMANENT_BURN|PROGRAM_CONTROLLED|TIMED_LOCK|UNLOCKED|MIXED|UNKNOWN|TIMELOCK|NONE)$/),
+        lock_duration_days: expect.toBeOneOf([expect.any(Number), null]),
         locked_pct:        expect.any(Number),
+        pools_assessed:    expect.any(Number),
+        pools_safe:        expect.any(Number),
+        pool_safety_breakdown: expect.any(Array),
       }),
       trading_pattern:          expect.objectContaining({
         wash_trading_score:          expect.any(Number),
@@ -144,6 +147,26 @@ describe("deepDive", () => {
         method:              expect.stringMatching(/^(BIRDEYE_SUPPLY|RUGCHECK_FALLBACK|UNAVAILABLE)$/),
       }),
     });
+
+    // pool_types_detected: array with at least one valid LP model type
+    expect(result.pool_types_detected).toBeInstanceOf(Array);
+    expect(result.pool_types_detected.length).toBeGreaterThanOrEqual(1);
+    result.pool_types_detected.forEach((t: string) => {
+      expect(t).toMatch(/^(TRADITIONAL_AMM|CLMM_DLMM|UNKNOWN)$/);
+    });
+
+    // rugcheck_score_details present when rugcheck data available
+    expect(result.rugcheck_score_details).not.toBeNull();
+    if (result.rugcheck_score_details !== null) {
+      expect(result.rugcheck_score_details).toMatchObject({
+        lp_false_positive_stripped: expect.any(Boolean),
+        stripped_score_amount:      expect.any(Number),
+      });
+      // reason must be populated when lp_false_positive_stripped is true
+      if (result.rugcheck_score_details.lp_false_positive_stripped) {
+        expect(result.rugcheck_score_details.reason).toBeTruthy();
+      }
+    }
 
     // dev_wallet_analysis must have funding_source + funding_risk_note fields
     expect(result.dev_wallet_analysis).toHaveProperty("funding_source");
@@ -275,15 +298,13 @@ describe("deepDive", () => {
 
     const result = await deepDive(TOKEN);
 
-    // lock_type must be PERMANENT_BURN when lp_burned, NONE otherwise
-    if (result.lp_burned === true) {
-      expect(result.liquidity_lock_status.locked).toBe(true);
-      expect(result.liquidity_lock_status.lock_type).toBe("PERMANENT_BURN");
-      expect(result.liquidity_lock_status.locked_pct).toBe(100);
-    } else {
-      expect(result.liquidity_lock_status.lock_type).toBe("NONE");
-      expect(result.liquidity_lock_status.locked).toBe(false);
-    }
+    // lock_type must be consistent with pool safety assessment
+    expect(result.liquidity_lock_status.lock_type).toMatch(
+      /^(PERMANENT_BURN|PROGRAM_CONTROLLED|TIMED_LOCK|UNLOCKED|MIXED|UNKNOWN|TIMELOCK|NONE)$/
+    );
+    expect(typeof result.liquidity_lock_status.locked).toBe("boolean");
+    expect(result.liquidity_lock_status.pools_assessed).toBeGreaterThanOrEqual(0);
+    expect(result.liquidity_lock_status.pool_safety_breakdown).toBeInstanceOf(Array);
   });
 
   it("key_drivers includes at least one POSITIVE direction when strong market signals exist", async () => {

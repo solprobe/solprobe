@@ -142,14 +142,38 @@ export type ExclusionCategory = "BURN" | "DEX_POOL" | "CEX" | "KNOWN_PROTOCOL" |
 // Deep Dive Supplemental Types (deepDive.ts only)
 // ---------------------------------------------------------------------------
 
-export type LockType = "PERMANENT_BURN" | "TIMELOCK" | "NONE";
+export type LockType =
+  | "PERMANENT_BURN"     // LP tokens sent to burn address
+  | "PROGRAM_CONTROLLED" // DLMM/CLMM pool — no fungible LP token, program owns liquidity
+  | "TIMED_LOCK"         // LP locked in time-lock contract
+  | "NOT_APPLICABLE"     // CLMM/DLMM with no traditional LP token
+  | "UNLOCKED"           // LP exists and is not burned or locked
+  | "MIXED"              // multiple pools, some locked some not
+  | "UNKNOWN"            // could not determine lock status
+  | "TIMELOCK"           // legacy alias — kept for backwards compat
+  | "NONE";              // no lock detected (legacy alias)
+
+export interface PoolSafetyBreakdown {
+  pool_address: string;
+  dex: string | null;
+  pool_type: "TRADITIONAL_AMM" | "DLMM_CLMM" | "UNKNOWN";
+  safety: "BURNED" | "PROGRAM_CONTROLLED" | "LOCKED" | "UNLOCKED" | "UNKNOWN";
+  safety_note: string;
+}
 
 export interface LiquidityLockStatus {
   locked: boolean;
   lock_type: LockType;
-  lock_duration_days: number;
+  /** null when permanently locked or lock duration is unknown */
+  lock_duration_days: number | null;
   locked_pct: number;
   note: string | null;
+  /** Number of pools assessed for LP lock status */
+  pools_assessed: number;
+  /** Number of pools where liquidity is safe (burned or program-controlled) */
+  pools_safe: number;
+  /** Per-pool safety breakdown */
+  pool_safety_breakdown: PoolSafetyBreakdown[];
 }
 
 export type WashTradingRisk = "NONE" | "LOW" | "ELEVATED" | "HIGH" | "EXTREME";
