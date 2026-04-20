@@ -102,6 +102,9 @@ function makeFetchMock(opts: MockOptions = {}) {
         data: {
           price: 0.000012,
           liquidity,
+          symbol: "BONK",
+          name: "Bonk",
+          logoURI: "https://arweave.net/hQiPZOsRZXGXBJd_82PhVdlM_hACsT_q6wqwf5cSY7I",
           // Price changes
           priceChange1hPercent:  price_change_1h,
           priceChange24hPercent: price_change_24h,
@@ -292,6 +295,10 @@ describe("marketIntel", () => {
 
     expect(result).toMatchObject({
       schema_version:       "2.0",
+      token_address:        expect.any(String),
+      symbol:               expect.toBeOneOf([expect.any(String), null]),
+      name:                 expect.toBeOneOf([expect.any(String), null]),
+      logo_uri:             expect.toBeOneOf([expect.any(String), null]),
       current_price_usd:    expect.any(Number),
       price_change_1h_pct:  expect.any(Number),
       price_change_24h_pct: expect.any(Number),

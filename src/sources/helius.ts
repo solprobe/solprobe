@@ -755,3 +755,44 @@ export async function getTokenInfo(
     token_age_days: null,    // derived from DexScreener pair_created_at_ms
   };
 }
+
+export interface WalletIdentityResult {
+  type: "exchange" | "protocol" | "wallet" | "unknown";
+  name: string | null;
+  category: string | null;
+}
+
+/**
+ * Returns the Helius wallet identity for a given address.
+ * Used to dynamically identify exchange and protocol wallets in holder lists.
+ * Returns null when HELIUS_API_KEY is missing or on any fetch failure.
+ *
+ * Verified live: AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtW2 →
+ *   {"type":"exchange","name":"Bybit Hot Wallet 1","category":"Centralized Exchange"}
+ */
+export async function getWalletIdentity(
+  address: string,
+  options: { timeout?: number } = {}
+): Promise<WalletIdentityResult | null> {
+  const apiKey = process.env.HELIUS_API_KEY;
+  if (!apiKey) return null;
+
+  const timeout = options.timeout ?? 2000;
+  const url = `https://api.helius.xyz/v1/wallet/${address}/identity?api-key=${apiKey}`;
+
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(timeout),
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const raw = await res.json() as { type?: string; name?: string; category?: string };
+    return {
+      type: (raw.type as WalletIdentityResult["type"]) ?? "unknown",
+      name: raw.name ?? null,
+      category: raw.category ?? null,
+    };
+  } catch {
+    return null;
+  }
+}

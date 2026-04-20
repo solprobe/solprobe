@@ -4,6 +4,7 @@ import {
   getBirdeyeWalletPortfolio,
   getBirdeyeWalletPnL,
   getBirdeyeWalletPnLDetails,
+  getBirdeyeWalletFirstFunded,
   type BirdeyeWalletPortfolioItem,
   type BirdeyeWalletPnLSummary,
   type BirdeyeWalletPnLDetails,
@@ -72,7 +73,9 @@ export interface WalletRiskResult {
   // ── Activity profile ──────────────────────────────────────────────────────
   activity: {
     wallet_age_days: number | null;
+    wallet_age_source: "birdeye_first_funded" | "rpc_full" | "rpc_partial" | "failed";
     total_trades: number;
+    trade_count_source: "birdeye_pnl" | "helius_fetch";
     active_days: number | null;
     last_active_hours_ago: number | null;
   };
@@ -585,6 +588,21 @@ function detectBot(
   return false;
 }
 
+// Fix 6: Bot detection from Birdeye trades-per-day (handles high-volume wallets
+// where the 200-tx Helius fetch cap makes totalTx / walletAgeDays useless).
+function detectBotFromBirdeye(data: {
+  total_trades: number | null;
+  wallet_age_days: number | null;
+}): { is_bot: boolean; bot_confidence: number } {
+  if (data.total_trades === null || data.wallet_age_days === null || data.wallet_age_days <= 0) {
+    return { is_bot: false, bot_confidence: 0 };
+  }
+  const trades_per_day = data.total_trades / data.wallet_age_days;
+  if (trades_per_day >= 500) return { is_bot: true, bot_confidence: 0.95 };
+  if (trades_per_day >= 100) return { is_bot: true, bot_confidence: 0.70 };
+  return { is_bot: false, bot_confidence: 0 };
+}
+
 function deriveTradingStyle(
   isBot: boolean,
   sniperScore: number,
@@ -800,7 +818,11 @@ function deriveWalletActivityType(data: {
   tokens_traded_30d: number | null;
   portfolio_has_holdings: boolean;
 }): WalletActivityType {
-  if (data.wallet_age_days !== null && data.wallet_age_days < 7) return "NEW_WALLET";
+  // Fix 3: high trade volume proves an established wallet regardless of computed age.
+  // The 200-tx Helius fetch cap makes wallet_age_days unreliable for active wallets;
+  // 1000+ trades is sufficient evidence this is not a new wallet.
+  const isHighVolume = data.total_trades > 1000;
+  if (!isHighVolume && data.wallet_age_days !== null && data.wallet_age_days < 7) return "NEW_WALLET";
   if (data.is_bot) return "BOT";
   if (data.last_active_hours_ago !== null && data.last_active_hours_ago > 720) return "INACTIVE";
 
@@ -1037,26 +1059,35 @@ function deriveBehaviorProfile(data: {
     };
   }
 
-  // PRO_TRADER: high win rate + large sample + disciplined hold time + non-sniper
+  // PRO_TRADER: high win rate + large sample + non-sniper.
+  // Standard path: closedCount >= 50 + disciplined hold time (1–72h).
+  // High-volume path: totalTx >= 1000 (Birdeye-reconciled) — hold time optional because
+  // avg_hold_time_hours is null without full parsed swap history (only 100 Helius txs).
+  const proTraderHoldOk =
+    data.avgHoldTimeHours !== null && data.avgHoldTimeHours >= 1 && data.avgHoldTimeHours <= 72;
+  const proTraderHighVolume = data.totalTx >= 1000;
   if (
     data.winRatePct !== null && data.winRatePct >= 60 &&
-    data.closedCount >= 50 &&
-    data.avgHoldTimeHours !== null &&
-    data.avgHoldTimeHours >= 1 && data.avgHoldTimeHours <= 72 &&
-    data.sniperScore < 40
+    data.sniperScore < 40 &&
+    (
+      (data.closedCount >= 50 && proTraderHoldOk) ||
+      proTraderHighVolume
+    )
   ) {
     evidence.push(
       `win_rate=${data.winRatePct.toFixed(1)}%`,
-      `${data.closedCount} closed positions`,
-      `avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`,
+      proTraderHighVolume
+        ? `${data.totalTx} total trades (Birdeye)`
+        : `${data.closedCount} closed positions`,
+      ...(data.avgHoldTimeHours !== null ? [`avg_hold=${data.avgHoldTimeHours.toFixed(1)}h`] : []),
       `sniper_score=${data.sniperScore} (low)`
     );
     return {
       style: "PRO_TRADER",
       consistency: data.consistency,
-      style_confidence: Math.min(0.95, 0.6 + data.closedCount / 500),
+      style_confidence: Math.min(0.95, 0.6 + (proTraderHighVolume ? data.totalTx : data.closedCount) / 500),
       style_evidence: evidence,
-      profile_summary: "experienced trader — high win rate, disciplined hold time, non-sniper entries",
+      profile_summary: "experienced trader — high win rate, non-sniper entries",
     };
   }
 
@@ -1187,10 +1218,18 @@ function buildWalletFactors(
     sf.push({ name: "win_rate", value: null, impact: 0, interpretation: "no closed trades — HODL wallet, win rate not applicable" });
   } else if (winRatePct !== null && winRatePct > 80) {
     sf.push({ name: "win_rate", value: winRatePct, impact: 10, interpretation: "suspiciously high win rate — possible insider" });
+  } else if (winRatePct !== null && winRatePct >= 70) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: "above average win rate" });
+  } else if (winRatePct !== null && winRatePct >= 60) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: "good win rate" });
+  } else if (winRatePct !== null && winRatePct >= 40) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: "normal win rate" });
   } else if (winRatePct !== null && winRatePct === 0) {
     sf.push({ name: "win_rate", value: winRatePct, impact: -15, interpretation: "0% win rate with closed trades — poor performance" });
+  } else if (winRatePct !== null) {
+    sf.push({ name: "win_rate", value: winRatePct, impact: -5, interpretation: "below average win rate" });
   } else {
-    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: winRatePct !== null ? "normal win rate" : "win rate unavailable" });
+    sf.push({ name: "win_rate", value: winRatePct, impact: 0, interpretation: "win rate unavailable" });
   }
 
   if (rugExitRatePct !== null && rugExitRatePct > 80) {
@@ -1289,12 +1328,12 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const fetchStart = Date.now();
   const SLA_ABORT_MS = fetchStart + 16_000;
 
-  // ── Phase 1: 8 parallel calls ────────────────────────────────────────────
-  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult, birdeyePnLResult, pnlDetailsResult] =
+  // ── Phase 1: 9 parallel calls ────────────────────────────────────────────
+  const [sigsResult, accountResult, assetsResult, parsedTxResult, solPriceResult, portfolioResult, birdeyePnLResult, pnlDetailsResult, firstFundedResult] =
     await Promise.allSettled([
-      // 1. Recent signatures — wallet age + total tx count
+      // 1. Recent signatures — page 1 of up to 1000 (Fix 1: increased from 200 for better wallet age)
       rpcWithFallback<any[]>(
-        { jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params: [address, { limit: 200 }] },
+        { jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params: [address, { limit: 1000 }] },
         8000
       ),
       // 2. SOL balance
@@ -1318,15 +1357,18 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       getBirdeyeWalletPnL(address, { timeout: 6000 }),
       // 8. Birdeye PnL details — per-token breakdown for unrealized_pnl_pct
       getBirdeyeWalletPnLDetails(address, { timeout: 6000 }),
+      // 9. Birdeye first funded — authoritative wallet creation timestamp
+      getBirdeyeWalletFirstFunded(address, { timeout: 4000 }),
     ]);
 
   if (sigsResult.status     === "rejected") logError("getSignaturesForAddress", sigsResult.reason);
   if (accountResult.status  === "rejected") logError("getAccountInfo",          accountResult.reason);
   if (assetsResult.status   === "rejected") logError("getAssetsByOwner",        assetsResult.reason);
   if (parsedTxResult.status === "rejected") logError("parsedTransactions",      parsedTxResult.reason);
+  if (portfolioResult.status === "rejected") logError("birdeye_portfolio", portfolioResult.reason);
 
   // Extract Phase 1 results
-  const sigs: any[] | null =
+  let sigs: any[] | null =
     sigsResult.status === "fulfilled" && Array.isArray(sigsResult.value)
       ? sigsResult.value
       : null;
@@ -1351,18 +1393,68 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   const pnlDetails: BirdeyeWalletPnLDetails | null =
     pnlDetailsResult.status === "fulfilled" ? pnlDetailsResult.value : null;
 
-  // ── Basic signals from signatures ────────────────────────────────────────
-  const totalTx = sigs?.length ?? 0;
-  let walletAgeDays: number | null = null;
-  let oldestSig: string | null = null;
+  // block_unix_time of the wallet's first ever SOL receipt — authoritative creation time
+  const firstFundedUnix: number | null =
+    firstFundedResult.status === "fulfilled" ? firstFundedResult.value : null;
 
+  // ── Basic signals from signatures ────────────────────────────────────────
+  const sigCount = sigs?.length ?? 0;      // raw on-chain sig count (up to 2000)
+  let oldestSig: string | null = null;
   if (sigs && sigs.length > 0) {
-    const oldest = sigs[sigs.length - 1];
-    oldestSig = oldest.signature ?? null;
-    if (typeof oldest.blockTime === "number") {
-      walletAgeDays = (Date.now() / 1000 - oldest.blockTime) / 86400;
-    }
+    oldestSig = sigs[sigs.length - 1]?.signature ?? null;
   }
+
+  // ── Wallet age — Birdeye first-funded is authoritative; RPC sigs are fallback ──
+  // Birdeye POST /wallet/v2/tx/first-funded returns the true first SOL receipt across
+  // the full chain history, unaffected by the RPC pagination cap.
+  // RPC pagination (up to 2000 sigs) is only used when Birdeye is unavailable.
+  let walletAgeDays: number | null = null;
+  let walletAgeSource: "birdeye_first_funded" | "rpc_full" | "rpc_partial" | "failed" = "failed";
+
+  if (firstFundedUnix !== null) {
+    walletAgeDays = (Date.now() / 1000 - firstFundedUnix) / 86400;
+    walletAgeSource = "birdeye_first_funded";
+  } else {
+    // Fallback: RPC pagination (Fix 1 — kept as secondary source)
+    if (sigs !== null && sigs.length === 1000 && Date.now() < SLA_ABORT_MS - 5000) {
+      const lastSigOfPage1 = sigs[sigs.length - 1]?.signature as string | undefined;
+      if (lastSigOfPage1) {
+        const page2 = await rpcWithFallback<any[]>(
+          { jsonrpc: "2.0", id: 11, method: "getSignaturesForAddress",
+            params: [address, { limit: 1000, before: lastSigOfPage1 }] },
+          2000
+        );
+        if (page2 !== null && page2.length > 0) {
+          sigs = [...sigs, ...page2];
+          walletAgeSource = page2.length < 1000 ? "rpc_full" : "rpc_partial";
+        } else {
+          walletAgeSource = "rpc_partial";
+        }
+      } else {
+        walletAgeSource = "rpc_partial";
+      }
+    } else if (sigs !== null && sigs.length > 0 && sigs.length < 1000) {
+      walletAgeSource = "rpc_full";
+    } else if (sigs !== null && sigs.length === 0) {
+      walletAgeSource = "rpc_full";
+    }
+
+    if (sigs && sigs.length > 0) {
+      const oldest = sigs[sigs.length - 1];
+      if (typeof oldest.blockTime === "number") {
+        walletAgeDays = (Date.now() / 1000 - oldest.blockTime) / 86400;
+      }
+    }
+
+    if (walletAgeDays === null) walletAgeSource = "failed";
+  }
+
+  // ── Fix 2: Reconcile total_transactions vs total_trades ───────────────────
+  // Birdeye PnL summary total_trades is the authoritative trade count for high-volume
+  // wallets. The sig count is capped by RPC pagination and undercounts real activity.
+  const reconciledTradeCount: number = birdeyePnL?.total_trades ?? sigCount;
+  const tradeCountSource: "birdeye_pnl" | "helius_fetch" =
+    birdeyePnL?.total_trades != null ? "birdeye_pnl" : "helius_fetch";
 
   // ── SOL balance + whale status ────────────────────────────────────────────
   const lamports: number = accountInfo?.value?.lamports ?? 0;
@@ -1378,7 +1470,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     tokensTradedLast30d = computeTokensTraded30d(address, parsedTxs);
   }
 
-  const isBot = detectBot(walletAgeDays, totalTx, parsedTxs ?? [], address);
+  const heliosBotDetected = detectBot(walletAgeDays, sigCount, parsedTxs ?? [], address);
+  const birdeyeBotResult = detectBotFromBirdeye({ total_trades: birdeyePnL?.total_trades ?? null, wallet_age_days: walletAgeDays });
+  const isBot = heliosBotDetected || birdeyeBotResult.is_bot;
   let { win_rate_pct: winRatePct, win_rate_calculation_status } = resolveWinRate(positions, parsedTxs);
   const avgHoldTimeHours = computeAvgHoldTime(positions);
 
@@ -1483,7 +1577,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   // ── Legacy trading style (flat backwards compat) ──────────────────────────
   const tradingStyle = deriveTradingStyle(
     isBot, sniperScore, avgHoldTimeHours, tokensTradedLast30d,
-    winRatePct, totalTx, walletAgeDays, closedCount
+    winRatePct, reconciledTradeCount, walletAgeDays, closedCount
   );
 
   const riskScore = computeRiskScore(
@@ -1564,7 +1658,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   // ── Classification ────────────────────────────────────────────────────────
   const strongSignals = factors.filter((f) => f.impact >= 20).length;
   const classification: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN" =
-    (totalTx < 10 || (walletAgeDays !== null && walletAgeDays < 7) || walletAgeDays === null)
+    (reconciledTradeCount < 10 || (walletAgeDays !== null && walletAgeDays < 7) || walletAgeDays === null)
       ? "UNKNOWN"
       : (score_overall >= 70 && strongSignals >= 2)
         ? "HIGH_RISK"
@@ -1625,7 +1719,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
   const wallet_activity_type = deriveWalletActivityType({
     wallet_age_days: walletAgeDays,
-    total_trades: birdeyePnL?.total_trades ?? totalTx,
+    total_trades: reconciledTradeCount,
     avg_hold_time_hours: avgHoldTimeHours,
     is_bot: isBot,
     sniper_score: sniperScore,
@@ -1668,7 +1762,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     avgHoldTimeHours,
     tokensTradedLast30d,
     winRatePct,
-    totalTx,
+    totalTx: reconciledTradeCount,
     walletAgeDays,
     closedCount,
     earlyEntryRatePct: null,      // not yet wired from Helius
@@ -1704,11 +1798,11 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   // ── Risk signals ──────────────────────────────────────────────────────────
   const risk_signals: Array<{ name: string; impact: "LOW" | "MEDIUM" | "HIGH"; reason: string }> = [];
 
-  if (totalTx < 10 || walletAgeDays === null || (walletAgeDays !== null && walletAgeDays < 7)) {
+  if (reconciledTradeCount < 10 || walletAgeDays === null || (walletAgeDays !== null && walletAgeDays < 7)) {
     risk_signals.push({
       name: "low_history",
       impact: "MEDIUM",
-      reason: `only ${totalTx} trades found — insufficient evidence for strong classification`,
+      reason: `only ${reconciledTradeCount} trades found — insufficient evidence for strong classification`,
     });
   }
   if (sniperScore > 70) {
@@ -1728,6 +1822,29 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
   if (dusting_analysis.dusting_risk === "HIGH") {
     risk_signals.push({ name: "active_dusting", impact: "MEDIUM", reason: dusting_analysis.meaning });
   }
+  // Fix 7: Anomaly signals — high PnL with low sniper score is alpha signal;
+  // high PnL on a young wallet may indicate insider access or pre-launch advantage.
+  if (
+    pnl.total_pnl_usdc !== null && pnl.total_pnl_usdc > 10_000 &&
+    sniperScore < 30 &&
+    winRatePct !== null && winRatePct >= 60
+  ) {
+    risk_signals.push({
+      name: "high_pnl_low_sniper_anomaly",
+      impact: "LOW",
+      reason: `${pnl.total_pnl_usdc >= 0 ? "+" : ""}$${Math.round(pnl.total_pnl_usdc).toLocaleString()} PnL with sniper score ${sniperScore} — skill-based edge, not front-running`,
+    });
+  }
+  if (
+    pnl.total_pnl_usdc !== null && pnl.total_pnl_usdc > 50_000 &&
+    walletAgeDays !== null && walletAgeDays < 90
+  ) {
+    risk_signals.push({
+      name: "high_pnl_young_wallet",
+      impact: "MEDIUM",
+      reason: `$${Math.round(pnl.total_pnl_usdc).toLocaleString()} PnL on wallet only ${Math.round(walletAgeDays)}d old — may indicate insider access or pre-launch positioning`,
+    });
+  }
 
   // ── Historical exposure (cross-token scan — outside 20s SLA) ─────────────
   // Not computed within the SLA window; null signals "not yet scanned"
@@ -1738,7 +1855,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
   // ── Copy-trade classification ─────────────────────────────────────────────
   const copy_trading = classifyCopyTrading({
-    total_trades: closedCount,
+    total_trades: birdeyePnL?.total_trades ?? closedCount,
     win_rate_pct: winRatePct !== null ? Math.round(winRatePct * 10) / 10 : null,
     win_rate_calculation_status,
     avg_hold_time_hours: avgHoldTimeHours !== null ? Math.round(avgHoldTimeHours * 10) / 10 : null,
@@ -1758,7 +1875,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     classification,
     activity: {
       wallet_age_days: walletAgeDaysRounded,
-      total_trades: birdeyePnL?.total_trades ?? totalTx,
+      wallet_age_source: walletAgeSource,
+      total_trades: reconciledTradeCount,
+      trade_count_source: tradeCountSource,
       active_days: activeDays,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
@@ -1792,7 +1911,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     // ── Activity profile ────────────────────────────────────────────────────
     activity: {
       wallet_age_days: walletAgeDaysRounded,
-      total_trades: birdeyePnL?.total_trades ?? totalTx,
+      wallet_age_source: walletAgeSource,
+      total_trades: reconciledTradeCount,
+      trade_count_source: tradeCountSource,
       active_days: activeDays,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
@@ -1800,7 +1921,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
 
     // ── Legacy flat fields ──────────────────────────────────────────────────
     wallet_age_days: walletAgeDaysRounded,
-    total_transactions: totalTx,
+    total_transactions: sigCount,
     tokens_traded_30d: tokensTradedLast30d,
 
     // ── Behavioural signals ─────────────────────────────────────────────────

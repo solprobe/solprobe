@@ -283,3 +283,23 @@ export interface ClusterGroup {
   /** Combined supply % held by this cluster; null until deep dive populates it. */
   supply_pct_combined: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// Last Trade Types (deepDive.ts only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Adversarial freshness signal — when did the token last trade?
+ * Sourced from Birdeye lastTradeUnixTime. Dead/dormant recency downgrades
+ * the recommendation action in buildRecommendation().
+ */
+export interface LastTrade {
+  /** Unix timestamp of the most recent trade; null when unavailable. */
+  timestamp: number | null;
+  /** Hours since the last trade; null when timestamp unavailable. */
+  hours_ago: number | null;
+  /** Freshness classification. */
+  recency: "ACTIVE" | "RECENT" | "STALE" | "DORMANT" | "DEAD" | "UNKNOWN";
+  /** Human-readable explanation of the recency band. */
+  recency_note: string;
+}

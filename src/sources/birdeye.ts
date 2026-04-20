@@ -5,6 +5,7 @@ const BASE_URL            = "https://public-api.birdeye.so/defi/token_overview";
 const OHLCV_URL           = "https://public-api.birdeye.so/defi/ohlcv";
 const CREATION_INFO_URL   = "https://public-api.birdeye.so/defi/token_creation_info";
 const TOKEN_SECURITY_URL  = "https://public-api.birdeye.so/defi/token_security";
+const TOKEN_TXS_URL       = "https://public-api.birdeye.so/defi/txs/token";
 
 // ---------------------------------------------------------------------------
 // OHLCV candle — defined here (sources layer) so marketIntel.ts can import it
@@ -32,6 +33,13 @@ export interface BirdeyeTokenData {
   volume_24h_usd: number | null;
   price_change_1h_pct: number | null;
   price_change_24h_pct: number | null;
+  price_change_5m_pct: number | null;
+  price_change_30m_pct: number | null;
+  price_change_8h_pct: number | null;
+  last_trade_unix_time: number | null;
+  symbol: string | null;
+  name: string | null;
+  logo_uri: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +111,13 @@ export interface BirdeyeTokenOverview {
 
   // First trade timestamp (Unix seconds); null for BONK (field absent on established tokens)
   first_trade_unix_time: number | null;     // firstTradeUnixTime
+  // Last trade timestamp (Unix seconds); verified via live curl: "lastTradeUnixTime": 1776515977
+  last_trade_unix_time: number | null;      // lastTradeUnixTime
+
+  // Token identity — verified via live curl against BONK: symbol="Bonk", name="Bonk", logoURI=...
+  symbol: string | null;                    // symbol
+  name: string | null;                      // name
+  logo_uri: string | null;                  // logoURI
 }
 
 // Raw response shape from Birdeye token_overview endpoint
@@ -149,6 +164,10 @@ interface RawBirdeyeOverview {
 
   holder?: number | null;
   firstTradeUnixTime?: number | null;
+  lastTradeUnixTime?: number | null;
+  symbol?: string | null;
+  name?: string | null;
+  logoURI?: string | null;
 }
 
 interface RawBirdeyeResponse {
@@ -261,6 +280,11 @@ export async function getBirdeyeTokenOverview(
     holder: d.holder ?? null,
 
     first_trade_unix_time: d.firstTradeUnixTime ?? null,
+    last_trade_unix_time: d.lastTradeUnixTime ?? null,
+
+    symbol: d.symbol ?? null,
+    name: d.name ?? null,
+    logo_uri: d.logoURI ?? null,
   };
 }
 
@@ -340,7 +364,34 @@ export async function getBirdeyeToken(
     volume_24h_usd: overview.volume_24h_usd,
     price_change_1h_pct: overview.price_change_1h_pct,
     price_change_24h_pct: overview.price_change_24h_pct,
+    price_change_5m_pct: overview.price_change_5m_pct,
+    price_change_30m_pct: overview.price_change_30m_pct,
+    price_change_8h_pct: overview.price_change_8h_pct,
+    last_trade_unix_time: overview.last_trade_unix_time,
+    symbol: overview.symbol,
+    name: overview.name,
+    logo_uri: overview.logo_uri,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight token metadata — identity fields only (symbol, name, logoURI).
+// Used by quickScan which doesn't otherwise fetch token_overview.
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeTokenMetadata {
+  symbol: string | null;
+  name: string | null;
+  logo_uri: string | null;
+}
+
+export async function getBirdeyeTokenMetadata(
+  address: string,
+  options: { timeout?: number } = {}
+): Promise<BirdeyeTokenMetadata | null> {
+  const overview = await getBirdeyeTokenOverview(address, { timeout: options.timeout ?? 2000 });
+  if (!overview) return null;
+  return { symbol: overview.symbol, name: overview.name, logo_uri: overview.logo_uri };
 }
 
 /**
@@ -405,6 +456,10 @@ export interface BirdeyeTokenSecurity {
   metaplex_update_authority: string | null;
   creator_address: string | null;
   total_supply: number | null;
+  /** Creator's share of total supply, 0–100. Null when not available. */
+  creator_percentage: number | null;
+  /** Top-10 holder share (0–100), excluding DEX pools per Birdeye's own filtering. */
+  top_10_holder_percent: number | null;
 }
 
 export async function getBirdeyeTokenSecurity(
@@ -438,6 +493,8 @@ export async function getBirdeyeTokenSecurity(
       metaplexUpdateAuthority?: string | null;
       creatorAddress?: string | null;
       totalSupply?: number | null;
+      creatorPercentage?: number | null;     // 0.0–1.0 scale
+      top10HolderPercent?: number | null;    // 0.0–1.0 scale (Birdeye DEX-filtered)
     };
   };
 
@@ -453,6 +510,9 @@ export async function getBirdeyeTokenSecurity(
     metaplex_update_authority: d.metaplexUpdateAuthority ?? null,
     creator_address: d.creatorAddress ?? null,
     total_supply: typeof d.totalSupply === "number" ? d.totalSupply : null,
+    // Fields are 0.0–1.0 scale — multiply ×100 for percent
+    creator_percentage: typeof d.creatorPercentage === "number" ? Math.round(d.creatorPercentage * 100 * 100) / 100 : null,
+    top_10_holder_percent: typeof d.top10HolderPercent === "number" ? Math.round(d.top10HolderPercent * 100 * 100) / 100 : null,
   };
 }
 
@@ -801,6 +861,69 @@ export async function getBirdeyeWalletPnL(
 }
 
 // ---------------------------------------------------------------------------
+// Wallet first funded — Birdeye POST /wallet/v2/tx/first-funded
+// Fields verified via live curl on 2026-04-20:
+//   .data["<wallet>"].block_unix_time  (unix timestamp of first SOL receipt)
+//   .data["<wallet>"].tx_hash
+// Returns unix timestamp or null on failure.
+// ---------------------------------------------------------------------------
+
+export async function getBirdeyeWalletFirstFunded(
+  walletAddress: string,
+  options: { timeout: number }
+): Promise<number | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const start = Date.now();
+  const url = "https://public-api.birdeye.so/wallet/v2/tx/first-funded";
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "X-API-KEY": apiKey,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "x-chain": "solana",
+      },
+      body: JSON.stringify({ wallets: [walletAddress] }),
+      signal: AbortSignal.timeout(options.timeout),
+    });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: Record<string, { block_unix_time?: number }>;
+  };
+
+  if (!json.success || !json.data) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  const entry = json.data[walletAddress];
+  const blockTime = entry?.block_unix_time ?? null;
+
+  recordSourceResult("birdeye", typeof blockTime === "number", Date.now() - start);
+  if (typeof blockTime === "number") recordSuccess("birdeye");
+
+  return typeof blockTime === "number" ? blockTime : null;
+}
+
+// ---------------------------------------------------------------------------
 // Wallet portfolio — current token holdings with live prices
 // Fields verified via live curl on 2026-04-08:
 //   .data.items[n] = { address, symbol, uiAmount, priceUsd, valueUsd }
@@ -908,4 +1031,174 @@ export async function getTokenOHLCV(
   const ath_price_usd = Math.max(...items.map((c) => c.h ?? 0));
   if (ath_price_usd <= 0) return null; // all candles have h=0 or missing
   return { ath_price_usd, candles: items.length };
+}
+
+// ---------------------------------------------------------------------------
+// Bundled launch detection via Birdeye early trades
+// Endpoint: GET /defi/txs/token?sort_type=asc&tx_type=swap
+// Fields verified via live curl on 2026-04-16:
+//   .data.items[n].blockUnixTime = number  (confirmed field name)
+//   .data.items[n].owner         = string  (wallet address — buyer)
+//   .data.items[n].txHash        = string
+//   NOTE: feePayer is null in the v1 endpoint — same-blockUnixTime clustering
+//         on the owner field is the primary bundler signal.
+// ---------------------------------------------------------------------------
+
+export interface BundlerDetectionResult {
+  bundled_launch_detected: boolean;
+  bundler_count: number;
+  bundler_fee_payers: string[];
+  bundled_sol_spent: number;
+  bundled_supply_pct: number | null;
+  launch_window_txs_analysed: number;
+  detection_method: "LAUNCH_WINDOW_FEE_PAYER" | "RUGCHECK_FALLBACK" | "UNKNOWN";
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  meaning: string;
+  action_guidance: string;
+}
+
+export const BUNDLER_NULL_RESULT: BundlerDetectionResult = {
+  bundled_launch_detected: false,
+  bundler_count: 0,
+  bundler_fee_payers: [],
+  bundled_sol_spent: 0,
+  bundled_supply_pct: null,
+  launch_window_txs_analysed: 0,
+  detection_method: "UNKNOWN",
+  confidence: "LOW",
+  meaning: "Launch window transactions could not be retrieved. Bundler detection was not completed.",
+  action_guidance: "Cannot assess bundler risk from available data.",
+};
+
+/**
+ * Detect bundled launches by clustering wallets that bought in the same block
+ * during the launch window.
+ *
+ * Primary signal: ≥3 distinct `owner` wallets sharing an identical `blockUnixTime`
+ *   within 300 s of the earliest recorded trade. Since feePayer is null in the
+ *   Birdeye v1 response, same-block buyer clustering is the strongest available signal.
+ *
+ * Confidence ceiling: "MEDIUM" because we lack fee-payer data.
+ * The `bundler_fee_payers` field is populated with the actual buyer wallet addresses
+ * that participated in coordinated same-block buying during the launch window.
+ *
+ * @param mintAddress  Token mint address
+ * @param tokenCreationTime  Unix timestamp from Birdeye token_creation_info; pass 0
+ *                           to use the earliest trade's timestamp as the window anchor.
+ */
+export async function detectBundledLaunchViaBirdeye(
+  mintAddress: string,
+  tokenCreationTime: number,
+  options: { timeout: number }
+): Promise<BundlerDetectionResult> {
+  if (!isAvailable("birdeye")) return BUNDLER_NULL_RESULT;
+
+  const url = `${TOKEN_TXS_URL}?address=${encodeURIComponent(mintAddress)}&limit=50&tx_type=swap&sort_type=asc`;
+  const start = Date.now();
+  const headers = buildHeaders();
+
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(options.timeout), headers });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return BUNDLER_NULL_RESULT;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return BUNDLER_NULL_RESULT;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: { items?: Array<{ blockUnixTime?: number; owner?: string; txHash?: string }> };
+  };
+
+  if (!json.success || !json.data?.items) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return BUNDLER_NULL_RESULT;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+
+  const allTrades = json.data.items.filter(
+    (item): item is { blockUnixTime: number; owner: string; txHash?: string } =>
+      typeof item.blockUnixTime === "number" && typeof item.owner === "string" && item.owner.length > 0
+  );
+
+  if (allTrades.length === 0) {
+    return { ...BUNDLER_NULL_RESULT, detection_method: "LAUNCH_WINDOW_FEE_PAYER" };
+  }
+
+  // Window anchor: prefer tokenCreationTime; fall back to earliest trade timestamp.
+  const windowStart = tokenCreationTime > 0 ? tokenCreationTime : allTrades[0].blockUnixTime;
+
+  // Narrow window first (60 s), expand to 300 s if too few trades.
+  let windowTxs = allTrades.filter(t => t.blockUnixTime >= windowStart && t.blockUnixTime <= windowStart + 60);
+  if (windowTxs.length < 3) {
+    windowTxs = allTrades.filter(t => t.blockUnixTime >= windowStart && t.blockUnixTime <= windowStart + 300);
+  }
+
+  if (windowTxs.length === 0) {
+    return {
+      ...BUNDLER_NULL_RESULT,
+      launch_window_txs_analysed: 0,
+      detection_method: "LAUNCH_WINDOW_FEE_PAYER",
+    };
+  }
+
+  // Primary signal: ≥3 distinct buyer wallets in the exact same block.
+  // feePayer is null per verified Birdeye v1 response — use owner as the clustering key.
+  const blockMap = new Map<number, Set<string>>();
+  for (const tx of windowTxs) {
+    if (!blockMap.has(tx.blockUnixTime)) blockMap.set(tx.blockUnixTime, new Set());
+    blockMap.get(tx.blockUnixTime)!.add(tx.owner);
+  }
+
+  const CLUSTER_THRESHOLD = 3;
+  const coordBlocks: number[] = [];
+  let totalBundledWallets = new Set<string>();
+
+  for (const [block, owners] of blockMap.entries()) {
+    if (owners.size >= CLUSTER_THRESHOLD) {
+      coordBlocks.push(block);
+      owners.forEach(o => totalBundledWallets.add(o));
+    }
+  }
+
+  const detected = coordBlocks.length > 0;
+
+  // bundler_fee_payers: actual buyer wallet addresses discovered during clustering.
+  // feePayer is unavailable in Birdeye v1 — these are the coordinated buyer wallets.
+  const bundlerFeePayers = Array.from(totalBundledWallets);
+
+  // Confidence ceiling: MEDIUM because feePayer is absent.
+  // Elevate to HIGH only if two or more blocks show coordinated buying.
+  const confidence: "HIGH" | "MEDIUM" | "LOW" = detected
+    ? coordBlocks.length >= 2 ? "HIGH" : "MEDIUM"
+    : "LOW";
+
+  const meaning = detected
+    ? `${totalBundledWallets.size} distinct wallet${totalBundledWallets.size !== 1 ? "s" : ""} bought this token ` +
+      `in the same block during the launch window — consistent with pre-planned coordinated accumulation.`
+    : `No same-block buyer clustering detected in the launch window. Launch appears organic based on available data.`;
+
+  const action_guidance = detected
+    ? `Coordinated wallets may distribute supply over time, creating sustained sell pressure. ` +
+      `Monitor for coordinated sell-offs. Current holder distribution may not reflect launch-time insider accumulation.`
+    : `No bundler pattern detected. Launch appears organic based on available data.`;
+
+  return {
+    bundled_launch_detected: detected,
+    bundler_count: totalBundledWallets.size,
+    bundler_fee_payers: bundlerFeePayers,
+    bundled_sol_spent: 0,  // not available from Birdeye v1 swap data
+    bundled_supply_pct: null,
+    launch_window_txs_analysed: windowTxs.length,
+    detection_method: "LAUNCH_WINDOW_FEE_PAYER",
+    confidence,
+    meaning,
+    action_guidance,
+  };
 }

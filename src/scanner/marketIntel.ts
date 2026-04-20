@@ -33,6 +33,10 @@ export interface MarketTimeframe {
 
 export interface MarketIntelResult {
   schema_version: "2.0";
+  token_address: string;
+  symbol: string | null;
+  name: string | null;
+  logo_uri: string | null;
   current_price_usd: number;
   price_change_5m_pct: number | null;
   price_change_15m_pct: number | null;  // mapped from Birdeye 30m (no 15m available)
@@ -1104,6 +1108,8 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     token_health,
     pct_from_ath,
     factors,
+    name: birdData?.name ?? null,
+    symbol: birdData?.symbol ?? null,
   };
 
   let market_summary: string;
@@ -1115,8 +1121,17 @@ async function _fetchMarketIntel(address: string): Promise<MarketIntelResult> {
     market_summary = await generateMarketIntelSummary(llmInput);
   }
 
+  const symbol = birdData?.symbol ?? null;
+  const name   = birdData?.name   ?? null;
+  const logo_uri = birdData?.logo_uri ?? null;
+  if (symbol === null && name === null) missing_fields.push("token_metadata");
+
   return {
     schema_version: "2.0" as const,
+    token_address: address,
+    symbol,
+    name,
+    logo_uri,
     current_price_usd,
     price_change_5m_pct,
     price_change_15m_pct,

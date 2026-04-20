@@ -6,22 +6,23 @@ export type { ScoringFactor };
 export interface RiskFactors {
   mint_authority_revoked: boolean | null;   // null → treat as false (25pt penalty)
   freeze_authority_revoked: boolean | null; // null → treat as false (15pt penalty)
-  top_10_holder_pct: number | null;         // null → treat as 100% (worst-case)
+  /** Birdeye-live adjusted holder concentration (protocol/DEX/burn addresses excluded). null → treat as 100% (worst-case) */
+  adjusted_top_10_holder_pct: number | null;
   liquidity_usd: number | null;             // null → treat as $0 (worst-case)
   has_rug_history: boolean;                 // true → instant F
-  bundled_launch: boolean;                  // true → 20pt penalty
+  bundled_launch: boolean;                  // true → penalty varies by confidence + token age
+  /** Confidence from Birdeye bundler detection. null = fallback to RugCheck (treat as HIGH). */
+  bundled_launch_confidence?: "HIGH" | "MEDIUM" | "LOW" | null;
   buy_sell_ratio: number | null;            // null → no penalty (insufficient data)
   token_age_days: number | null;            // null → 10pt penalty
-  rugcheck_risk_score: number | null;       // RugCheck aggregate score
-  single_holder_danger: boolean;            // RugCheck risks[] "Single holder ownership" at danger
+  /** Birdeye-live: any single non-excluded holder ≥ 15% of supply */
+  single_holder_danger: boolean;
   lp_burned: boolean | null;               // raw burn check result (false or null before derivation)
   lp_model: LPModel;                        // DEX model — determines whether LP burn is meaningful
   lp_status: LPStatus;                      // derived from lp_burned + lp_model
   dex_id: string | null;                    // dexId of the primary pair
   dev_wallet_age_days: number | null;       // deep dive only; null for quick scan
   launch_pattern?: "SAME_BLOCK" | "WITHIN_5_BLOCKS" | "NORMAL" | "UNKNOWN"; // quick scan only
-  // Deep dive adjusted holder concentration (protocol addresses excluded)
-  adjusted_top_10_holder_pct?: number | null;
   // Dev wallet funding source type (deep dive only)
   dev_funder_type?: FunderType | null;
   // Deep dive supplemental signals
@@ -30,9 +31,8 @@ export interface RiskFactors {
   authority_ever_regranted?: boolean;               // any SET_AUTHORITY tx post-launch
   wash_trading_circular_pairs?: number;             // A→B→A circular swap pairs detected
   post_launch_mints?: number;                       // MINT_TO events after token creation
-  // LP false-positive correction metadata (FIX 4)
-  rugcheck_lp_stripped?: boolean;                   // true when LP risks were removed from RugCheck score
-  rugcheck_raw_score?: number | null;               // raw RugCheck score before LP correction
+  // Birdeye-derived supply signals
+  creator_supply_pct?: number | null;               // creator's % of total supply
 }
 
 export type RiskGrade = "A" | "B" | "C" | "D" | "F";
@@ -102,115 +102,79 @@ export function calculateRiskGrade(
     }
   }
 
-  // Holder concentration — skipped for exempt tokens
+  // Holder concentration — Birdeye-adjusted (protocol/DEX/burn addresses excluded), skipped for exempt tokens
   if (!exempt) {
-    const holderPct = factors.top_10_holder_pct ?? 100;
-    if (holderPct > 90) {
+    const adj = factors.adjusted_top_10_holder_pct ?? 100;
+    if (adj > 90) {
       score -= 35;
       sf.push({
-        name: "top_10_holders",
-        value: factors.top_10_holder_pct,
+        name: "top_10_holder_concentration",
+        value: adj,
         impact: -35,
-        interpretation: `top-10 hold ${holderPct.toFixed(0)}% — extreme concentration`,
+        interpretation: `top-10 hold ${adj.toFixed(0)}% — extreme concentration`,
       });
-    } else if (holderPct > 60) {
+    } else if (adj > 60) {
       score -= 20;
       sf.push({
-        name: "top_10_holders",
-        value: factors.top_10_holder_pct,
+        name: "top_10_holder_concentration",
+        value: adj,
         impact: -20,
-        interpretation: `top-10 hold ${holderPct.toFixed(0)}% — high concentration`,
+        interpretation: `top-10 hold ${adj.toFixed(0)}% — high concentration`,
       });
     } else {
       sf.push({
-        name: "top_10_holders",
-        value: factors.top_10_holder_pct,
+        name: "top_10_holder_concentration",
+        value: adj,
         impact: 0,
-        interpretation: `top-10 hold ${holderPct.toFixed(0)}% — healthy distribution`,
+        interpretation: `top-10 hold ${adj.toFixed(0)}% — healthy distribution`,
       });
     }
   }
 
-  // Adjusted holder concentration (protocol/DEX addresses excluded) — deep dive only, not exempt
-  if (!exempt && factors.adjusted_top_10_holder_pct != null) {
-    const adj = factors.adjusted_top_10_holder_pct;
-    if (adj > 40) {
-      score -= 25;
-      sf.push({
-        name: "adjusted_holder_concentration",
-        value: adj,
-        impact: -25,
-        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — high insider concentration`,
-      });
-    } else if (adj > 20) {
-      score -= 10;
-      sf.push({
-        name: "adjusted_holder_concentration",
-        value: adj,
-        impact: -10,
-        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — elevated insider concentration`,
-      });
-    } else {
-      sf.push({
-        name: "adjusted_holder_concentration",
-        value: adj,
-        impact: 0,
-        interpretation: `adjusted top-10 ${adj.toFixed(0)}% — normal after exclusions`,
-      });
-    }
-  }
-
-  // RugCheck risk score — never skipped for exempt tokens
-  // rugcheck_risk_score is the adjusted score (LP false positives already stripped).
-  // rugcheck_lp_stripped and rugcheck_raw_score carry the correction metadata.
-  const lpCorrectionSuffix = factors.rugcheck_lp_stripped
-    ? ` (LP-adj from ${factors.rugcheck_raw_score ?? "?"})`
-    : "";
-  if (factors.rugcheck_risk_score !== null && factors.rugcheck_risk_score !== undefined) {
-    if (factors.rugcheck_risk_score > 5_000) {
+  // Creator supply concentration — Birdeye-derived, replaces RugCheck score penalties
+  if (factors.creator_supply_pct !== null && factors.creator_supply_pct !== undefined) {
+    if (factors.creator_supply_pct > 20) {
       score -= 30;
       sf.push({
-        name: "rugcheck_score",
-        value: factors.rugcheck_risk_score,
+        name: "creator_supply_pct",
+        value: factors.creator_supply_pct,
         impact: -30,
-        interpretation: `extreme rug risk score (>5000)${lpCorrectionSuffix}`,
+        interpretation: `creator holds ${factors.creator_supply_pct.toFixed(1)}% of supply (>20%)`,
       });
-    } else if (factors.rugcheck_risk_score > 2_000) {
-      score -= 20;
+    } else if (factors.creator_supply_pct > 10) {
+      score -= 15;
       sf.push({
-        name: "rugcheck_score",
-        value: factors.rugcheck_risk_score,
-        impact: -20,
-        interpretation: `high rug risk score (>2000)${lpCorrectionSuffix}`,
+        name: "creator_supply_pct",
+        value: factors.creator_supply_pct,
+        impact: -15,
+        interpretation: `creator holds ${factors.creator_supply_pct.toFixed(1)}% of supply (>10%)`,
       });
-    } else if (factors.rugcheck_risk_score > 1_000) {
-      score -= 10;
+    } else if (factors.creator_supply_pct > 5) {
+      score -= 5;
       sf.push({
-        name: "rugcheck_score",
-        value: factors.rugcheck_risk_score,
-        impact: -10,
-        interpretation: `elevated rug risk score (>1000)${lpCorrectionSuffix}`,
+        name: "creator_supply_pct",
+        value: factors.creator_supply_pct,
+        impact: -5,
+        interpretation: `creator holds ${factors.creator_supply_pct.toFixed(1)}% of supply (>5%)`,
       });
     } else {
       sf.push({
-        name: "rugcheck_score",
-        value: factors.rugcheck_risk_score,
+        name: "creator_supply_pct",
+        value: factors.creator_supply_pct,
         impact: 0,
-        interpretation: factors.rugcheck_lp_stripped
-          ? `low risk score${lpCorrectionSuffix}`
-          : "low risk score",
+        interpretation: `creator holds ${factors.creator_supply_pct.toFixed(1)}% of supply — normal`,
       });
     }
   } else {
     sf.push({
-      name: "rugcheck_score",
+      name: "creator_supply_pct",
       value: null,
       impact: 0,
-      interpretation: "RugCheck score unavailable",
+      interpretation: "creator supply % unavailable",
     });
   }
 
-  // Single holder danger from RugCheck risks[] — never skipped
+  // Single holder danger — live Birdeye when available, RugCheck fallback
   if (factors.single_holder_danger) {
     score -= 25;
     sf.push({
@@ -306,14 +270,41 @@ export function calculateRiskGrade(
     });
   }
 
-  // Bundled launch
+  // Bundled launch — penalty scaled by detection confidence and token age.
+  //
+  // Confidence gate: Birdeye fires at ≥3 buyers in a single block (LOW bar). Only HIGH
+  // confidence (≥2 coordinated blocks) justifies the full penalty. MEDIUM gets half.
+  // RugCheck fallback has no confidence metadata → treated as HIGH (conservative).
+  //
+  // Age decay: the risk of a bundled launch is that coordinated wallets DUMP. After 90 days
+  // of live trading with no coordinated sell-off, the temporal threat has largely passed.
+  // Penalty is halved for tokens 30–90 days old, quartered for tokens >90 days old.
   if (factors.bundled_launch) {
-    score -= 20;
+    // Step 1: confidence gate
+    // null confidence = RugCheck fallback (no granularity) → treat conservatively as HIGH
+    const conf = factors.bundled_launch_confidence ?? "HIGH";
+    const confidencePenalty = conf === "HIGH" ? 20 : conf === "MEDIUM" ? 10 : 0;
+
+    // Step 2: age decay (applied on top of confidence penalty)
+    const ageDays = factors.token_age_days;
+    const ageMultiplier =
+      ageDays === null   ? 1.0   // unknown age → no decay (conservative)
+      : ageDays > 90     ? 0.25  // established token → coordinated dump threat largely past
+      : ageDays > 30     ? 0.5   // moderate age → partial decay
+      : 1.0;                     // fresh token → full penalty
+
+    const penalty = Math.round(confidencePenalty * ageMultiplier);
+    score -= penalty;
+
+    const confLabel = conf === "HIGH" ? "high-confidence" : conf === "MEDIUM" ? "medium-confidence" : "low-confidence";
+    const ageLabel  = ageDays === null ? "" : ageDays > 90 ? ", age-decayed" : ageDays > 30 ? ", partially age-decayed" : "";
     sf.push({
       name: "bundled_launch",
       value: true,
-      impact: -20,
-      interpretation: "bundled launch detected — coordinated insiders",
+      impact: -penalty,
+      interpretation: penalty === 0
+        ? `bundled launch detected (${confLabel}${ageLabel}) — threat negligible`
+        : `bundled launch detected (${confLabel}${ageLabel}) — coordinated insiders`,
     });
   } else {
     sf.push({
@@ -374,7 +365,7 @@ export function calculateRiskGrade(
     });
   }
 
-  // Dev wallet age — deep dive only (null for quick scan)
+  // Dev wallet age — applies to quickScan (via Birdeye first-funded) and deep dive
   if (factors.dev_wallet_age_days !== null) {
     if (factors.dev_wallet_age_days < 1) {
       score -= 30;
@@ -548,7 +539,6 @@ export function calculateConfidence(data: {
   sources_available: number;
   sources_total: number;
   data_age_ms: number;
-  rugcheck_age_seconds?: number;
   token_health?: string;
   signals_agree?: boolean;
 }): { model: number; data_completeness: number; signal_consensus: number } {
@@ -557,7 +547,6 @@ export function calculateConfidence(data: {
   let model = data_completeness;
   if (data.data_age_ms > 60_000)  model -= 0.1;
   if (data.data_age_ms > 300_000) model -= 0.2;
-  if (data.rugcheck_age_seconds && data.rugcheck_age_seconds > 86_400) model -= 0.15;
   if (data.token_health === "DEAD" || data.token_health === "ILLIQUID")
     model = Math.min(model, 0.3);
   if (data.token_health === "LOW_ACTIVITY") model = Math.min(model, 0.6);

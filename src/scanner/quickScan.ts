@@ -1,7 +1,7 @@
 import { getDexScreenerToken, deriveLPStatus, classifyLPModel, type LPModel, type LPStatus } from "../sources/dexscreener.js";
-import { getRugCheckSummary, stripLPFalsePositives } from "../sources/rugcheck.js";
+import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned, getMintCreationBlock } from "../sources/helius.js";
-import { getTokenCreationInfo } from "../sources/birdeye.js";
+import { getTokenCreationInfo, getBirdeyeTokenMetadata, getBirdeyeTokenSecurity, getBirdeyeTopHolders, getBirdeyeWalletFirstFunded } from "../sources/birdeye.js";
 import {
   calculateRiskGrade,
   calculateConfidence,
@@ -10,7 +10,7 @@ import {
   type RiskFactors,
 } from "./riskScorer.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
-import { isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
+import { isLPBurnLaunchpad, PROGRAMS, isProtocolAddress } from "../constants.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateQuickScanSummary,
@@ -167,6 +167,10 @@ export function deriveLiquidityCheck(liquidity_usd: number | null | undefined): 
 
 export interface QuickScanResult {
   schema_version: "2.0";
+  token_address: string;
+  symbol: string | null;
+  name: string | null;
+  logo_uri: string | null;
   /** Always "STRUCTURAL_SAFETY" — this service evaluates on-chain token structure only */
   grade_type: "STRUCTURAL_SAFETY";
   /** Scope declaration — clarifies what is and is not covered */
@@ -174,24 +178,35 @@ export interface QuickScanResult {
     includes: string[];
     excludes: string[];
   };
-  is_honeypot: boolean;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
+  /** Birdeye-live adjusted top-10 holder concentration (protocol/DEX/burn addresses excluded). Null when holder data unavailable. */
   top_10_holder_pct: number | null;
-  /** Structured liquidity assessment — does not replace sol_market_intel */
+  /** Structural LP burn and liquidity presence check — does not replace sol_market_intel depth signals */
   liquidity_check: LiquidityCheck;
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
   dex_id: string | null;
-  rugcheck_risk_score: number | null;
+  /** Creator/deployer wallet analysis — derived from Birdeye token_creation_info + wallet first-funded */
+  creator_wallet: {
+    address: string | null;
+    wallet_age_days: number | null;
+    /** True when the deployer wallet was funded fewer than 7 days before token creation — strong rug signal */
+    is_fresh_deployer: boolean;
+  };
+  /** True when at least one traditional AMM pool was detected across all pairs */
+  traditional_amm_pool_present: boolean;
+  /**
+   * True when the traditional AMM pool's LP burn status has been assessed.
+   * False when the primary pool is CLMM/DLMM — secondary traditional AMM pools are not LP-assessed in this tier.
+   */
+  traditional_amm_lp_assessed: boolean;
   single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
   /** Backwards-compat string confidence derived from numeric confidence */
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
-  /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
-  rugcheck_report_age_seconds: number | null;
   /** True when this token is on the Jupiter strict list with a legitimately retained authority. */
   authority_exempt: boolean;
   /** Human-readable reason for the exemption, or null when not exempt. */
@@ -208,20 +223,8 @@ export interface QuickScanResult {
   launch_anomaly: LaunchAnomaly;
   /** LP lock status — multi-pool assessment */
   liquidity_lock_status: import("./types.js").LiquidityLockStatus;
-  /** True when RugCheck LP false positives were stripped before scoring */
-  rugcheck_lp_adjusted: boolean;
-  /** Raw RugCheck score before LP correction; null when RugCheck was unavailable */
-  rugcheck_raw_score: number | null;
   /** All LP model types detected across all pools (not just the primary pool) */
   pool_types_detected: Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">;
-  /** Detailed RugCheck score correction metadata; null when RugCheck unavailable */
-  rugcheck_score_details: {
-    raw_score: number | null;
-    adjusted_score: number | null;
-    lp_false_positive_stripped: boolean;
-    stripped_score_amount: number;
-    reason: string | null;
-  } | null;
 }
 
 function logError(source: string, reason: unknown, address: string): void {
@@ -240,12 +243,15 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   // All sources run in parallel.
   // Birdeye token_creation_info is primary for mint timestamp; Helius is the fallback.
-  const [dexResult, rugResult, mintResult, birdeyeCreationResult, mintBlockResult] = await Promise.allSettled([
+  const [dexResult, rugResult, mintResult, birdeyeCreationResult, mintBlockResult, metadataResult, securityResult, holdersResult] = await Promise.allSettled([
     getDexScreenerToken(address, { timeout: 4000 }),
     getRugCheckSummary(address, { timeout: 3000 }),
     getTokenMintInfo(address, { timeout: 3000 }),          // sole source for authority flags
     getTokenCreationInfo(address, { timeout: 3000 }),      // primary for mint creation time
     getMintCreationBlock(address, { timeout: 2000 }),      // fallback for mint creation time
+    getBirdeyeTokenMetadata(address, { timeout: 2000 }),   // token identity (symbol/name/logo)
+    getBirdeyeTokenSecurity(address, { timeout: 2500 }),   // creator_percentage, total_supply
+    getBirdeyeTopHolders(address, 15, { timeout: 2500 }),  // live holder concentration
   ]);
 
   const dexData            = dexResult.status            === "fulfilled" ? dexResult.value            : null;
@@ -253,40 +259,60 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const mintData           = mintResult.status           === "fulfilled" ? mintResult.value           : null;
   const birdeyeCreationData = birdeyeCreationResult.status === "fulfilled" ? birdeyeCreationResult.value : null;
   const mintBlockData      = mintBlockResult.status      === "fulfilled" ? mintBlockResult.value      : null;
+  const metadataData       = metadataResult.status       === "fulfilled" ? metadataResult.value       : null;
+  const securityData       = securityResult.status       === "fulfilled" ? securityResult.value       : null;
+  const holdersData        = holdersResult.status        === "fulfilled" ? holdersResult.value        : null;
 
   if (dexResult.status  === "rejected") logError("dexscreener", dexResult.reason,  address);
   if (rugResult.status  === "rejected") logError("rugcheck",    rugResult.reason,   address);
   if (mintResult.status === "rejected") logError("helius_rpc",  mintResult.reason,  address);
 
-  // ── Phase 2: LP burn check — requires LP mint from phase 1 ───────────────
+  // ── Phase 2: LP burn + creator wallet age — parallel, both depend on phase 1 ─
   const lp_model = dexData?.lp_model ?? "UNKNOWN";
   const dex_id   = dexData?.dex_id   ?? null;
   const lpMint   = dexData?.lp_mint_address ?? null;
 
-  // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
-  // quickScan does not call Helius getAsset, so no creatorProgramId is available.
-  // Infer the launch program from the dexId heuristic and gate on LP_BURN_LAUNCHPADS.
-  // When Helius getAsset is wired up here, replace inferredProgramId with the
-  // real creatorProgramId and drop the heuristic entirely.
-  let lp_burned: boolean | null = null;
-  if (lp_model !== "CLMM_DLMM") {
-    const inferredProgramId = dexData?.pairs.some((p) =>
-      p.dexId?.toLowerCase().includes("pump")
-    ) ? PROGRAMS.PUMP_FUN : null;
-    const launchedFromLPBurnPad = inferredProgramId
-      ? isLPBurnLaunchpad(inferredProgramId)
-      : false;
-    lp_burned = launchedFromLPBurnPad
-      ? true
-      : (lpMint ? await checkLPBurned(lpMint, { timeout: 2000 }) : null);
-  }
+  // Creator address: Birdeye token_creation_info is primary (field: .data.creator,
+  // verified via live curl 2026-04-20). RugCheck .creator is fallback.
+  const creatorAddress: string | null =
+    (birdeyeCreationData?.creator && birdeyeCreationData.creator.length > 0)
+      ? birdeyeCreationData.creator
+      : (rugData?.creator ?? null);
+
+  // Infer pump.fun launchpad from dexId for LP burn check (see CLMM comment below).
+  // Only exact pump.fun dexIds qualify — "pumpswap" is a separate DEX and must not match.
+  const PUMP_FUN_DEX_IDS = new Set(["pumpfun", "pump"]);
+  const inferredProgramId = dexData?.pairs.some((p) => {
+    const id = p.dexId?.toLowerCase();
+    return id !== undefined && PUMP_FUN_DEX_IDS.has(id);
+  }) ? PROGRAMS.PUMP_FUN : null;
+  const launchedFromLPBurnPad = inferredProgramId ? isLPBurnLaunchpad(inferredProgramId) : false;
+
+  // Run LP burn check and creator wallet age lookup in parallel.
+  // CLMM/DLMM pools have no fungible LP mint — LP burn check is skipped for them.
+  // getBirdeyeWalletFirstFunded: verified field path json.data[wallet].block_unix_time (2026-04-20).
+  const [lpBurnResult, creatorFirstFundedResult] = await Promise.allSettled([
+    (lp_model !== "CLMM_DLMM" && !launchedFromLPBurnPad && lpMint)
+      ? checkLPBurned(lpMint, { timeout: 2000 })
+      : Promise.resolve(null),
+    creatorAddress
+      ? getBirdeyeWalletFirstFunded(creatorAddress, { timeout: 2000 })
+      : Promise.resolve(null),
+  ]);
+
+  let lp_burned: boolean | null =
+    lp_model === "CLMM_DLMM" ? null :
+    launchedFromLPBurnPad     ? true :
+    lpBurnResult.status === "fulfilled" ? lpBurnResult.value : null;
+
+  // Creator wallet age derived from Birdeye first-funded block_unix_time.
+  const creatorFirstFundedUnix =
+    creatorFirstFundedResult.status === "fulfilled" ? creatorFirstFundedResult.value : null;
+  const creatorWalletAgeDays = creatorFirstFundedUnix !== null
+    ? (Date.now() / 1000 - creatorFirstFundedUnix) / 86400
+    : null;
 
   const lp_status = deriveLPStatus(lp_burned, lp_model);
-
-  // Strip LP-related false positives from RugCheck now that lp_burned + lp_model are known.
-  const rugcheckAdjusted = rugData
-    ? stripLPFalsePositives(rugData, { lp_burned, lp_model })
-    : null;
 
   // ── Liquidity lock status (single-pool view for quick scan) ──────────────
   const primaryPairAddress = dexData?.pairs.slice()
@@ -330,18 +356,40 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
   const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
 
-  // ── Holder concentration: from RugCheck (already filtered for protocol addrs) ─
-  const top_10_holder_pct = rugData?.top_10_holder_pct ?? null;
+  // ── Holder concentration: live Birdeye data (falls back to RugCheck) ────────
+  // Fast address-only exclusion — no getAccountInfo per holder.
+  // Exclude known protocol, burn, and DEX program addresses by static check only.
+  const HOLDER_EXCLUDE = new Set<string>([
+    "1nc1nerator11111111111111111111111111111111",  // burn address
+    PROGRAMS.RAYDIUM_AMM_V4,
+    PROGRAMS.ORCA_WHIRLPOOL,
+    PROGRAMS.TOKEN_PROGRAM,
+    PROGRAMS.TOKEN_2022,
+    PROGRAMS.PUMP_FUN,
+  ]);
+
+  let live_single_holder_danger: boolean | null = null;
+  let live_top_10_holder_pct: number | null = null;
+
+  if (holdersData && holdersData.length > 0 && securityData?.total_supply && securityData.total_supply > 0) {
+    const totalSupply = securityData.total_supply;
+    const filtered = holdersData.filter(h => !HOLDER_EXCLUDE.has(h.owner) && !isProtocolAddress(h.owner));
+    const withPct = filtered.map(h => ({ pct: (h.ui_amount / totalSupply) * 100 }));
+    const top_holder_pct = withPct.length > 0 ? Math.max(...withPct.map(h => h.pct)) : null;
+    const top10sum = withPct.slice(0, 10).reduce((s, h) => s + h.pct, 0);
+    live_single_holder_danger = top_holder_pct !== null && top_holder_pct >= 15;
+    live_top_10_holder_pct = Math.min(100, top10sum);
+  }
+
+  // Birdeye-live only — no RugCheck fallback for holder data
+  const top_10_holder_pct = live_top_10_holder_pct !== null ? Math.round(live_top_10_holder_pct * 100) / 100 : null;
+  const single_holder_danger_live = live_single_holder_danger ?? false;
 
   // ── Liquidity ─────────────────────────────────────────────────────────────
   const liquidity_usd = dexData?.liquidity_usd ?? null;
 
-  // ── Honeypot + rug history ─────────────────────────────────────────────────
-  const is_honeypot    = rugData?.is_honeypot    ?? false;
+  // ── Rug history (sole RugCheck field retained) ────────────────────────────
   const has_rug_history = rugData?.has_rug_history ?? false;
-
-  // ── RugCheck report age ────────────────────────────────────────────────────
-  const rugcheck_report_age_seconds = rugData?.report_age_seconds ?? null;
 
   // ── Token age ─────────────────────────────────────────────────────────────
   let token_age_days: number | null = null;
@@ -365,22 +413,20 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const riskFactors: RiskFactors = {
     mint_authority_revoked,
     freeze_authority_revoked,
-    top_10_holder_pct,
+    adjusted_top_10_holder_pct: top_10_holder_pct,
     liquidity_usd,
     has_rug_history,
-    bundled_launch: rugData?.bundled_launch_detected ?? false,
+    bundled_launch: false, // RugCheck bundler detection removed; no Birdeye bundler in quick scan
     buy_sell_ratio: dexData?.buy_sell_ratio_1h ?? null,
     token_age_days,
-    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
-    single_holder_danger: rugData?.single_holder_danger ?? false,
+    single_holder_danger: single_holder_danger_live,
+    creator_supply_pct: securityData?.creator_percentage ?? null,
     lp_burned,
     lp_model,
     lp_status,
     dex_id,
-    dev_wallet_age_days: null, // quickScan never fetches this
+    dev_wallet_age_days: creatorWalletAgeDays, // Birdeye first-funded for creator wallet
     launch_pattern: launch_anomaly.launch_pattern,
-    rugcheck_lp_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
-    rugcheck_raw_score: rugData?.score ?? null,
   };
 
   const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
@@ -399,7 +445,6 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     sources_available: sources.length,
     sources_total: 3,
     data_age_ms,
-    rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
   });
   const data_confidence = confidenceToString(confidence.model);
 
@@ -414,8 +459,8 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   // ── Scope declaration ─────────────────────────────────────────────────────
   const grade_type = "STRUCTURAL_SAFETY" as const;
   const scope = {
-    includes: ["mint_authority", "freeze_authority", "holder_distribution"],
-    excludes: ["liquidity", "volume", "price_action", "market_behavior"],
+    includes: ["mint_authority", "freeze_authority", "holder_distribution", "lp_burn_status", "liquidity_presence"],
+    excludes: ["market_liquidity_depth", "volume", "price_action", "market_behavior"],
   };
 
   // ── Liquidity check (structured heuristic — no raw $ in response) ─────────
@@ -425,14 +470,19 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
   const data_quality: "FULL" | "PARTIAL" | "LIMITED" =
     sources.length === 3 ? "FULL" : sources.length >= 2 ? "PARTIAL" : "LIMITED";
 
+  const symbol   = metadataData?.symbol   ?? null;
+  const name     = metadataData?.name     ?? null;
+  const logo_uri = metadataData?.logo_uri ?? null;
+
   const missing_fields: string[] = [];
   if (dexData  === null) missing_fields.push("liquidity_usd", "dex_id", "lp_model");
-  if (rugData  === null) missing_fields.push("rugcheck_risk_score", "top_10_holder_pct", "has_rug_history");
+  if (rugData  === null) missing_fields.push("has_rug_history");
+  if (holdersData === null) missing_fields.push("top_10_holder_pct");
   if (mintData === null) missing_fields.push("mint_authority_revoked", "freeze_authority_revoked");
+  if (symbol === null && name === null) missing_fields.push("token_metadata");
 
   // ── LLM summary — sequential, after all parallel fetches complete ──────────
   const llmInputData: QuickScanData = {
-    is_honeypot,
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
@@ -457,9 +507,12 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   return {
     schema_version: "2.0" as const,
+    token_address: address,
+    symbol,
+    name,
+    logo_uri,
     grade_type,
     scope,
-    is_honeypot,
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
@@ -468,12 +521,15 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     lp_model,
     lp_status,
     dex_id,
-    rugcheck_risk_score: riskFactors.rugcheck_risk_score,
+    creator_wallet: {
+      address: creatorAddress,
+      wallet_age_days: creatorWalletAgeDays !== null ? Math.round(creatorWalletAgeDays * 10) / 10 : null,
+      is_fresh_deployer: creatorWalletAgeDays !== null && creatorWalletAgeDays < 7,
+    },
     single_holder_danger: riskFactors.single_holder_danger,
     risk_grade,
     summary,
     data_confidence,
-    rugcheck_report_age_seconds,
     authority_exempt,
     authority_exempt_reason,
     factors: scoringFactors,
@@ -483,21 +539,12 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     missing_fields,
     launch_anomaly,
     liquidity_lock_status,
-    rugcheck_lp_adjusted: rugcheckAdjusted?.lp_risks_stripped ?? false,
-    rugcheck_raw_score: rugData?.score ?? null,
     pool_types_detected: [...new Set(
       (dexData?.pairs ?? []).map(pair => classifyLPModel(pair.dexId))
     )] as Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">,
-    rugcheck_score_details: rugData ? {
-      raw_score: rugData.score,
-      adjusted_score: rugcheckAdjusted?.adjusted_score ?? rugData.score,
-      lp_false_positive_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
-      stripped_score_amount: rugData.score - (rugcheckAdjusted?.adjusted_score ?? rugData.score),
-      reason: rugcheckAdjusted?.lp_risks_stripped
-        ? lp_burned === true
-          ? "LP tokens confirmed burned on-chain — RugCheck LP unlock flag is a false positive"
-          : "DLMM/CLMM pool confirmed — no LP token exists, RugCheck LP assessment does not apply"
-        : null,
-    } : null,
+    traditional_amm_pool_present: (dexData?.pairs ?? []).some(p => classifyLPModel(p.dexId) === "TRADITIONAL_AMM"),
+    // LP burn is only assessed for the primary (highest-liquidity) pool.
+    // When the primary is CLMM/DLMM, secondary traditional AMM pools are detected but not LP-assessed.
+    traditional_amm_lp_assessed: lp_model === "TRADITIONAL_AMM",
   };
 }

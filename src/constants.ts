@@ -1,28 +1,35 @@
 // ---------------------------------------------------------------------------
-// Virtuals Protocol Address Whitelist
+// Known Protocol / Custodian Address Whitelist
 // ---------------------------------------------------------------------------
-// These are protocol-owned on-chain addresses (Base chain) that should be
-// excluded from holder concentration calculations. Virtuals Protocol holds
-// tokens in these accounts as part of bonding-curve / treasury mechanics —
-// counting them as normal holders would inflate concentration figures.
+// Protocol-owned addresses that should be excluded from holder concentration
+// calculations. Counting these as normal holders inflates concentration figures.
+// Includes Virtuals Protocol (Base chain) and pump.fun custodian/treasury (Solana).
 // ---------------------------------------------------------------------------
 
-const VIRTUALS_PROTOCOL_ADDRESSES = new Set<string>([
-  // Virtuals Protocol genesis / deployer address
+const KNOWN_PROTOCOL_ADDRESSES = new Set<string>([
+  // Virtuals Protocol genesis / deployer address (Base chain)
   "0xe2890629ef31b32132003c02b29a50a025deee8a",
   // VIRTUAL token contract address (Base chain)
   "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+  // Pump.fun Token Custodian — holds tokens on behalf of bonding-curve buyers
+  // Verified via Helius identity: type=wallet, name="Pump.fun Token Custodian"
+  "cfq1ts1ifr1euwwbm8efxuzm5r3ya3uvmzznwishbgzt",
+  // Pump.fun Treasury — fee collection / operational wallet
+  // Verified via Helius identity: type=wallet, name="Pump.fun Treasury"
+  "g8ccfrffqzwhsaqjxldfwbakge95sdduqvxntrl4kqjm",
 ]);
 
 /**
- * Returns true if the given address belongs to Virtuals Protocol.
+ * Returns true if the given address is a known protocol/custodian address
+ * that should be excluded from holder concentration calculations.
  * Comparison is case-insensitive.
  *
  * @example
  * isProtocolAddress("0xe2890629EF31b32132003C02B29a50A025dEeE8a") // true
+ * isProtocolAddress("Cfq1ts1iFr1eUWWBm8eFxUzm5R3YA3UvMZznwiShbgZt") // true
  */
 export function isProtocolAddress(address: string): boolean {
-  return VIRTUALS_PROTOCOL_ADDRESSES.has(address.toLowerCase());
+  return KNOWN_PROTOCOL_ADDRESSES.has(address.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------

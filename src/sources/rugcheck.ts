@@ -18,18 +18,25 @@ export interface RugCheckResult {
   /** Top-10 holder concentration (%), excluding Virtuals Protocol addresses. */
   top_10_holder_pct: number | null;
   is_honeypot: boolean;
+  /** Creator/deployer wallet address from RugCheck token report. */
+  creator: string | null;
   /** Raw unbounded RugCheck score (same as rugcheck_risk_score, 0 when null). */
   score: number;
   /** Normalised score from RugCheck API (0–10000 range). */
   score_normalised: number;
   /** Full risks array from RugCheck — needed by stripLPFalsePositives(). */
   risks: Array<{ name: string; score: number; level: string; value?: string }>;
-  /** True when LP-related false positives have been removed from this result. */
+  /** True when LP-related false positives were actually found and removed. */
   lp_risks_stripped: boolean;
   /** Score after LP false positive risks have been subtracted. */
   adjusted_score: number;
   /** Normalised score after LP false positive risks have been subtracted. */
   adjusted_score_normalised: number;
+  /**
+   * Populated when LP burn is confirmed on-chain but no LP risk names matched
+   * in RugCheck risks[]. Score is unchanged; nothing was stripped.
+   */
+  lp_burn_confirmed_no_risk_found: boolean;
 }
 
 // Risk names that RugCheck incorrectly flags when LP is burned or pool is CLMM/DLMM.
@@ -64,8 +71,15 @@ export function stripLPFalsePositives(
   const adjusted_score_normalised = rugcheck.score > 0
     ? Math.round((adjusted_score / rugcheck.score) * rugcheck.score_normalised)
     : 0;
+
+  if (strippedScore === 0) {
+    // LP burn confirmed but no matching LP risk names in risks[] — nothing to strip.
+    console.log(`[rugcheck] lp_burned/CLMM confirmed but no LP risk names matched in risks[] for this token — score unchanged`);
+    return { ...rugcheck, lp_risks_stripped: false, adjusted_score: rugcheck.score, adjusted_score_normalised: rugcheck.score_normalised, lp_burn_confirmed_no_risk_found: true };
+  }
+
   console.log(`[rugcheck] stripped LP false positive: lp_burned=${onChainLP.lp_burned} lp_model=${onChainLP.lp_model} score ${rugcheck.score} → ${adjusted_score} (removed ${strippedScore} points from LP flags)`);
-  return { ...rugcheck, risks: filteredRisks, score: adjusted_score, score_normalised: adjusted_score_normalised, lp_risks_stripped: true, adjusted_score, adjusted_score_normalised };
+  return { ...rugcheck, risks: filteredRisks, score: adjusted_score, score_normalised: adjusted_score_normalised, lp_risks_stripped: true, adjusted_score, adjusted_score_normalised, lp_burn_confirmed_no_risk_found: false };
 }
 
 interface RawRisk {
@@ -96,6 +110,7 @@ interface RawReport {
   rugged?: boolean;
   detectedAt?: string;
   createdAt?: string;
+  creator?: string | null;
   token?: unknown;
 }
 
@@ -194,6 +209,9 @@ export async function getRugCheckSummary(
   const score = rugcheck_risk_score ?? 0;
   const score_normalised = raw.score_normalised ?? 0;
 
+  // raw.creator verified via live curl: field path .creator, value type string|null
+  const creator = typeof raw.creator === "string" && raw.creator.length > 0 ? raw.creator : null;
+
   return {
     has_rug_history,
     bundled_launch_detected,
@@ -203,11 +221,13 @@ export async function getRugCheckSummary(
     report_age_seconds,
     top_10_holder_pct,
     is_honeypot,
+    creator,
     score,
     score_normalised,
     risks,
     lp_risks_stripped: false,
     adjusted_score: score,
     adjusted_score_normalised: score_normalised,
+    lp_burn_confirmed_no_risk_found: false,
   };
 }

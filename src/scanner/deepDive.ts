@@ -1,9 +1,9 @@
 import { getDexScreenerToken, deriveLPStatus, classifyLPModel, type LPModel, type LPStatus } from "../sources/dexscreener.js";
-import { getRugCheckSummary, stripLPFalsePositives } from "../sources/rugcheck.js";
-import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer, checkPoolLiquiditySafety, type PoolLiquiditySafety } from "../sources/helius.js";
+import { getRugCheckSummary } from "../sources/rugcheck.js";
+import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer, checkPoolLiquiditySafety, getWalletIdentity, type PoolLiquiditySafety } from "../sources/helius.js";
 import { buildTxGraph, heliusTxsToEdges } from "../analysis/walletGraph.js";
 import { detectClusters } from "../analysis/clusterDetection.js";
-import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders, getTokenCreationInfo } from "../sources/birdeye.js";
+import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders, getTokenCreationInfo, detectBundledLaunchViaBirdeye, BUNDLER_NULL_RESULT, type BundlerDetectionResult } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
   calculateRiskGrade,
@@ -15,7 +15,7 @@ import {
 import type {
   ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory,
   FundingSource, LiquidityLockStatus, PoolSafetyBreakdown, WashTradingRisk, TradingPattern,
-  AuthorityHistory, MetadataImmutability,
+  AuthorityHistory, MetadataImmutability, LastTrade,
 } from "./types.js";
 import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
 import { deduplicate, getOrFetch } from "../cache.js";
@@ -54,16 +54,19 @@ export interface DilutionRisk {
 
 export interface DeepDiveResult {
   schema_version: "2.0";
-  is_honeypot: boolean;
+  token_address: string;
+  symbol: string | null;
+  name: string | null;
+  logo_uri: string | null;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
+  /** Birdeye-live adjusted top-10 holder concentration (protocol/DEX/burn addresses excluded). */
   top_10_holder_pct: number | null;
   liquidity_usd: number | null;
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
   dex_id: string | null;
-  rugcheck_risk_score: number | null;
   single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
   summary: string;
@@ -72,9 +75,10 @@ export interface DeepDiveResult {
   trading_pattern: TradingPattern;
   pump_fun_launched: boolean;
   bundled_launch_detected: boolean;
-  volume_24h: number;
-  price_change_24h_pct: number;
   momentum_score: number;
+  momentum_tier: "STRONG" | "MODERATE" | "WEAK" | "DEAD";
+  momentum_interpretation: string;
+  last_trade: LastTrade;
   full_risk_report: string;
   /** Structured recommendation — never a bare string */
   recommendation: {
@@ -111,8 +115,6 @@ export interface DeepDiveResult {
   /** Top contributing factors in agent-friendly shape */
   key_drivers: KeyDriver[];
   data_confidence: "HIGH" | "MEDIUM" | "LOW";
-  /** Age in seconds of the RugCheck report used; null if RugCheck was unavailable. */
-  rugcheck_report_age_seconds: number | null;
   /** True when this token is on the Jupiter strict list with a legitimately retained authority. */
   authority_exempt: boolean;
   /** Human-readable reason for the exemption, or null when not exempt. */
@@ -129,20 +131,10 @@ export interface DeepDiveResult {
   missing_fields: string[];
   /** Holder concentration after excluding burn/DEX/protocol addresses */
   adjusted_holder_concentration: AdjustedHolderConcentration;
-  /** True when RugCheck LP false positives were stripped before scoring */
-  rugcheck_lp_adjusted: boolean;
-  /** Raw RugCheck score before LP correction; null when RugCheck was unavailable */
-  rugcheck_raw_score: number | null;
   /** All LP model types detected across all pools (not just the primary pool) */
   pool_types_detected: Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">;
-  /** Detailed RugCheck score correction metadata; null when RugCheck unavailable */
-  rugcheck_score_details: {
-    raw_score: number | null;
-    adjusted_score: number | null;
-    lp_false_positive_stripped: boolean;
-    stripped_score_amount: number;
-    reason: string | null;
-  } | null;
+  /** Structured bundled-launch detection result from Birdeye launch-window analysis */
+  bundler_analysis: BundlerDetectionResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,52 +260,109 @@ function deriveOverallLockType(
 // Derived signal helpers
 // ---------------------------------------------------------------------------
 
-/** 0–100 momentum score derived entirely from on-chain/DEX signals. */
+/**
+ * Multi-timeframe momentum score (0–100).
+ * Weights: 5m=0.25, 30m=0.30, 1h=0.25, 8h=0.12, 24h=0.08
+ * Normalization: ±20% maps to ±1.0, scaled to ±60 pts max.
+ * A recency factor [0.0–1.0] multiplies (score − 50); returns 0 immediately at 0.0.
+ */
 function calculateMomentumScore(data: {
+  price_change_5m_pct:  number | null;
+  price_change_30m_pct: number | null;
+  price_change_1h_pct:  number | null;
+  price_change_8h_pct:  number | null;
   price_change_24h_pct: number | null;
-  volume_24h: number | null;
-  buy_sell_ratio_1h: number | null;
-  unique_buyers_24h: number | null;
-  liquidity_usd: number | null;
+  volume_1h_usd:        number | null;
+  volume_24h_usd:       number | null;
+  buy_sell_ratio_1h:    number | null;
+  hours_since_last_trade: number | null;
 }): number {
-  let score = 50;  // neutral baseline
+  // Recency factor: collapse everything to 0 when token is dormant/dead
+  const hrs = data.hours_since_last_trade;
+  const recency_factor =
+    hrs === null ? 1.0
+    : hrs < 6    ? 1.0
+    : hrs < 24   ? 0.85
+    : hrs < 168  ? 0.5    // 7 days
+    : hrs < 720  ? 0.15   // 30 days
+    : 0.0;                // dead
 
-  // Component 1: Price momentum (weight 40)
-  // Normalise: ±50% maps to ±40 points
-  const price = data.price_change_24h_pct ?? 0;
-  const price_component = Math.max(-40, Math.min(40, price * 0.8));
-  score += price_component;
+  if (recency_factor === 0.0) return 0;
 
-  // Component 2: Volume relative to liquidity (weight 25)
-  // volume/liquidity > 1 = very active, < 0.1 = dormant
-  if (data.volume_24h !== null && data.liquidity_usd && data.liquidity_usd > 0) {
-    const vol_ratio = data.volume_24h / data.liquidity_usd;
-    const vol_component = vol_ratio >= 2   ?  25
-                        : vol_ratio >= 0.5 ?  12
-                        : vol_ratio >= 0.1 ?   0
-                        : -10;
-    score += vol_component;
+  // Weighted price component: ±20% → ±1.0, scaled to ±60 pts
+  const normalize = (pct: number | null) => pct === null ? null : Math.max(-1, Math.min(1, pct / 20));
+  const w5m  = 0.25, w30m = 0.30, w1h  = 0.25, w8h  = 0.12, w24h = 0.08;
+
+  const n5m  = normalize(data.price_change_5m_pct);
+  const n30m = normalize(data.price_change_30m_pct);
+  const n1h  = normalize(data.price_change_1h_pct);
+  const n8h  = normalize(data.price_change_8h_pct);
+  const n24h = normalize(data.price_change_24h_pct);
+
+  // Only average over timeframes that have data
+  let weightSum = 0;
+  let weightedPriceSum = 0;
+  if (n5m  !== null) { weightedPriceSum += n5m  * w5m;  weightSum += w5m;  }
+  if (n30m !== null) { weightedPriceSum += n30m * w30m; weightSum += w30m; }
+  if (n1h  !== null) { weightedPriceSum += n1h  * w1h;  weightSum += w1h;  }
+  if (n8h  !== null) { weightedPriceSum += n8h  * w8h;  weightSum += w8h;  }
+  if (n24h !== null) { weightedPriceSum += n24h * w24h; weightSum += w24h; }
+
+  const price_component = weightSum > 0 ? (weightedPriceSum / weightSum) * 60 : 0;
+
+  // Volume confirmation: ±15 pts (1h vs 24h hourly average)
+  let vol_component = 0;
+  if (data.volume_1h_usd !== null && data.volume_24h_usd !== null && data.volume_24h_usd > 0) {
+    const hourly_avg = data.volume_24h_usd / 24;
+    const ratio = data.volume_1h_usd / hourly_avg;
+    vol_component = ratio >= 3 ? 15 : ratio >= 1.5 ? 8 : ratio >= 0.5 ? 0 : -8;
   }
 
-  // Component 3: Buy pressure (weight 20)
+  // Buy pressure: ±15 pts
   const bsr = data.buy_sell_ratio_1h ?? 0.5;
-  const buy_component = bsr > 0.7  ?  20
-                      : bsr > 0.55 ?  10
+  const buy_component = bsr > 0.7  ?  15
+                      : bsr > 0.55 ?   7
                       : bsr > 0.45 ?   0
-                      : bsr > 0.3  ? -10
-                      : -20;
-  score += buy_component;
+                      : bsr > 0.3  ?  -7
+                      : -15;
 
-  // Component 4: Unique buyer momentum (weight 15)
-  // > 3000 unique buyers in 24h = high organic interest
-  const buyers = data.unique_buyers_24h ?? 0;
-  const buyer_component = buyers > 5000 ?  15
-                        : buyers > 2000 ?   8
-                        : buyers > 500  ?   0
-                        : -5;
-  score += buyer_component;
+  const raw = 50 + price_component + vol_component + buy_component;
+  const clamped = Math.max(0, Math.min(100, raw));
 
-  return Math.max(0, Math.min(100, Math.round(score)));
+  // Apply recency: compress toward 50 for stale/dormant, then clamp
+  const with_recency = 50 + (clamped - 50) * recency_factor;
+  return Math.max(0, Math.min(100, Math.round(with_recency)));
+}
+
+/** Adversarial freshness signal — when did the token last trade? */
+function deriveLastTrade(last_trade_unix_time: number | null): import("./types.js").LastTrade {
+  if (last_trade_unix_time === null) {
+    return {
+      timestamp: null,
+      hours_ago: null,
+      recency: "UNKNOWN",
+      recency_note: "Last trade timestamp unavailable.",
+    };
+  }
+  const hours_ago = (Date.now() / 1000 - last_trade_unix_time) / 3600;
+  const recency =
+    hours_ago < 6    ? "ACTIVE"
+    : hours_ago < 24   ? "RECENT"
+    : hours_ago < 168  ? "STALE"
+    : hours_ago < 720  ? "DORMANT"
+    : "DEAD";
+  const recency_note =
+    recency === "ACTIVE"  ? `Last trade ${hours_ago.toFixed(1)}h ago — token is actively trading.`
+    : recency === "RECENT"  ? `Last trade ${hours_ago.toFixed(0)}h ago — recent activity within 24h.`
+    : recency === "STALE"   ? `Last trade ${(hours_ago / 24).toFixed(1)}d ago — limited recent activity.`
+    : recency === "DORMANT" ? `Last trade ${(hours_ago / 24).toFixed(0)}d ago — token appears dormant.`
+    : `Last trade ${(hours_ago / 24).toFixed(0)}d ago — token appears dead.`;
+  return {
+    timestamp: last_trade_unix_time,
+    hours_ago: Math.round(hours_ago * 10) / 10,
+    recency,
+    recency_note,
+  };
 }
 
 /**
@@ -388,10 +437,13 @@ function buildRecommendation(data: {
   risk_breakdown: { contract_risk: string; liquidity_risk: string; market_risk: string; behavioral_risk: string };
   historical_flags: HistoricalFlag[];
   confidence_model: number;
+  last_trade_recency: "ACTIVE" | "RECENT" | "STALE" | "DORMANT" | "DEAD" | "UNKNOWN";
 }): { action: "AVOID" | "WATCH" | "CONSIDER" | "DYOR"; reason: string; confidence: number; time_horizon: "SHORT_TERM" | "MEDIUM_TERM" | "LONG_TERM" } {
   const highRisks = Object.entries(data.risk_breakdown)
     .filter(([, v]) => v === "HIGH")
     .map(([k]) => k.replace("_risk", "").toUpperCase());
+
+  const inactive = data.last_trade_recency === "DEAD" || data.last_trade_recency === "DORMANT";
 
   if (data.risk_grade === "F" || highRisks.length >= 3) {
     return { action: "AVOID", reason: highRisks.join(" + ") || "CRITICAL_GRADE", confidence: 0.9, time_horizon: "SHORT_TERM" };
@@ -400,10 +452,16 @@ function buildRecommendation(data: {
     return { action: "AVOID", reason: "CONFIRMED_RUG_HISTORY", confidence: 0.95, time_horizon: "SHORT_TERM" };
   }
   if (data.risk_grade === "D" || highRisks.length >= 1) {
-    return { action: "WATCH", reason: highRisks.join(" + ") || "ELEVATED_RISK", confidence: data.confidence_model, time_horizon: "SHORT_TERM" };
+    const action = inactive ? "AVOID" : "WATCH";
+    return { action, reason: inactive ? "INACTIVE_TOKEN" : (highRisks.join(" + ") || "ELEVATED_RISK"), confidence: data.confidence_model, time_horizon: "SHORT_TERM" };
   }
   if (data.risk_grade === "A" || data.risk_grade === "B") {
-    return { action: "CONSIDER", reason: "ACCEPTABLE_STRUCTURAL_RISK", confidence: data.confidence_model, time_horizon: "MEDIUM_TERM" };
+    const action = inactive ? "WATCH" : "CONSIDER";
+    return { action, reason: inactive ? "INACTIVE_TOKEN" : "ACCEPTABLE_STRUCTURAL_RISK", confidence: data.confidence_model, time_horizon: inactive ? "SHORT_TERM" : "MEDIUM_TERM" };
+  }
+  // DYOR / C grade
+  if (inactive) {
+    return { action: "AVOID", reason: "INACTIVE_TOKEN", confidence: data.confidence_model, time_horizon: "SHORT_TERM" };
   }
   return { action: "DYOR", reason: "INCONCLUSIVE_SIGNALS", confidence: Math.min(data.confidence_model, 0.5), time_horizon: "SHORT_TERM" };
 }
@@ -501,12 +559,19 @@ async function classifyHolderAddress(
   // Fast-path: static sets require no RPC
   if (BURN_ADDRESSES.has(ownerAddress)) return "BURN";
   if (KNOWN_CEX_ADDRESSES.has(ownerAddress)) return "CEX";
+  if (isProtocolAddress(ownerAddress)) return "CEX";
+
+  // Helius identity lookup — dynamically identifies exchange and protocol wallets.
+  // Runs before expensive RPC calls; timeout kept short (1000ms) to stay within budget.
+  const identity = await getWalletIdentity(ownerAddress, { timeout: 1000 });
+  if (identity?.type === "exchange" || identity?.type === "protocol") return "CEX";
 
   // Level 1: check the token account's raw program owner.
   // For AMMs that own vault accounts directly (PumpSwap, some Meteora variants),
   // getAccountInfo(tokenAccountAddress).owner === DEX program ID.
   const tokenAcctInfo = await rpcCall("getAccountInfo", [tokenAccountAddress, { encoding: "base58" }], timeoutMs);
-  if (tokenAcctInfo?.value === null || tokenAcctInfo?.value === undefined) return "BURN";
+  // null value = RPC failure or account not found — cannot confirm it's a burn address, keep as insider
+  if (tokenAcctInfo?.value === null || tokenAcctInfo?.value === undefined) return "INSIDER";
   const tokenAcctOwner: string | undefined = tokenAcctInfo?.value?.owner;
   if (tokenAcctOwner && DEX_PROGRAMS.has(tokenAcctOwner)) return "DEX_POOL";
 
@@ -514,7 +579,8 @@ async function classifyHolderAddress(
   // For Raydium AMM V4, Orca, etc. the vault ATA is owned by the Token Program,
   // but its authority is a PDA whose program owner is the DEX program.
   const ownerInfo = await rpcCall("getAccountInfo", [ownerAddress, { encoding: "base58" }], timeoutMs);
-  if (ownerInfo?.value === null || ownerInfo?.value === undefined) return "BURN";
+  // null value = wallet has no on-chain state (zero SOL, never transacted) — still a real wallet, not burn
+  if (ownerInfo?.value === null || ownerInfo?.value === undefined) return "INSIDER";
   const ownerProgram: string | undefined = ownerInfo?.value?.owner;
   if (!ownerProgram) return "INSIDER";
 
@@ -584,7 +650,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const [dexResult, rugResult, mintResult, birdResult, scanResult, mintAuthResult,
          securityResult, holderListResult, washTradingResult, authHistoryResult,
          topHoldersResult, tokenSupplyResult, swapTxsResult, mintDeployerResult,
-         creationInfoResult] =
+         creationInfoResult, bundlerResult] =
     await Promise.allSettled([
       getDexScreenerToken(address, { timeout: 4000 }),
       getRugCheckSummary(address, { timeout: 5000 }),
@@ -601,6 +667,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       getTokenSwapTransactions(address, { timeout: 5000, limit: 100, order: "asc" }),
       getMintDeployer(address, { timeout: 3000 }),   // DAS getAsset — deployer fallback for pump.fun
       getTokenCreationInfo(address, { timeout: 3000 }), // Birdeye — primary source for creator wallet
+      detectBundledLaunchViaBirdeye(address, 0, { timeout: 4000 }), // bundler detection; 0 = anchor on first trade
     ]);
 
   const dexData       = dexResult.status         === "fulfilled" ? dexResult.value         : null;
@@ -610,6 +677,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const mintAuthAddress = mintAuthResult.status  === "fulfilled" ? mintAuthResult.value    : null;
   const mintDeployerAddress = mintDeployerResult.status === "fulfilled" ? mintDeployerResult.value : null;
   const creationInfo  = creationInfoResult.status === "fulfilled" ? creationInfoResult.value : null;
+  const bundlerData   = bundlerResult.status === "fulfilled" ? bundlerResult.value : BUNDLER_NULL_RESULT;
   const securityData  = securityResult.status    === "fulfilled" ? securityResult.value    : null;
   const holderListData = holderListResult.status === "fulfilled" ? holderListResult.value  : null;
   const washTradingData = washTradingResult.status === "fulfilled" ? washTradingResult.value : null;
@@ -627,14 +695,19 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const dex_id   = dexData?.dex_id   ?? null;
   const lpMint   = dexData?.lp_mint_address ?? null;
 
-  // Infer launch program from dexId heuristic.
-  // Used here (before pump_fun_launched is declared) to decide whether to apply
-  // the DAS deployer fallback for tokens with no live mint authority.
-  const inferredProgramId = dexData?.pairs.some((p) =>
-    p.dexId?.toLowerCase().includes("pump")
-  ) ? PROGRAMS.PUMP_FUN : null;
-  const launchedFromLPBurnPad = inferredProgramId
-    ? isLPBurnLaunchpad(inferredProgramId)
+  // Detect pump.fun launch via Helius transaction source field.
+  // swapTxsData (fetched in Phase 1, order=asc) contains Helius parsed transactions
+  // where the `source` field identifies the originating protocol (e.g. "PUMP_FUN").
+  // This replaces the deprecated DexScreener dexId heuristic.
+  // Secondary signal: DAS update authority matching the pump.fun program address.
+  const swapTxsPhase1 = swapTxsResult.status === "fulfilled" ? swapTxsResult.value : null;
+  const heliusPumpFun = Array.isArray(swapTxsPhase1)
+    && swapTxsPhase1.some((tx: any) => tx?.source === "PUMP_FUN");
+  const dasPumpFun = mintDeployerAddress === PROGRAMS.PUMP_FUN;
+  const isPumpFunFromHelius = heliusPumpFun || dasPumpFun;
+  const inferredProgramId = isPumpFunFromHelius ? PROGRAMS.PUMP_FUN : null;
+  const launchedFromLPBurnPad = isPumpFunFromHelius
+    ? isLPBurnLaunchpad(PROGRAMS.PUMP_FUN)
     : false;
 
   // Priority for dev wallet address:
@@ -653,6 +726,44 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
           : null;
   const devWalletForAge = effectiveDevAddress;
 
+  // Phase 1 result: top holders — extracted early so Phase 4 and Phase 1b can start immediately.
+  const topHoldersData = topHoldersResult.status === "fulfilled" ? topHoldersResult.value : null;
+
+  // Start Phase 4 (pool safety), Phase 1b (fee-payer lookups), and two previously-sequential
+  // awaits in the background immediately after Phase 1. All only need Phase 1 data, so they
+  // can overlap with the Phase 2 / Phase 3 sequential chain (saving up to ~6 s on cold paths).
+  const _poolsToCheck = (dexData?.pairs ?? [])
+    .slice()
+    .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))
+    .slice(0, 5);
+  const poolSafetyPromise = Promise.allSettled(
+    _poolsToCheck.map((p) =>
+      checkPoolLiquiditySafety(p.pairAddress, (p as any).info?.liquidityToken?.address ?? null, { timeout: 3000 })
+    )
+  );
+
+  const _knownPoolAddresses = new Set(
+    (dexData?.pairs ?? []).map((p: { pairAddress: string }) => p.pairAddress).filter(Boolean)
+  );
+  const targetWallets = (topHoldersData ?? [])
+    .map((h: { owner: string }) => h.owner)
+    .filter((addr: string) => !isProtocolAddress(addr) && !_knownPoolAddresses.has(addr));
+  const feePayerPromise = Promise.allSettled(
+    targetWallets.map(w => getWalletSwapFeePayers(w, { timeout: 1500, limit: 5 }))
+  );
+
+  // resolveAuthorityExempt makes a Jupiter API call (3000ms timeout) for unknown tokens —
+  // starting it here in parallel with Phase 2/3 saves up to 3s on the critical path.
+  const authorityExemptPromise = resolveAuthorityExempt(address);
+
+  // getSolBalance is a sequential 3000ms RPC call — start it now so it overlaps with Phase 2/3.
+  // The protocol-address fast-path is preserved: if mintAuthAddress is a protocol address the
+  // dev_wallet_analysis block below short-circuits and never awaits this promise.
+  const _devSolBalanceProtocol = mintAuthAddress && isProtocolAddress(mintAuthAddress);
+  const devSolBalancePromise: Promise<number | null> = (!_devSolBalanceProtocol && effectiveDevAddress)
+    ? getSolBalance(effectiveDevAddress, 3000)
+    : Promise.resolve(null);
+
   // CLMM/DLMM pools have no fungible LP mint — skip the burn check entirely.
   const lpBurnPromise: Promise<boolean | null> =
     lp_model === "CLMM_DLMM"
@@ -663,18 +774,13 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   const [lpBurnResult, walletAgeResult, devWalletSigsResult] = await Promise.allSettled([
     lpBurnPromise,
-    devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 5000 }) : Promise.resolve(null),
-    devWalletForAge ? rpcCall("getSignaturesForAddress", [devWalletForAge, { limit: 200 }], 4000) : Promise.resolve(null),
+    devWalletForAge ? getWalletAgeDays(devWalletForAge, { timeout: 1500 }) : Promise.resolve(null),
+    devWalletForAge ? rpcCall("getSignaturesForAddress", [devWalletForAge, { limit: 200 }], 2000) : Promise.resolve(null),
   ]);
 
   const lp_burned           = lpBurnResult.status  === "fulfilled" ? lpBurnResult.value  : null;
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
   const lp_status           = deriveLPStatus(lp_burned, lp_model);
-
-  // Strip LP-related false positives from RugCheck now that lp_burned + lp_model are known.
-  const rugcheckAdjusted = rugData
-    ? stripLPFalsePositives(rugData, { lp_burned, lp_model })
-    : null;
 
   // Oldest dev wallet sig — needed for funding source classification
   const devWalletSigs: any[] | null = devWalletSigsResult.status === "fulfilled" ? devWalletSigsResult.value : null;
@@ -682,8 +788,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? (devWalletSigs[devWalletSigs.length - 1]?.signature ?? null)
     : null;
 
-  // Top holders, total supply, and swap transactions from Phase 1
-  const topHoldersData = topHoldersResult.status === "fulfilled" ? topHoldersResult.value : null;
+  // Total supply and swap transactions from Phase 1
   const tokenSupplyRaw = tokenSupplyResult.status === "fulfilled" ? tokenSupplyResult.value : null;
   const swapTxsData    = swapTxsResult.status    === "fulfilled" ? swapTxsResult.value    : null;
   const totalSupplyValue: number | null = typeof tokenSupplyRaw?.value?.uiAmount === "number"
@@ -698,7 +803,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   };
   const [fundingSourceResult, adjustedConcentrationResult] = await Promise.allSettled([
     devWalletForAge
-      ? classifyWalletFundingSource(devWalletForAge, devWalletOldestSig, 6000)
+      ? classifyWalletFundingSource(devWalletForAge, devWalletOldestSig, 1000)
       : Promise.resolve(_defaultFundingSource),
     computeAdjustedConcentration(topHoldersData ?? [], totalSupplyValue),
   ]);
@@ -713,13 +818,19 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const mint_authority_revoked   = mintData?.mint_authority_revoked   ?? false;
   const freeze_authority_revoked = mintData?.freeze_authority_revoked ?? false;
 
-  // ── Holder concentration (RugCheck, protocol addrs already filtered) ───────
-  const top_10_holder_pct = rugData?.top_10_holder_pct ?? null;
-  const is_honeypot       = rugData?.is_honeypot       ?? false;
+  // ── Holder concentration (Birdeye-live, adjusted) ────────────────────────
+  const top_10_holder_pct = adjusted_holder_concentration.adjusted_top_10_pct;
   const has_rug_history   = rugData?.has_rug_history   ?? false;
 
-  // ── RugCheck report age ────────────────────────────────────────────────────
-  const rugcheck_report_age_seconds = rugData?.report_age_seconds ?? null;
+  // ── Single holder danger (Birdeye ≥15% threshold) ────────────────────────
+  let live_single_holder_danger_deep = false;
+  if (topHoldersData && topHoldersData.length > 0 && totalSupplyValue && totalSupplyValue > 0) {
+    const excludedAddresses = new Set(adjusted_holder_concentration.exclusions.map(e => e.address));
+    const maxPct = (topHoldersData as Array<{ owner: string; ui_amount: number }>)
+      .filter(h => !excludedAddresses.has(h.owner) && !isProtocolAddress(h.owner))
+      .reduce((max, h) => Math.max(max, (h.ui_amount / totalSupplyValue) * 100), 0);
+    live_single_holder_danger_deep = maxPct >= 15;
+  }
 
   // ── Price / volume (priority: DexScreener → Birdeye) ─────────────────────
   const liquidity_usd        = dexData?.liquidity_usd        ?? birdData?.liquidity_usd        ?? null;
@@ -778,20 +889,31 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     funding_wallet_overlap !== null && funding_wallet_overlap > 0 ? "MEDIUM" : "LOW";
 
   // ── Risk grade ────────────────────────────────────────────────────────────
-  const bundled_launch_detected = rugData?.bundled_launch_detected
-    ?? ((token_age_days != null && token_age_days < 1) && (top_10_holder_pct != null && top_10_holder_pct > 90));
+  // Bundled launch detection: Birdeye v1 launch-window analysis via detectBundledLaunchViaBirdeye.
+  // Falls back to RugCheck signal when Birdeye detection_method is "UNKNOWN" (unavailable).
+  const bundled_launch_detected =
+    bundlerData.detection_method !== "UNKNOWN"
+      ? bundlerData.bundled_launch_detected
+      : (rugData?.bundled_launch_detected ?? false);
+
+  // Confidence is only meaningful from the Birdeye live detector.
+  // RugCheck fallback has no confidence field → null (scorer treats as HIGH, conservative).
+  const bundled_launch_confidence: "HIGH" | "MEDIUM" | "LOW" | null =
+    bundlerData.detection_method !== "UNKNOWN"
+      ? (bundlerData.confidence ?? null)
+      : null;
 
   const factors: RiskFactors = {
     mint_authority_revoked,
     freeze_authority_revoked,
-    top_10_holder_pct,
+    adjusted_top_10_holder_pct: adjusted_holder_concentration.adjusted_top_10_pct,
     liquidity_usd,
     has_rug_history,
     bundled_launch: bundled_launch_detected,
+    bundled_launch_confidence,
     buy_sell_ratio: buy_sell_ratio_1h,
     token_age_days,
-    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
-    single_holder_danger: rugData?.single_holder_danger ?? false,
+    single_holder_danger: live_single_holder_danger_deep,
     lp_burned,
     lp_model,
     lp_status,
@@ -804,12 +926,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     authority_ever_regranted: authority_history.authority_ever_regranted,
     wash_trading_circular_pairs: circular_pairs,
     post_launch_mints,
-    adjusted_top_10_holder_pct: adjusted_holder_concentration.adjusted_top_10_pct,
     dev_funder_type: devWalletForAge ? dev_funding_source.funder_type : null,
-    rugcheck_lp_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
-    rugcheck_raw_score: rugData?.score ?? null,
   };
-  const { exempt: authority_exempt, reason: authority_exempt_reason } = await resolveAuthorityExempt(address);
+  const { exempt: authority_exempt, reason: authority_exempt_reason } = await authorityExemptPromise;
   const { grade: risk_grade, scoringFactors } = calculateRiskGrade(factors, authority_exempt);
 
   // ── Deep-only signals ─────────────────────────────────────────────────────
@@ -831,9 +950,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   } else {
     // Use effectiveDevAddress: mintAuthAddress for standard tokens,
     // DAS update authority for pump.fun tokens where mintAuthority is burned.
-    const devSolBalance = effectiveDevAddress
-      ? await getSolBalance(effectiveDevAddress, 3000)
-      : null;
+    const devSolBalance = await devSolBalancePromise;
     const funding_risk_note: string | null =
       dev_funding_source.funder_type === "MIXER"          ? "Dev wallet funded via mixer — high anonymous funding risk"
       : dev_funding_source.funder_type === "DEPLOYER"     ? "Dev wallet funded by deployer-pattern wallet — elevated risk"
@@ -850,15 +967,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   }
 
   // LP lock — multi-pool assessment (up to 5 highest-liquidity pools)
-  const poolsToCheck = (dexData?.pairs ?? [])
-    .slice()
-    .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))
-    .slice(0, 5);
-  const poolSafetyResults = await Promise.allSettled(
-    poolsToCheck.map((p) =>
-      checkPoolLiquiditySafety(p.pairAddress, (p as any).info?.liquidityToken?.address ?? null, { timeout: 3000 })
-    )
-  );
+  // poolSafetyPromise was started in the background after Phase 1, so this just awaits the result.
+  const poolSafetyResults = await poolSafetyPromise;
   const poolSafeties: PoolLiquiditySafety[] = poolSafetyResults
     .filter((r): r is PromiseFulfilledResult<PoolLiquiditySafety> => r.status === "fulfilled")
     .map((r) => r.value);
@@ -869,14 +979,32 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const unique_buyers_24h = dexData?.pair?.txns?.h24?.buys ?? 0;
   const wash_trading_score = deriveWashTradingScore(buy_sell_ratio_1h, volume_24h || null, liquidity_usd);
 
-  // ── Momentum score ────────────────────────────────────────────────────────
+  // ── Last trade (adversarial freshness signal) ─────────────────────────────
+  const last_trade = deriveLastTrade(birdData?.last_trade_unix_time ?? null);
+  const hours_since_last_trade = last_trade.hours_ago;
+
+  // ── Momentum score (multi-timeframe) ─────────────────────────────────────
   const momentum_score = calculateMomentumScore({
-    price_change_24h_pct,
-    volume_24h: volume_24h || null,
+    price_change_5m_pct:  birdData?.price_change_5m_pct  ?? null,
+    price_change_30m_pct: birdData?.price_change_30m_pct ?? null,
+    price_change_1h_pct:  dexData?.price_change_1h_pct   ?? birdData?.price_change_1h_pct ?? null,
+    price_change_8h_pct:  birdData?.price_change_8h_pct  ?? null,
+    price_change_24h_pct: price_change_24h_pct,
+    volume_1h_usd:        birdData?.volume_1h_usd         ?? null,
+    volume_24h_usd:       volume_24h || null,
     buy_sell_ratio_1h,
-    unique_buyers_24h,
-    liquidity_usd,
+    hours_since_last_trade,
   });
+  const momentum_tier: "STRONG" | "MODERATE" | "WEAK" | "DEAD" =
+    momentum_score >= 75 ? "STRONG"
+    : momentum_score >= 50 ? "MODERATE"
+    : momentum_score >= 25 ? "WEAK"
+    : "DEAD";
+  const momentum_interpretation: string =
+    momentum_score >= 75 ? "Strong upward momentum — active buying, rising price, healthy volume (75–100)"
+    : momentum_score >= 50 ? "Moderate momentum — some buying activity but not dominant (50–74)"
+    : momentum_score >= 25 ? "Weak momentum — low volume or sell pressure outweighs buys (25–49)"
+    : "Dead or declining — near-zero volume, strong sell pressure, or price collapse (0–24)";
 
   // ── Data confidence ────────────────────────────────────────────────────────
   const sources = [
@@ -890,7 +1018,6 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     sources_available: sources.length,
     sources_total: 4,
     data_age_ms,
-    rugcheck_age_seconds: rugcheck_report_age_seconds ?? undefined,
   });
   const data_confidence = confidenceToString(confidence.model);
 
@@ -898,7 +1025,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const historical_flags: HistoricalFlag[] = buildHistoricalFlags({
     has_rug_history,
     bundled_launch: bundled_launch_detected,
-    single_holder_danger: rugData?.single_holder_danger ?? false,
+    single_holder_danger: live_single_holder_danger_deep,
     dev_wallet_analysis: { previous_rugs: has_rug_history },
   });
   if (is_mutable === true) historical_flags.push("MUTABLE_METADATA");
@@ -907,8 +1034,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   // ── Risk breakdown ────────────────────────────────────────────────────────
   const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
-    (is_honeypot || has_rug_history || !mint_authority_revoked || !freeze_authority_revoked || authority_history.authority_ever_regranted) ? "HIGH"
-    : (rugcheckAdjusted?.adjusted_score ?? 0) > 2000 ? "MEDIUM"
+    (has_rug_history || !mint_authority_revoked || !freeze_authority_revoked || authority_history.authority_ever_regranted) ? "HIGH"
     : "LOW";
 
   const liquidity_risk: "LOW" | "MEDIUM" | "HIGH" =
@@ -922,9 +1048,20 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     : volume_24h < 10_000 || (buy_sell_ratio_1h !== null && buy_sell_ratio_1h < 0.3) ? "MEDIUM"
     : "LOW";
 
+  // behavioral_risk reflects the effective bundled-launch threat, not just the raw boolean.
+  // A MEDIUM-confidence detection on a 280-day-old token is not the same threat as a
+  // HIGH-confidence detection on a 3-day-old token. Mirror the confidence + age logic
+  // from the scorer: HIGH confidence fresh token → HIGH risk; decayed/low-conf → MEDIUM.
+  const effectiveBundledHigh =
+    bundled_launch_detected
+    && (bundled_launch_confidence === "HIGH" || bundled_launch_confidence === null)
+    && (token_age_days === null || token_age_days <= 90);
+  const effectiveBundledMedium =
+    bundled_launch_detected && !effectiveBundledHigh;
+
   const behavioral_risk: "LOW" | "MEDIUM" | "HIGH" =
-    bundled_launch_detected || (rugData?.insider_flags ?? false) ? "HIGH"
-    : (rugData?.single_holder_danger ?? false) ? "MEDIUM"
+    effectiveBundledHigh ? "HIGH"
+    : effectiveBundledMedium || live_single_holder_danger_deep ? "MEDIUM"
     : "LOW";
 
   const risk_breakdown = { contract_risk, liquidity_risk, market_risk, behavioral_risk };
@@ -939,20 +1076,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     ? Math.floor(dexData.pair_created_at_ms / 1000)
     : null;
 
-  // DEX pool addresses from DexScreener — exclude from target wallets
-  const knownPoolAddresses = new Set(
-    (dexData?.pairs ?? []).map((p: { pairAddress: string }) => p.pairAddress).filter(Boolean)
-  );
-
-  // Build target wallet list: top holders minus protocol + DEX pool addresses
-  const targetWallets = (topHoldersData ?? [])
-    .map((h: { owner: string }) => h.owner)
-    .filter((addr: string) => !isProtocolAddress(addr) && !knownPoolAddresses.has(addr));
-
-  // Phase 1b: parallel fee payer lookups (1500ms each, max 20 wallets)
-  const feePayerResults = await Promise.allSettled(
-    targetWallets.map(w => getWalletSwapFeePayers(w, { timeout: 1500, limit: 5 }))
-  );
+  // Phase 1b fee payer lookups were started in the background after Phase 1; await here.
+  const feePayerResults = await feePayerPromise;
 
   // Build fee_payer → wallets[] map from Phase 1b results.
   // Shared fee payer = strong bundled-launch signal.
@@ -1032,7 +1157,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // insider_control_percent: sum supply % across all detected clusters
   const insider_control_percent = clusterResult.clusters.length > 0
     ? clusterResult.clusters.reduce((sum, c) => sum + (c.supply_pct_combined ?? 0), 0)
-    : (rugData?.insider_flags ? 15 : null);
+    : null;
 
   const wallet_analysis = {
     clustered_wallets: clusterResult.total_clustered_wallets,
@@ -1051,7 +1176,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // ── Sniper activity ───────────────────────────────────────────────────────
   const sniper_activity: "LOW" | "MEDIUM" | "HIGH" =
     bundled_launch_detected ? "HIGH"
-    : (rugData?.single_holder_danger ?? false) ? "MEDIUM"
+    : live_single_holder_danger_deep ? "MEDIUM"
     : "LOW";
 
   // ── Key drivers ───────────────────────────────────────────────────────────
@@ -1068,6 +1193,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     risk_breakdown,
     historical_flags,
     confidence_model: confidence.model,
+    last_trade_recency: last_trade.recency,
   });
 
   // ── Data quality ──────────────────────────────────────────────────────────
@@ -1076,14 +1202,17 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   const missing_fields: string[] = [];
   if (dexData  === null) missing_fields.push("price", "volume", "liquidity", "buy_sell_ratio");
-  if (rugData  === null) missing_fields.push("rugcheck_risk_score", "bundled_launch", "single_holder_danger");
+  if (rugData  === null) missing_fields.push("has_rug_history");
   if (mintData === null) missing_fields.push("mint_authority_revoked", "freeze_authority_revoked");
   if (birdData === null) missing_fields.push("birdeye_price");
+  const symbol   = birdData?.symbol   ?? null;
+  const name     = birdData?.name     ?? null;
+  const logo_uri = birdData?.logo_uri ?? null;
+  if (symbol === null && name === null) missing_fields.push("token_metadata");
   if (effectiveDevAddress === null) missing_fields.push("dev_wallet_address");
 
   // ── Quick-scan-style one-liner summary ─────────────────────────────────────
   const flags: string[] = [];
-  if (is_honeypot) flags.push("honeypot");
   if (has_rug_history) flags.push("rug history");
   if (!mint_authority_revoked) flags.push("mint authority active");
   if (!freeze_authority_revoked) flags.push("freeze authority active");
@@ -1097,7 +1226,6 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   // ── LLM full risk report — sequential, after all parallel fetches complete ─
   const llmInput: DeepDiveData = {
     risk_grade,
-    is_honeypot,
     has_rug_history,
     mint_authority_revoked,
     freeze_authority_revoked,
@@ -1109,12 +1237,12 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     bundled_launch_detected,
     data_confidence,
     recommendation: recommendation.action,
-    rugcheck_risk_score: rugcheckAdjusted?.adjusted_score ?? null,
-    insider_flags: rugData?.insider_flags ?? false,
     authority_exempt,
     authority_exempt_reason,
     factors: scoringFactors,
     historical_flags,
+    name,
+    symbol,
   };
 
   const llmStart = Date.now();
@@ -1130,17 +1258,19 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
 
   return {
     schema_version: "2.0" as const,
-    is_honeypot,
+    token_address: address,
+    symbol,
+    name,
+    logo_uri,
     mint_authority_revoked,
     freeze_authority_revoked,
     top_10_holder_pct,
+    single_holder_danger: live_single_holder_danger_deep,
     liquidity_usd,
     lp_burned,
     lp_model,
     lp_status,
     dex_id,
-    rugcheck_risk_score: factors.rugcheck_risk_score,
-    single_holder_danger: factors.single_holder_danger,
     risk_grade,
     summary,
     dev_wallet_analysis,
@@ -1148,13 +1278,13 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     trading_pattern,
     pump_fun_launched,
     bundled_launch_detected,
-    volume_24h,
-    price_change_24h_pct,
     momentum_score,
+    momentum_tier,
+    momentum_interpretation,
+    last_trade,
     full_risk_report,
     recommendation,
     data_confidence,
-    rugcheck_report_age_seconds,
     authority_exempt,
     authority_exempt_reason,
     factors: scoringFactors,
@@ -1171,21 +1301,9 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     authority_history,
     dilution_risk,
     adjusted_holder_concentration,
-    rugcheck_lp_adjusted: rugcheckAdjusted?.lp_risks_stripped ?? false,
-    rugcheck_raw_score: rugData?.score ?? null,
     pool_types_detected: [...new Set(
       (dexData?.pairs ?? []).map(pair => classifyLPModel(pair.dexId))
     )] as Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">,
-    rugcheck_score_details: rugData ? {
-      raw_score: rugData.score,
-      adjusted_score: rugcheckAdjusted?.adjusted_score ?? rugData.score,
-      lp_false_positive_stripped: rugcheckAdjusted?.lp_risks_stripped ?? false,
-      stripped_score_amount: rugData.score - (rugcheckAdjusted?.adjusted_score ?? rugData.score),
-      reason: rugcheckAdjusted?.lp_risks_stripped
-        ? lp_burned === true
-          ? "LP tokens confirmed burned on-chain — RugCheck LP unlock flag is a false positive"
-          : "DLMM/CLMM pool confirmed — no LP token exists, RugCheck LP assessment does not apply"
-        : null,
-    } : null,
+    bundler_analysis: bundlerData,
   };
 }

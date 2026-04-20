@@ -37,6 +37,11 @@ function makeFetchMock(overrides: {
   return vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
     const u = String(url);
 
+    // Birdeye token_overview — provides symbol/name/logoURI
+    if (u.includes("birdeye.so/defi/token_overview")) {
+      return fakeResponse({ success: true, data: { symbol: "USDC", name: "USD Coin", logoURI: "https://example.com/usdc.png", price: 1.0001, liquidity } });
+    }
+
     if (u.includes("dexscreener")) {
       return fakeResponse({
         pairs: [{
@@ -160,12 +165,14 @@ describe("quickScan", () => {
 
     expect(result).toMatchObject({
       schema_version:          "2.0",
+      token_address:           expect.any(String),
+      symbol:                  expect.toBeOneOf([expect.any(String), null]),
+      name:                    expect.toBeOneOf([expect.any(String), null]),
+      logo_uri:                expect.toBeOneOf([expect.any(String), null]),
       grade_type:              "STRUCTURAL_SAFETY",
-      is_honeypot:             expect.any(Boolean),
       mint_authority_revoked:  expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
       lp_burned:               expect.toBeOneOf([true, false, null]),
-      rugcheck_risk_score:     expect.toBeOneOf([expect.any(Number), null]),
       single_holder_danger:    expect.any(Boolean),
       risk_grade:              expect.stringMatching(/^[ABCDF]$/),
       summary:                 expect.any(String),
@@ -181,18 +188,6 @@ describe("quickScan", () => {
     result.pool_types_detected.forEach((t: string) => {
       expect(t).toMatch(/^(TRADITIONAL_AMM|CLMM_DLMM|UNKNOWN)$/);
     });
-
-    // rugcheck_score_details present when rugcheck data available
-    expect(result.rugcheck_score_details).not.toBeNull();
-    if (result.rugcheck_score_details !== null) {
-      expect(result.rugcheck_score_details).toMatchObject({
-        lp_false_positive_stripped: expect.any(Boolean),
-        stripped_score_amount:      expect.any(Number),
-      });
-      if (result.rugcheck_score_details.lp_false_positive_stripped) {
-        expect(result.rugcheck_score_details.reason).toBeTruthy();
-      }
-    }
 
     // confidence.model is 0.0–1.0
     expect(result.confidence.model).toBeGreaterThanOrEqual(0);
@@ -274,7 +269,7 @@ describe("quickScan", () => {
     expect(factorNames).toContain("freeze_authority");
     expect(factorNames).toContain("lp_status");
     expect(factorNames).toContain("liquidity_check");
-    expect(factorNames).toContain("rugcheck_score");
+    expect(factorNames).toContain("creator_supply_pct");
     expect(factorNames).toContain("single_holder_danger");
     expect(factorNames).toContain("token_age_days");
 
@@ -339,10 +334,13 @@ describe("quickScan", () => {
     expect(gradeOrder.indexOf(notBurnedResult.risk_grade)).toBeGreaterThan(gradeOrder.indexOf(burnedResult.risk_grade));
   });
 
-  it("applies single_holder_danger penalty from RugCheck risks array", async () => {
-    // Without single_holder_danger: score 100 - 25 (lp_burned null) = 75 → A
-    // With single_holder_danger:    score 100 - 25 (lp) - 25 (danger) = 50 → C
-    const withDanger = vi.fn().mockImplementation(async (url: string) => {
+  it("applies single_holder_danger penalty from Birdeye live holder data", async () => {
+    // single_holder_danger is now derived from Birdeye top-holders (≥15% threshold).
+    // Clean mock: no Birdeye holder data → single_holder_danger false.
+    // Danger mock: one holder owns 20% of supply → single_holder_danger true.
+    const mintBuf = Buffer.alloc(82, 0); // authorities revoked
+
+    const withDanger = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("dexscreener")) {
         return fakeResponse({ pairs: [{
@@ -356,27 +354,39 @@ describe("quickScan", () => {
           liquidity: { usd: 2_000_000 },
           txns: { h1: { buys: 200, sells: 100 }, h24: { buys: 2000, sells: 1000 } },
           pairCreatedAt: Date.now() - 400 * 86_400_000,
+          info: { liquidityToken: { address: "FakeLPMint1111111111111111111111111111111111" } },
         }] });
       }
       if (u.includes("rugcheck")) {
-        return fakeResponse({
-          mint: USDC,
-          mintAuthority: null,
-          freezeAuthority: null,
-          topHolders: Array.from({ length: 10 }, (_, i) => ({
-            address: `addr${i}111111111111111111111111111111111111`,
-            pct: 5, amount: 1000, uiAmount: 1000, uiAmountString: "1000",
-          })),
-          score: 0,
-          risks: [{ name: "Single holder ownership", level: "danger", description: "single holder", score: 100, value: "" }],
-          rugged: false,
-        });
+        return fakeResponse({ mint: USDC, mintAuthority: null, freezeAuthority: null,
+          topHolders: [], score: 0, risks: [], rugged: false });
       }
-      const mintBuf2 = Buffer.alloc(82, 0); // authorities revoked
-      return fakeResponse({ id: 1, result: { value: { data: [mintBuf2.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
+      // Birdeye token_security — provides total_supply
+      if (u.includes("token_security")) {
+        return fakeResponse({ success: true, data: { totalSupply: 1_000_000, creatorPercentage: 0 } });
+      }
+      // Birdeye v3/token/holder — big holder at 20%
+      if (u.includes("v3/token/holder")) {
+        return fakeResponse({ success: true, data: { items: [
+          { owner: "BigHolder111111111111111111111111111111111111", token_account: "acct1", ui_amount: 200_000 },
+          { owner: "SmallHolder11111111111111111111111111111111111", token_account: "acct2", ui_amount: 50_000 },
+        ] } });
+      }
+      if (u.includes("birdeye")) {
+        return fakeResponse({ success: true, data: { symbol: "USDC", name: "USD Coin", logoURI: null, price: 1.0001, liquidity: 2_000_000 } });
+      }
+      const body = JSON.parse((init?.body as string) ?? "{}");
+      if (body.method === "getTokenLargestAccounts") {
+        return fakeResponse({ id: 1, result: { value: [{ address: "1nc1nerator11111111111111111111111111111111", amount: "1000000" }] } });
+      }
+      if (body.method === "getSignaturesForAddress") {
+        const blockTime = Math.floor((Date.now() - 400 * 86_400_000) / 1000);
+        return fakeResponse({ id: 1, result: [{ signature: "fakeSig", slot: 100, blockTime }] });
+      }
+      return fakeResponse({ id: 1, result: { value: { data: [mintBuf.toString("base64"), "base64"], owner: "TokenkebQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } } });
     });
 
-    vi.stubGlobal("fetch", makeFetchMock()); // clean — no danger
+    vi.stubGlobal("fetch", makeFetchMock()); // clean — no Birdeye holder data → false
     const clean = await quickScan(USDC);
     _resetCache();
 

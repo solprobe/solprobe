@@ -35,6 +35,32 @@ function dexPair(overrides: Record<string, unknown> = {}) {
   };
 }
 
+type BirdeyeTxItem = { blockUnixTime: number; owner: string };
+
+/** Minimal Birdeye token_overview payload — extend as needed. */
+function birdeyeOverview(overrides: Record<string, unknown> = {}) {
+  return {
+    success: true,
+    data: {
+      address: TOKEN,
+      price: 1.0001,
+      liquidity: 5_000_000,
+      symbol: "USDC",
+      name: "USD Coin",
+      logoURI: "https://example.com/usdc.png",
+      v1hUSD: 100_000,
+      v24hUSD: 2_000_000,
+      priceChange1hPercent: 2,
+      priceChange24hPercent: 0.5,
+      priceChange5mPercent: 0.1,
+      priceChange30mPercent: 0.5,
+      priceChange8hPercent: 1.0,
+      lastTradeUnixTime: Math.floor(Date.now() / 1000) - 3600, // 1h ago
+      ...overrides,
+    },
+  };
+}
+
 function makeFetch({
   rugcheckStatus = 200,
   rugcheckData = {
@@ -49,6 +75,8 @@ function makeFetch({
     rugged: false,
   },
   dexData = { pairs: [dexPair()] },
+  birdeyeTxItems = null as BirdeyeTxItem[] | null,
+  birdeyeTokenOverride = null as Record<string, unknown> | null,
 } = {}) {
   return vi.fn().mockImplementation(async (url: string) => {
     const u = String(url);
@@ -57,6 +85,20 @@ function makeFetch({
     }
     if (u.includes("dexscreener")) {
       return fakeResponse(dexData);
+    }
+    // Birdeye txs/token — bundled launch detection endpoint
+    if (u.includes("txs/token")) {
+      if (birdeyeTxItems !== null) {
+        return fakeResponse({ success: true, data: { items: birdeyeTxItems } });
+      }
+      return fakeResponse(null, 401);
+    }
+    // Birdeye token_overview — opt-in via birdeyeTokenOverride
+    if (u.includes("token_overview")) {
+      if (birdeyeTokenOverride !== null) {
+        return fakeResponse(birdeyeOverview(birdeyeTokenOverride));
+      }
+      return fakeResponse(null, 401);
     }
     if (u.includes("birdeye")) {
       return fakeResponse(null, 401); // no key — acceptable null
@@ -84,11 +126,13 @@ describe("deepDive", () => {
 
     expect(result).toMatchObject({
       schema_version:           "2.0",
-      is_honeypot:              expect.any(Boolean),
+      token_address:            expect.any(String),
+      symbol:                   expect.toBeOneOf([expect.any(String), null]),
+      name:                     expect.toBeOneOf([expect.any(String), null]),
+      logo_uri:                 expect.toBeOneOf([expect.any(String), null]),
       mint_authority_revoked:   expect.any(Boolean),
       freeze_authority_revoked: expect.any(Boolean),
       lp_burned:                expect.toBeOneOf([true, false, null]),
-      rugcheck_risk_score:      expect.toBeOneOf([expect.any(Number), null]),
       single_holder_danger:     expect.any(Boolean),
       risk_grade:               expect.stringMatching(/^[ABCDF]$/),
       recommendation:           expect.objectContaining({
@@ -98,6 +142,13 @@ describe("deepDive", () => {
         time_horizon: expect.stringMatching(/^(SHORT_TERM|MEDIUM_TERM|LONG_TERM)$/),
       }),
       momentum_score:           expect.any(Number),
+      momentum_tier:            expect.stringMatching(/^(STRONG|MODERATE|WEAK|DEAD)$/),
+      last_trade:               expect.objectContaining({
+        timestamp:    expect.toBeOneOf([expect.any(Number), null]),
+        hours_ago:    expect.toBeOneOf([expect.any(Number), null]),
+        recency:      expect.stringMatching(/^(ACTIVE|RECENT|STALE|DORMANT|DEAD|UNKNOWN)$/),
+        recency_note: expect.any(String),
+      }),
       data_confidence:          expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
       full_risk_report:         expect.any(String),
       summary:                  expect.any(String),
@@ -155,18 +206,17 @@ describe("deepDive", () => {
       expect(t).toMatch(/^(TRADITIONAL_AMM|CLMM_DLMM|UNKNOWN)$/);
     });
 
-    // rugcheck_score_details present when rugcheck data available
-    expect(result.rugcheck_score_details).not.toBeNull();
-    if (result.rugcheck_score_details !== null) {
-      expect(result.rugcheck_score_details).toMatchObject({
-        lp_false_positive_stripped: expect.any(Boolean),
-        stripped_score_amount:      expect.any(Number),
-      });
-      // reason must be populated when lp_false_positive_stripped is true
-      if (result.rugcheck_score_details.lp_false_positive_stripped) {
-        expect(result.rugcheck_score_details.reason).toBeTruthy();
-      }
-    }
+    // bundler_analysis always present with correct shape
+    expect(result.bundler_analysis).toMatchObject({
+      bundled_launch_detected:    expect.any(Boolean),
+      bundler_count:              expect.any(Number),
+      bundler_fee_payers:         expect.any(Array),
+      launch_window_txs_analysed: expect.any(Number),
+      detection_method:           expect.stringMatching(/^(LAUNCH_WINDOW_FEE_PAYER|RUGCHECK_FALLBACK|UNKNOWN)$/),
+      confidence:                 expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      meaning:                    expect.any(String),
+      action_guidance:            expect.any(String),
+    });
 
     // dev_wallet_analysis must have funding_source + funding_risk_note fields
     expect(result.dev_wallet_analysis).toHaveProperty("funding_source");
@@ -338,5 +388,93 @@ describe("deepDive", () => {
       .filter((s) => s.length > 0);
     expect(sentences.length).toBeGreaterThanOrEqual(2); // at least 3 sentences
     expect(sentences.length).toBeLessThanOrEqual(6);    // not more than ~5
+  });
+
+  it("bundler_analysis detects bundled launch when ≥3 distinct owners share a block", async () => {
+    const blockTime = 1_700_000_000;
+    // 4 distinct wallets buying in the exact same block — clear bundled signal
+    const birdeyeTxItems: BirdeyeTxItem[] = [
+      { blockUnixTime: blockTime, owner: "wallet1" + "1".repeat(36) },
+      { blockUnixTime: blockTime, owner: "wallet2" + "2".repeat(36) },
+      { blockUnixTime: blockTime, owner: "wallet3" + "3".repeat(36) },
+      { blockUnixTime: blockTime, owner: "wallet4" + "4".repeat(36) },
+      { blockUnixTime: blockTime + 5, owner: "wallet5" + "5".repeat(36) },
+    ];
+
+    vi.stubGlobal("fetch", makeFetch({ birdeyeTxItems }));
+    const result = await deepDive(TOKEN);
+
+    expect(result.bundler_analysis.bundled_launch_detected).toBe(true);
+    expect(result.bundler_analysis.bundler_count).toBe(4);
+    expect(result.bundler_analysis.detection_method).toBe("LAUNCH_WINDOW_FEE_PAYER");
+    expect(result.bundler_analysis.launch_window_txs_analysed).toBeGreaterThanOrEqual(4);
+    expect(result.bundler_analysis.bundler_fee_payers).toBeInstanceOf(Array);
+    expect(result.bundled_launch_detected).toBe(true);
+  });
+
+  it("bundler_analysis reports no bundled launch when all owners are in unique blocks", async () => {
+    const blockTime = 1_700_000_000;
+    // Each wallet buys in a different block — no coordination signal
+    const birdeyeTxItems: BirdeyeTxItem[] = [
+      { blockUnixTime: blockTime,     owner: "wallet1" + "1".repeat(36) },
+      { blockUnixTime: blockTime + 1, owner: "wallet2" + "2".repeat(36) },
+      { blockUnixTime: blockTime + 2, owner: "wallet3" + "3".repeat(36) },
+      { blockUnixTime: blockTime + 3, owner: "wallet4" + "4".repeat(36) },
+    ];
+
+    vi.stubGlobal("fetch", makeFetch({ birdeyeTxItems }));
+    const result = await deepDive(TOKEN);
+
+    expect(result.bundler_analysis.bundled_launch_detected).toBe(false);
+    expect(result.bundler_analysis.bundler_count).toBe(0);
+    expect(result.bundler_analysis.detection_method).toBe("LAUNCH_WINDOW_FEE_PAYER");
+  });
+
+  it("dead token: lastTradeUnixTime >30d ago → momentum_score=0, momentum_tier=DEAD, last_trade.recency=DEAD", async () => {
+    const deadTimestamp = Math.floor(Date.now() / 1000) - 31 * 86_400; // 31 days ago
+    vi.stubGlobal("fetch", makeFetch({
+      birdeyeTokenOverride: {
+        lastTradeUnixTime: deadTimestamp,
+        priceChange1hPercent: null,
+        priceChange24hPercent: null,
+        priceChange5mPercent: null,
+        priceChange30mPercent: null,
+        priceChange8hPercent: null,
+        v1hUSD: 0,
+        v24hUSD: 0,
+      },
+    }));
+
+    const result = await deepDive(TOKEN);
+
+    expect(result.momentum_score).toBe(0);
+    expect(result.momentum_tier).toBe("DEAD");
+    expect(result.last_trade.recency).toBe("DEAD");
+    expect(result.last_trade.hours_ago).toBeGreaterThan(700);
+  });
+
+  it("active token: lastTradeUnixTime 1h ago + strong 1h price → momentum_score≥60, momentum_tier≠DEAD", async () => {
+    const activeTimestamp = Math.floor(Date.now() / 1000) - 3600; // 1h ago
+    vi.stubGlobal("fetch", makeFetch({
+      birdeyeTokenOverride: {
+        lastTradeUnixTime: activeTimestamp,
+        priceChange1hPercent: 20,
+        priceChange24hPercent: 15,
+        priceChange5mPercent: 5,
+        priceChange30mPercent: 10,
+        priceChange8hPercent: 12,
+        v1hUSD: 500_000,
+        v24hUSD: 2_000_000,
+      },
+      dexData: {
+        pairs: [dexPair({ txns: { h1: { buys: 400, sells: 100 }, h24: { buys: 4000, sells: 1000 } } })],
+      },
+    }));
+
+    const result = await deepDive(TOKEN);
+
+    expect(result.momentum_score).toBeGreaterThanOrEqual(60);
+    expect(result.momentum_tier).not.toBe("DEAD");
+    expect(result.last_trade.recency).toBe("ACTIVE");
   });
 });

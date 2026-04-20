@@ -51,7 +51,6 @@ const PROVIDERS: Provider[] = [
 // ---------------------------------------------------------------------------
 
 export interface QuickScanData {
-  is_honeypot: boolean;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
   top_10_holder_pct: number | null;
@@ -66,7 +65,6 @@ export interface QuickScanData {
 
 export interface DeepDiveData {
   risk_grade: string;
-  is_honeypot: boolean;
   has_rug_history: boolean;
   mint_authority_revoked: boolean;
   freeze_authority_revoked: boolean;
@@ -78,12 +76,12 @@ export interface DeepDiveData {
   bundled_launch_detected: boolean;
   data_confidence: string;
   recommendation: string;
-  rugcheck_risk_score?: number | null;
-  insider_flags?: boolean;
   authority_exempt?: boolean;
   authority_exempt_reason?: string | null;
   factors?: ScoringFactor[];
   historical_flags?: string[];
+  name?: string | null;
+  symbol?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +184,6 @@ async function callWithFallback(
 
 export function fallbackQuickSummary(data: QuickScanData): string {
   const flags: string[] = [];
-  if (data.is_honeypot) flags.push("honeypot detected");
   if (data.has_rug_history) flags.push("rug history");
   if (!data.mint_authority_revoked) flags.push("mint authority active");
   if (!data.freeze_authority_revoked) flags.push("freeze authority active");
@@ -229,11 +226,9 @@ export function fallbackDeepReport(data: DeepDiveData): string {
   sentences.push(`Liquidity: ${liq}; 24 h volume: ${vol}; momentum ${data.momentum_score}/100.`);
 
   const risks: string[] = [];
-  if (data.is_honeypot) risks.push("honeypot pattern");
   if (data.has_rug_history) risks.push("prior rug");
   if (data.pump_fun_launched) risks.push("pump.fun launch");
   if (data.bundled_launch_detected) risks.push("bundled launch");
-  if (data.insider_flags) risks.push("insider activity");
   if (data.top_10_holder_pct !== null && data.top_10_holder_pct > 80)
     risks.push(`top-10 control ${data.top_10_holder_pct.toFixed(1)}%`);
   if (risks.length > 0) sentences.push(`Risk signals: ${risks.join(", ")}.`);
@@ -268,7 +263,7 @@ export async function generateQuickScanSummary(data: QuickScanData): Promise<str
   const liq = data.liquidity_usd !== null
     ? `$${data.liquidity_usd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
     : "unknown";
-  const userMsg = `Risk grade: ${data.risk_grade}. Liquidity: ${liq}. Mint revoked: ${data.mint_authority_revoked}. Freeze revoked: ${data.freeze_authority_revoked}. Honeypot: ${data.is_honeypot}. Rug history: ${data.has_rug_history ?? false}. Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}. Confidence: ${data.data_confidence}.${factorLines}`;
+  const userMsg = `Risk grade: ${data.risk_grade}. Liquidity: ${liq}. Mint revoked: ${data.mint_authority_revoked}. Freeze revoked: ${data.freeze_authority_revoked}. Rug history: ${data.has_rug_history ?? false}. Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}. Confidence: ${data.data_confidence}.${factorLines}`;
 
   const result = await callWithFallback("fast", 80, system, userMsg);
   return result || fallbackQuickSummary(data);
@@ -282,7 +277,9 @@ export interface WalletRiskData {
   classification?: "LOW_RISK" | "HIGH_RISK" | "UNKNOWN";
   activity?: {
     wallet_age_days: number | null;
+    wallet_age_source?: "birdeye_first_funded" | "rpc_full" | "rpc_partial" | "failed";
     total_trades: number;
+    trade_count_source?: "birdeye_pnl" | "helius_fetch";
     active_days: number | null;
     last_active_hours_ago: number | null;
   };
@@ -365,6 +362,8 @@ export interface MarketIntelData {
   pct_from_ath?: number | null;
   signal_subtype?: string;
   factors?: ScoringFactor[];
+  name?: string | null;
+  symbol?: string | null;
 }
 
 // Forbidden words that contradict ACTIVE token health or use hyperbolic language
@@ -386,16 +385,20 @@ function validateMarketSummary(text: string, tokenHealth?: string): boolean {
 }
 
 export function fallbackMarketIntelSummary(data: MarketIntelData): string {
+  const tokenId = data.symbol ?? data.name ?? "Token";
   const dir = data.signal === "BULLISH" ? "Bullish" : data.signal === "BEARISH" ? "Bearish" : "Neutral";
   const vol = data.volume_1h_usd > 0 ? `$${(data.volume_1h_usd / 1000).toFixed(0)}k 1h volume` : "volume unknown";
   const scorePart = data.signal_score != null ? ` (score ${data.signal_score > 0 ? "+" : ""}${data.signal_score})` : "";
   const healthPart = data.token_health ? `; token health ${data.token_health}` : "";
-  return `${dir} signal${scorePart} — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure${healthPart}.`;
+  return `${tokenId}: ${dir} signal${scorePart} — ${vol}, ${data.buy_pressure.toLowerCase()} buy pressure${healthPart}.`;
 }
 
 export async function generateMarketIntelSummary(data: MarketIntelData): Promise<string> {
+  const tokenId = data.symbol ?? data.name ?? null;
+  const tokenLabel = tokenId ? `$${tokenId}` : "this token";
   const system =
-    "You are a Solana market analyst writing one short paragraph for AI trading agents. " +
+    `You are a Solana market analyst writing one short paragraph for AI trading agents about ${tokenLabel}. ` +
+    `Always refer to the token as ${tokenLabel} — never as "SOLANA token" or "this token". ` +
     "You receive structured market data including token_health, signal, and factors[]. " +
     "Your summary MUST be consistent with the structured fields — never contradict them. " +
     "If token_health is ACTIVE, do not describe the token as rugged, dead, or worthless. " +
@@ -416,6 +419,7 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
     : "";
 
   const userMsg = [
+    tokenId ? `Token: ${tokenId}.` : "",
     `Price: $${data.current_price_usd}.`,
     `1h change: ${data.price_change_1h_pct.toFixed(2)}%.`,
     `24h change: ${data.price_change_24h_pct.toFixed(2)}%.`,
@@ -455,8 +459,12 @@ export async function generateMarketIntelSummary(data: MarketIntelData): Promise
  * Tries Anthropic Sonnet first, falls back to Groq Mixtral, then template.
  */
 export async function generateDeepDiveReport(data: DeepDiveData): Promise<string> {
+  const tokenId = data.symbol ?? data.name ?? null;
+  const tokenLabel = tokenId ? `$${tokenId}` : "this token";
   const system =
-    "You are a professional on-chain security analyst. Write a 3–5 sentence risk report for this Solana token. Use the scoring factors list as your primary evidence — explain which factors drove the score and how they combine. Connect related risks into patterns rather than listing fields independently. State the recommendation and the single strongest reason for it in the final sentence. Be specific, factual, and concise. Do not use bullet points.";
+    `You are a professional on-chain security analyst. Write a 3–5 sentence risk report for ${tokenLabel}. ` +
+    `Always refer to the token as ${tokenLabel} — never as "this token" or "the token". ` +
+    "Use the scoring factors list as your primary evidence — explain which factors drove the score and how they combine. Connect related risks into patterns rather than listing fields independently. State the recommendation and the single strongest reason for it in the final sentence. Be specific, factual, and concise. Do not use bullet points.";
 
   const topFactors = [...(data.factors ?? [])]
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
@@ -474,13 +482,14 @@ export async function generateDeepDiveReport(data: DeepDiveData): Promise<string
     : "minimal";
 
   const userMsg = [
+    tokenId ? `Token: ${tokenId}.` : "",
     `Risk grade: ${data.risk_grade}. Recommendation: ${data.recommendation}.`,
     `Mint revoked: ${data.mint_authority_revoked}. Freeze revoked: ${data.freeze_authority_revoked}.`,
-    `Honeypot: ${data.is_honeypot}. Rug history: ${data.has_rug_history}.`,
+    `Rug history: ${data.has_rug_history}.`,
     `Liquidity: ${liq}. 24h volume: ${vol}. Momentum score: ${data.momentum_score}/100.`,
-    `Pump.fun: ${data.pump_fun_launched}. Bundled launch: ${data.bundled_launch_detected}. Insider flags: ${data.insider_flags ?? false}.`,
+    `Pump.fun: ${data.pump_fun_launched}. Bundled launch: ${data.bundled_launch_detected}.`,
     `Top-10 holders: ${data.top_10_holder_pct !== null ? data.top_10_holder_pct.toFixed(1) + "%" : "unknown"}.`,
-    `RugCheck score: ${data.rugcheck_risk_score ?? "n/a"}. Data confidence: ${data.data_confidence}.`,
+    `Data confidence: ${data.data_confidence}.`,
     data.historical_flags && data.historical_flags.length > 0
       ? `Historical flags: ${data.historical_flags.join(", ")}.`
       : "",
