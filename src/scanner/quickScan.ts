@@ -10,7 +10,7 @@ import {
   type RiskFactors,
 } from "./riskScorer.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
-import { isLPBurnLaunchpad, PROGRAMS, isProtocolAddress } from "../constants.js";
+import { isLPBurnLaunchpad, PROGRAMS, isProtocolAddress, CUSTODIAL_DEX_LP_PLATFORMS } from "../constants.js";
 import { deduplicate, getOrFetch } from "../cache.js";
 import {
   generateQuickScanSummary,
@@ -187,6 +187,8 @@ export interface QuickScanResult {
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
+  /** Human-readable note for CUSTODIAL lp_status; null for all other statuses. */
+  lp_status_note: string | null;
   dex_id: string | null;
   /** Creator/deployer wallet analysis — derived from Birdeye token_creation_info + wallet first-funded */
   creator_wallet: {
@@ -314,6 +316,17 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
 
   const lp_status = deriveLPStatus(lp_burned, lp_model);
 
+  // ── Custodial LP override ─────────────────────────────────────────────────
+  // When DexScreener provides no LP mint (lp_burned===null) but dex_id maps to a
+  // verified protocol custodian, classify CUSTODIAL instead of UNKNOWN.
+  const custodialPlatform = (lp_burned === null && lp_model === "TRADITIONAL_AMM" && dex_id)
+    ? CUSTODIAL_DEX_LP_PLATFORMS.get(dex_id) ?? null
+    : null;
+  const effective_lp_status: LPStatus = custodialPlatform ? "CUSTODIAL" : lp_status;
+  const lp_status_note: string | null = custodialPlatform
+    ? custodialPlatform.risk_implication
+    : null;
+
   // ── Liquidity lock status (single-pool view for quick scan) ──────────────
   const primaryPairAddress = dexData?.pairs.slice()
     .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0]?.pairAddress ?? null;
@@ -338,6 +351,25 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
           pool_address: primaryPairAddress, dex: dex_id, pool_type: "TRADITIONAL_AMM" as const,
           safety: "BURNED" as const, safety_note: "LP tokens confirmed burned",
         }] : [],
+      };
+    }
+    if (custodialPlatform) {
+      return {
+        locked: false, lock_type: "CUSTODIAL" as const, lock_duration_days: null,
+        locked_pct: 0, note: custodialPlatform.risk_implication,
+        pools_assessed: primaryPairAddress ? 1 : 0, pools_safe: 0,
+        pool_safety_breakdown: primaryPairAddress ? [{
+          pool_address: primaryPairAddress, dex: dex_id, pool_type: "TRADITIONAL_AMM" as const,
+          safety: "CUSTODIAL" as const,
+          safety_note: `LP held by ${custodialPlatform.platform} protocol wallet`,
+        }] : [],
+        custody_info: {
+          custodial_wallets: custodialPlatform.custodial_wallets,
+          treasury_wallets:  custodialPlatform.treasury_wallets,
+          platform:          custodialPlatform.platform,
+          type_description:  custodialPlatform.type_description,
+          risk_implication:  custodialPlatform.risk_implication,
+        },
       };
     }
     return {
@@ -423,7 +455,7 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     creator_supply_pct: securityData?.creator_percentage ?? null,
     lp_burned,
     lp_model,
-    lp_status,
+    lp_status: effective_lp_status,
     dex_id,
     dev_wallet_age_days: creatorWalletAgeDays, // Birdeye first-funded for creator wallet
     launch_pattern: launch_anomaly.launch_pattern,
@@ -519,7 +551,8 @@ async function _fetchQuickScan(address: string): Promise<QuickScanResult> {
     liquidity_check,
     lp_burned,
     lp_model,
-    lp_status,
+    lp_status: effective_lp_status,
+    lp_status_note,
     dex_id,
     creator_wallet: {
       address: creatorAddress,

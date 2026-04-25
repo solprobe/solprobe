@@ -1,4 +1,42 @@
 // ---------------------------------------------------------------------------
+// Custodial LP Platform Registry
+// ---------------------------------------------------------------------------
+// DEX platforms that hold LP tokens in a known protocol-controlled wallet
+// rather than burning them. When lp_burn check returns null AND the dex_id
+// matches an entry here, the LP status is CUSTODIAL (not UNKNOWN).
+//
+// To add a new platform: verify the custodial wallet via Helius /identity,
+// confirm the wallet type is "wallet" and name identifies the protocol.
+// ---------------------------------------------------------------------------
+
+export interface CustodialLPPlatform {
+  platform: string;
+  /** Addresses that hold LP tokens on behalf of bonding-curve or pool participants */
+  custodial_wallets: string[];
+  /** Protocol treasury / operational wallets also holding LP */
+  treasury_wallets: string[];
+  type_description: string;
+  risk_implication: string;
+}
+
+/**
+ * Map of DexScreener dexId → custodial platform info.
+ * Lookup: `CUSTODIAL_DEX_LP_PLATFORMS.get(dex_id)`.
+ */
+export const CUSTODIAL_DEX_LP_PLATFORMS = new Map<string, CustodialLPPlatform>([
+  ["pumpswap", {
+    platform: "pump.fun",
+    // Verified via Helius identity API 2025-04-25
+    custodial_wallets: ["Cfq1ts1iFr1eUWWBm8eFxUzm5R3YA3UvMZznwiShbgZt"],
+    treasury_wallets:  ["G8CcfRffqZWHSAQJXLDfwbAkGE95SddUqVXnTrL4kqjm"],
+    type_description:  "Pump.fun Protocol Custody & Treasury",
+    risk_implication:
+      "Liquidity is controlled by the pump.fun platform, not an anonymous creator. " +
+      "Not an immediate rug vector, but represents single-point-of-failure platform risk.",
+  }],
+]);
+
+// ---------------------------------------------------------------------------
 // Known Protocol / Custodian Address Whitelist
 // ---------------------------------------------------------------------------
 // Protocol-owned addresses that should be excluded from holder concentration
@@ -71,3 +109,24 @@ export const LP_BURN_LAUNCHPADS = new Set([
 export function isLPBurnLaunchpad(programId: string): boolean {
   return LP_BURN_LAUNCHPADS.has(programId);
 }
+
+// ---------------------------------------------------------------------------
+// Known Vesting Programs
+// ---------------------------------------------------------------------------
+// Programs that lock tokens in escrow and release them to recipients over time.
+// Used to detect when a top holder received tokens via vesting and transferred
+// them out — a dump risk signal.
+//
+// IMPORTANT: escrow wallet addresses return {"type":"unknown"} from Helius
+// identity — match on program ID only.
+// ---------------------------------------------------------------------------
+
+/**
+ * Map of program ID → platform name for known vesting programs.
+ * Lookup: `KNOWN_VESTING_PROGRAMS.get(programId)`.
+ */
+export const KNOWN_VESTING_PROGRAMS = new Map<string, string>([
+  ["strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m", "Streamflow"],
+  ["vesTcKoh7z3Yg9noSNMJ2RbHKTwNEfDCBY1Z3kQzYuV", "Valhalla"],
+  ["Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS", "Unloc"],
+]);

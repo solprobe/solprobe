@@ -192,10 +192,14 @@ export function calculateRiskGrade(
     });
   }
 
-  // LP burn — penalty depends on DEX model
+  // LP burn — penalty depends on DEX model and whether the holder is a known protocol
   if (factors.lp_status !== "BURNED" && factors.lp_status !== "NOT_APPLICABLE") {
     if (factors.lp_model === "TRADITIONAL_AMM") {
-      const penalty = factors.lp_status === "UNBURNED" ? 25 : 10;
+      // CUSTODIAL: LP held by a verified protocol wallet — reduced penalty vs UNKNOWN
+      // (not an anonymous rug vector, but single-point-of-failure platform risk)
+      const penalty = factors.lp_status === "UNBURNED"   ? 25
+                    : factors.lp_status === "CUSTODIAL"  ?  5
+                    : /* UNKNOWN */                         10;
       score -= penalty;
       sf.push({
         name: "lp_status",
@@ -204,11 +208,15 @@ export function calculateRiskGrade(
         interpretation:
           factors.lp_status === "UNBURNED"
             ? "LP not burned on AMM — rug risk"
+            : factors.lp_status === "CUSTODIAL"
+            ? "LP held by verified protocol custodian — platform risk only"
             : "LP burn status unknown on AMM",
       });
     } else {
       // UNKNOWN model
-      const penalty = factors.lp_status === "UNBURNED" ? 25 : 5;
+      const penalty = factors.lp_status === "UNBURNED"   ? 25
+                    : factors.lp_status === "CUSTODIAL"  ?  3
+                    : /* UNKNOWN */                          5;
       score -= penalty;
       sf.push({
         name: "lp_status",
@@ -217,6 +225,8 @@ export function calculateRiskGrade(
         interpretation:
           factors.lp_status === "UNBURNED"
             ? "LP not burned — rug risk"
+            : factors.lp_status === "CUSTODIAL"
+            ? "LP held by verified protocol custodian — platform risk only"
             : "LP burn unknown — DEX model uncertain",
       });
     }
@@ -316,13 +326,21 @@ export function calculateRiskGrade(
   }
 
   // Buy/sell pressure
+  // buy_sell_ratio = buys / (buys + sells): 0.5 = equal, 1.0 = all buys, 0.0 = all sells
+  function bsrInterpretation(r: number): string {
+    const buyPct = Math.round(r * 100);
+    const sellPct = 100 - buyPct;
+    if (r >= 0.45 && r <= 0.55) return `balanced buy/sell pressure (1h)`;
+    if (r > 0.55) return `buy-heavy — ${buyPct}% buys vs ${sellPct}% sells (1h)`;
+    return `sell-heavy — ${sellPct}% sells vs ${buyPct}% buys (1h)`;
+  }
   if (factors.buy_sell_ratio !== null && factors.buy_sell_ratio < 0.5) {
     score -= 10;
     sf.push({
       name: "buy_sell_ratio",
       value: factors.buy_sell_ratio,
       impact: -10,
-      interpretation: `sell-heavy (${(factors.buy_sell_ratio * 100).toFixed(0)}% buys)`,
+      interpretation: bsrInterpretation(factors.buy_sell_ratio),
     });
   } else {
     sf.push({
@@ -332,7 +350,7 @@ export function calculateRiskGrade(
       interpretation:
         factors.buy_sell_ratio === null
           ? "buy/sell ratio unavailable"
-          : `balanced pressure (${(factors.buy_sell_ratio * 100).toFixed(0)}% buys)`,
+          : bsrInterpretation(factors.buy_sell_ratio),
     });
   }
 

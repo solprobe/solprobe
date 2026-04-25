@@ -14,7 +14,7 @@ export type LPModel = "TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN";
 
 /** Interpreted LP burn state, accounting for whether the DEX model even has
  *  an LP token to burn. */
-export type LPStatus = "BURNED" | "UNBURNED" | "UNKNOWN" | "NOT_APPLICABLE";
+export type LPStatus = "BURNED" | "UNBURNED" | "CUSTODIAL" | "UNKNOWN" | "NOT_APPLICABLE";
 
 /** DexScreener dexId values known to use traditional fungible LP tokens. */
 const TRADITIONAL_AMM_DEXES = new Set([

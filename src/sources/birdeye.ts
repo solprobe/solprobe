@@ -1202,3 +1202,115 @@ export async function detectBundledLaunchViaBirdeye(
     action_guidance,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Wallet transaction list — vesting inflow / dump outflow detection
+// Endpoint: GET /v1/wallet/tx_list
+// Fields verified via live curl on 2026-04-25:
+//   .data.solana[n].mainAction            = string  (e.g. "TRANSFER")
+//   .data.solana[n].txHash                = string
+//   .data.solana[n].blockUnixTime         = number
+//   .data.solana[n].tokenTransfers[m].mint             = string
+//   .data.solana[n].tokenTransfers[m].tokenAmount      = number
+//   .data.solana[n].tokenTransfers[m].fromUserAccount  = string
+//   .data.solana[n].tokenTransfers[m].toUserAccount    = string
+// ---------------------------------------------------------------------------
+
+export interface BirdeyeWalletTx {
+  tx_hash: string | null;
+  block_unix_time: number | null;
+  main_action: string | null;
+  token_transfers: Array<{
+    mint: string;
+    token_amount: number;
+    from_user_account: string;
+    to_user_account: string;
+  }>;
+}
+
+/**
+ * Fetch recent transactions for a wallet address.
+ * Returns null on API unavailability or error.
+ * Filters to `tx_type=all` to capture TRANSFER events (vesting inflows/outflows).
+ */
+export async function getBirdeyeWalletTxList(
+  walletAddress: string,
+  options: { timeout?: number; limit?: number } = {}
+): Promise<BirdeyeWalletTx[] | null> {
+  const apiKey = process.env.BIRDEYE_API_KEY;
+  if (!apiKey) return null;
+  if (!isAvailable("birdeye")) return null;
+
+  const timeout = options.timeout ?? 4000;
+  const limit = options.limit ?? 100;
+  const start = Date.now();
+
+  const url = `https://public-api.birdeye.so/v1/wallet/tx_list` +
+    `?wallet=${encodeURIComponent(walletAddress)}&limit=${limit}&tx_type=all`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "X-API-KEY": apiKey,
+        Accept: "application/json",
+        "x-chain": "solana",
+      },
+      signal: AbortSignal.timeout(timeout),
+    });
+  } catch {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  if (!res.ok) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    recordFailure("birdeye");
+    return null;
+  }
+
+  const json = await res.json() as {
+    success?: boolean;
+    data?: {
+      solana?: Array<{
+        txHash?: string;
+        blockUnixTime?: number;
+        mainAction?: string;
+        tokenTransfers?: Array<{
+          mint?: string;
+          tokenAmount?: number;
+          fromUserAccount?: string;
+          toUserAccount?: string;
+        }>;
+      }>;
+    };
+  };
+
+  if (!json.success || !json.data?.solana) {
+    recordSourceResult("birdeye", false, Date.now() - start);
+    return null;
+  }
+
+  recordSourceResult("birdeye", true, Date.now() - start);
+  recordSuccess("birdeye");
+
+  return json.data.solana.map((tx) => ({
+    tx_hash: tx.txHash ?? null,
+    block_unix_time: tx.blockUnixTime ?? null,
+    main_action: tx.mainAction ?? null,
+    token_transfers: (tx.tokenTransfers ?? [])
+      .filter((t): t is { mint: string; tokenAmount: number; fromUserAccount: string; toUserAccount: string } =>
+        typeof t.mint === "string" &&
+        typeof t.tokenAmount === "number" &&
+        typeof t.fromUserAccount === "string" &&
+        typeof t.toUserAccount === "string"
+      )
+      .map((t) => ({
+        mint: t.mint,
+        token_amount: t.tokenAmount,
+        from_user_account: t.fromUserAccount,
+        to_user_account: t.toUserAccount,
+      })),
+  }));
+}

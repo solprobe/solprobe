@@ -3,7 +3,7 @@ import { getRugCheckSummary } from "../sources/rugcheck.js";
 import { getTokenMintInfo, checkLPBurned, getWalletAgeDays, detectCircularWashTrading, getAuthorityHistory, getTokenSwapTransactions, getWalletSwapFeePayers, getMintDeployer, checkPoolLiquiditySafety, getWalletIdentity, type PoolLiquiditySafety } from "../sources/helius.js";
 import { buildTxGraph, heliusTxsToEdges } from "../analysis/walletGraph.js";
 import { detectClusters } from "../analysis/clusterDetection.js";
-import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders, getTokenCreationInfo, detectBundledLaunchViaBirdeye, BUNDLER_NULL_RESULT, type BundlerDetectionResult } from "../sources/birdeye.js";
+import { getBirdeyeToken, getBirdeyeTokenSecurity, getBirdeyeHolderList, getBirdeyeTopHolders, getTokenCreationInfo, detectBundledLaunchViaBirdeye, getBirdeyeWalletTxList, BUNDLER_NULL_RESULT, type BundlerDetectionResult } from "../sources/birdeye.js";
 import { getSolscanMeta } from "../sources/solscan.js";
 import {
   calculateRiskGrade,
@@ -15,11 +15,11 @@ import {
 import type {
   ScoringFactor, HistoricalFlag, KeyDriver, AdjustedHolderConcentration, ExclusionCategory,
   FundingSource, LiquidityLockStatus, PoolSafetyBreakdown, WashTradingRisk, TradingPattern,
-  AuthorityHistory, MetadataImmutability, LastTrade,
+  AuthorityHistory, MetadataImmutability, LastTrade, VestingRisk,
 } from "./types.js";
 import { classifyWalletFundingSource } from "../utils/walletClassifier.js";
 import { deduplicate, getOrFetch } from "../cache.js";
-import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS } from "../constants.js";
+import { isProtocolAddress, isLPBurnLaunchpad, PROGRAMS, CUSTODIAL_DEX_LP_PLATFORMS, KNOWN_VESTING_PROGRAMS } from "../constants.js";
 import { resolveAuthorityExempt } from "../sources/jupiterTokenList.js";
 import {
   generateDeepDiveReport,
@@ -66,6 +66,8 @@ export interface DeepDiveResult {
   lp_burned: boolean | null;
   lp_model: LPModel;
   lp_status: LPStatus;
+  /** Human-readable note for CUSTODIAL lp_status; null for all other statuses. */
+  lp_status_note: string | null;
   dex_id: string | null;
   single_holder_danger: boolean;
   risk_grade: "A" | "B" | "C" | "D" | "F";
@@ -135,6 +137,8 @@ export interface DeepDiveResult {
   pool_types_detected: Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">;
   /** Structured bundled-launch detection result from Birdeye launch-window analysis */
   bundler_analysis: BundlerDetectionResult;
+  /** Vested token dump risk — null when check was skipped (e.g. no top holder >= 5%) */
+  vesting_risk: VestingRisk | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +639,223 @@ async function computeAdjustedConcentration(
 }
 
 // ---------------------------------------------------------------------------
+// Vesting risk check — detects if the top real holder received tokens from a
+// known vesting program and has since transferred them out.
+// Only runs when the top holder holds >= 5% of supply. Budget: ~1s.
+// ---------------------------------------------------------------------------
+
+async function checkVestingRisk(
+  tokenMint: string,
+  topHoldersData: Array<{ owner: string; ui_amount: number }> | null,
+  totalSupplyValue: number | null,
+  knownPoolAddresses: Set<string>,
+  options: { timeout?: number } = {}
+): Promise<VestingRisk> {
+  const SKIPPED: VestingRisk = {
+    checked: false,
+    holder_address: null,
+    holder_supply_pct: null,
+    vesting_platform: null,
+    inflow_token_amount: null,
+    inflow_pct_of_supply: null,
+    outflow_detected: false,
+    outflow_token_amount: null,
+    risk: "UNKNOWN",
+    risk_reason: "check skipped — no qualifying top holder",
+  };
+
+  if (!topHoldersData || topHoldersData.length === 0 || !totalSupplyValue) return SKIPPED;
+
+  // Find the top real holder with >= 5% supply
+  const topHolder = topHoldersData
+    .filter(h => !isProtocolAddress(h.owner) && !knownPoolAddresses.has(h.owner))
+    .map(h => ({ ...h, supply_pct: (h.ui_amount / totalSupplyValue) * 100 }))
+    .find(h => h.supply_pct >= 5);
+
+  if (!topHolder) {
+    return { ...SKIPPED, risk_reason: "check skipped — no holder with >= 5% supply" };
+  }
+
+  const txTimeout = options.timeout ?? 3000;
+
+  const txList = await getBirdeyeWalletTxList(topHolder.owner, { timeout: txTimeout, limit: 100 });
+  if (!txList) {
+    return {
+      checked: true,
+      holder_address: topHolder.owner,
+      holder_supply_pct: topHolder.supply_pct,
+      vesting_platform: null,
+      inflow_token_amount: null,
+      inflow_pct_of_supply: null,
+      outflow_detected: false,
+      outflow_token_amount: null,
+      risk: "UNKNOWN",
+      risk_reason: "tx history unavailable",
+    };
+  }
+
+  // Inflows: TRANSFER where this holder received the target token
+  const inflows = txList.flatMap(tx =>
+    tx.token_transfers.filter(
+      t => t.mint === tokenMint && t.to_user_account === topHolder.owner
+    ).map(t => ({ ...t, tx_hash: tx.tx_hash }))
+  );
+
+  // Outflows: TRANSFER where this holder sent the target token to a non-DEX non-protocol address
+  const outflows = txList.flatMap(tx =>
+    tx.token_transfers.filter(
+      t => t.mint === tokenMint &&
+        t.from_user_account === topHolder.owner &&
+        !knownPoolAddresses.has(t.to_user_account) &&
+        !isProtocolAddress(t.to_user_account)
+    )
+  );
+
+  if (inflows.length === 0) {
+    return {
+      checked: true,
+      holder_address: topHolder.owner,
+      holder_supply_pct: topHolder.supply_pct,
+      vesting_platform: null,
+      inflow_token_amount: null,
+      inflow_pct_of_supply: null,
+      outflow_detected: outflows.length > 0,
+      outflow_token_amount: outflows.length > 0
+        ? outflows.reduce((s, t) => s + t.token_amount, 0) : null,
+      risk: "LOW",
+      risk_reason: "no vesting inflows detected",
+    };
+  }
+
+  // Check if any inflow sender is owned by a known vesting program.
+  // Also check inflow tx program IDs for completed escrows whose accounts
+  // have been closed (Streamflow closes the escrow ATA after full withdrawal).
+  const uniqueSenders = [...new Set(inflows.map(t => t.from_user_account))].slice(0, 5);
+
+  // Map sender → tx_hashes for the closed-account fallback
+  const senderTxHashes = new Map<string, string[]>();
+  for (const inflow of inflows) {
+    if (!inflow.tx_hash) continue;
+    const existing = senderTxHashes.get(inflow.from_user_account) ?? [];
+    if (!existing.includes(inflow.tx_hash)) existing.push(inflow.tx_hash);
+    senderTxHashes.set(inflow.from_user_account, existing);
+  }
+
+  let vesting_platform: string | null = null;
+  let totalInflow = 0;
+
+  const heliusApiKey = process.env.HELIUS_API_KEY;
+
+  for (const sender of uniqueSenders) {
+    try {
+      const accountInfo = await rpcCall("getAccountInfo", [sender, { encoding: "base64" }], 1500);
+      const ownerProgram: string | null = accountInfo?.value?.owner ?? null;
+      if (ownerProgram && KNOWN_VESTING_PROGRAMS.has(ownerProgram)) {
+        vesting_platform = KNOWN_VESTING_PROGRAMS.get(ownerProgram)!;
+        totalInflow += inflows
+          .filter(t => t.from_user_account === sender)
+          .reduce((s, t) => s + t.token_amount, 0);
+        break;
+      }
+
+      // Fallback: account is closed — inspect the inflow transaction program IDs.
+      // Vesting escrow PDAs (Streamflow, Valhalla, Unloc) are closed after
+      // full withdrawal, making getAccountInfo return null.
+      // Use Helius RPC getTransaction (separate rate limit from Enhanced API).
+      if (accountInfo?.value == null && heliusApiKey) {
+        const txHashes = (senderTxHashes.get(sender) ?? []).slice(0, 2);
+        for (const txHash of txHashes) {
+          try {
+            const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
+            const txRes = await fetch(rpcUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "getTransaction",
+                params: [txHash, { encoding: "json", maxSupportedTransactionVersion: 0 }],
+              }),
+              signal: AbortSignal.timeout(2000),
+            }).catch(() => null);
+            if (!txRes?.ok) continue;
+            const rpcJson = await txRes.json().catch(() => null) as {
+              result?: {
+                transaction?: {
+                  message?: {
+                    accountKeys?: string[];
+                    instructions?: Array<{ programIdIndex?: number }>;
+                  };
+                };
+              };
+            } | null;
+            const message = rpcJson?.result?.transaction?.message;
+            if (!message) continue;
+            const accountKeys: string[] = message.accountKeys ?? [];
+            const instructions = message.instructions ?? [];
+            const programIds = instructions
+              .map(ix => accountKeys[ix.programIdIndex ?? -1])
+              .filter((id): id is string => !!id);
+            const matchedPid = programIds.find(pid => KNOWN_VESTING_PROGRAMS.has(pid));
+            if (matchedPid) {
+              vesting_platform = KNOWN_VESTING_PROGRAMS.get(matchedPid)!;
+              totalInflow += inflows
+                .filter(t => t.from_user_account === sender)
+                .reduce((s, t) => s + t.token_amount, 0);
+              break;
+            }
+          } catch {
+            // skip this tx
+          }
+          if (vesting_platform) break;
+        }
+      }
+    } catch {
+      // RPC failure — skip this sender
+    }
+    if (vesting_platform) break;
+  }
+
+  if (!vesting_platform) {
+    return {
+      checked: true,
+      holder_address: topHolder.owner,
+      holder_supply_pct: topHolder.supply_pct,
+      vesting_platform: null,
+      inflow_token_amount: null,
+      inflow_pct_of_supply: null,
+      outflow_detected: outflows.length > 0,
+      outflow_token_amount: outflows.length > 0
+        ? outflows.reduce((s, t) => s + t.token_amount, 0) : null,
+      risk: "LOW",
+      risk_reason: "transfer inflows detected but no vesting program identified",
+    };
+  }
+
+  const outflow_total = outflows.reduce((s, t) => s + t.token_amount, 0);
+  const inflow_pct_of_supply = totalInflow > 0
+    ? (totalInflow / totalSupplyValue) * 100 : null;
+  const outflow_detected = outflows.length > 0;
+  const risk: "LOW" | "MEDIUM" | "HIGH" = outflow_detected ? "HIGH" : "MEDIUM";
+  const risk_reason = outflow_detected
+    ? `${vesting_platform} vesting unlock received; tokens transferred out — possible coordinated dump`
+    : `${vesting_platform} vesting unlock received; no outflow detected yet`;
+
+  return {
+    checked: true,
+    holder_address: topHolder.owner,
+    holder_supply_pct: topHolder.supply_pct,
+    vesting_platform,
+    inflow_token_amount: totalInflow > 0 ? totalInflow : null,
+    inflow_pct_of_supply,
+    outflow_detected,
+    outflow_token_amount: outflow_detected ? outflow_total : null,
+    risk,
+    risk_reason,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -782,6 +1003,15 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const dev_wallet_age_days = walletAgeResult.status === "fulfilled" ? walletAgeResult.value : null;
   const lp_status           = deriveLPStatus(lp_burned, lp_model);
 
+  // ── Custodial LP override ──────────────────────────────────────────────────
+  const custodialPlatform = (lp_burned === null && lp_model === "TRADITIONAL_AMM" && dex_id)
+    ? CUSTODIAL_DEX_LP_PLATFORMS.get(dex_id) ?? null
+    : null;
+  const effective_lp_status: LPStatus = custodialPlatform ? "CUSTODIAL" : lp_status;
+  const lp_status_note: string | null = custodialPlatform
+    ? custodialPlatform.risk_implication
+    : null;
+
   // Oldest dev wallet sig — needed for funding source classification
   const devWalletSigs: any[] | null = devWalletSigsResult.status === "fulfilled" ? devWalletSigsResult.value : null;
   const devWalletOldestSig: string | null = Array.isArray(devWalletSigs) && devWalletSigs.length > 0
@@ -794,6 +1024,16 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const totalSupplyValue: number | null = typeof tokenSupplyRaw?.value?.uiAmount === "number"
     ? tokenSupplyRaw.value.uiAmount
     : null;
+
+  // Vesting dump risk — start in background now that totalSupplyValue and topHoldersData are ready.
+  // Runs in ~1s (1 Birdeye tx_list call + up to 5 sequential getAccountInfo calls).
+  const vestingRiskPromise = checkVestingRisk(
+    address,
+    topHoldersData as Array<{ owner: string; ui_amount: number }> | null,
+    totalSupplyValue,
+    _knownPoolAddresses,
+    { timeout: 3000 }
+  );
 
   // Funding source + adjusted concentration — run in parallel
   const _defaultFundingSource: FundingSource = {
@@ -916,7 +1156,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     single_holder_danger: live_single_holder_danger_deep,
     lp_burned,
     lp_model,
-    lp_status,
+    lp_status: effective_lp_status,
     dex_id,
     dev_wallet_age_days,
     is_mutable_metadata: is_mutable,
@@ -972,7 +1212,29 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const poolSafeties: PoolLiquiditySafety[] = poolSafetyResults
     .filter((r): r is PromiseFulfilledResult<PoolLiquiditySafety> => r.status === "fulfilled")
     .map((r) => r.value);
-  const liquidity_lock_status = deriveOverallLockType(poolSafeties, dex_id);
+  const rawLockStatus = deriveOverallLockType(poolSafeties, dex_id);
+  // When on-chain pool checks return no clear burn/lock but the dex_id maps to a
+  // verified protocol custodian, override with CUSTODIAL rather than UNKNOWN/UNLOCKED.
+  const liquidity_lock_status: LiquidityLockStatus = custodialPlatform &&
+    (rawLockStatus.lock_type === "UNKNOWN" || rawLockStatus.lock_type === "UNLOCKED" || rawLockStatus.lock_type === "NONE")
+    ? {
+        ...rawLockStatus,
+        lock_type: "CUSTODIAL" as const,
+        note: custodialPlatform.risk_implication,
+        pool_safety_breakdown: rawLockStatus.pool_safety_breakdown.map(p => ({
+          ...p,
+          safety: "CUSTODIAL" as const,
+          safety_note: `LP held by ${custodialPlatform.platform} protocol wallet`,
+        })),
+        custody_info: {
+          custodial_wallets: custodialPlatform.custodial_wallets,
+          treasury_wallets:  custodialPlatform.treasury_wallets,
+          platform:          custodialPlatform.platform,
+          type_description:  custodialPlatform.type_description,
+          risk_implication:  custodialPlatform.risk_implication,
+        },
+      }
+    : rawLockStatus;
 
   // ── Trading pattern scalars (needed by momentum_score below) ─────────────
   // Full trading_pattern object is assembled after clusterResult (see below).
@@ -1022,6 +1284,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   const data_confidence = confidenceToString(confidence.model);
 
   // ── Historical flags ───────────────────────────────────────────────────────
+  const vestingRisk = await vestingRiskPromise;
+
   const historical_flags: HistoricalFlag[] = buildHistoricalFlags({
     has_rug_history,
     bundled_launch: bundled_launch_detected,
@@ -1031,6 +1295,7 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
   if (is_mutable === true) historical_flags.push("MUTABLE_METADATA");
   if (authority_history.authority_ever_regranted) historical_flags.push("AUTHORITY_REGRANTED");
   if (devWalletForAge && dev_funding_source.funder_type === "MIXER") historical_flags.push("DEV_MIXER_FUNDED");
+  if (vestingRisk.risk === "HIGH") historical_flags.push("VESTING_UNLOCK_DUMP_RISK");
 
   // ── Risk breakdown ────────────────────────────────────────────────────────
   const contract_risk: "LOW" | "MEDIUM" | "HIGH" =
@@ -1269,7 +1534,8 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
     liquidity_usd,
     lp_burned,
     lp_model,
-    lp_status,
+    lp_status: effective_lp_status,
+    lp_status_note,
     dex_id,
     risk_grade,
     summary,
@@ -1305,5 +1571,6 @@ async function _fetchDeepDive(address: string): Promise<DeepDiveResult> {
       (dexData?.pairs ?? []).map(pair => classifyLPModel(pair.dexId))
     )] as Array<"TRADITIONAL_AMM" | "CLMM_DLMM" | "UNKNOWN">,
     bundler_analysis: bundlerData,
+    vesting_risk: vestingRisk,
   };
 }

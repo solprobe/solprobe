@@ -47,7 +47,8 @@ export type HistoricalFlag =
   | "SAME_BLOCK_LAUNCH"                  // mint and pool created in same block
   | "MUTABLE_METADATA"                   // token metadata is mutable post-launch (deep dive only)
   | "AUTHORITY_REGRANTED"               // mint authority was regranted after revocation (deep dive only)
-  | "DEV_MIXER_FUNDED";                  // dev wallet funded via known mixer pattern (deep dive only)
+  | "DEV_MIXER_FUNDED"                   // dev wallet funded via known mixer pattern (deep dive only)
+  | "VESTING_UNLOCK_DUMP_RISK";          // top holder received vesting unlock and transferred out (deep dive only)
 
 /**
  * Top contributing factor in agent-friendly shape (deep dive only).
@@ -146,6 +147,7 @@ export type ExclusionCategory = "BURN" | "DEX_POOL" | "CEX" | "KNOWN_PROTOCOL" |
 export type LockType =
   | "PERMANENT_BURN"     // LP tokens sent to burn address
   | "PROGRAM_CONTROLLED" // DLMM/CLMM pool — no fungible LP token, program owns liquidity
+  | "CUSTODIAL"          // LP held by a verified protocol-controlled wallet (not anonymous)
   | "TIMED_LOCK"         // LP locked in time-lock contract
   | "NOT_APPLICABLE"     // CLMM/DLMM with no traditional LP token
   | "UNLOCKED"           // LP exists and is not burned or locked
@@ -158,8 +160,22 @@ export interface PoolSafetyBreakdown {
   pool_address: string;
   dex: string | null;
   pool_type: "TRADITIONAL_AMM" | "DLMM_CLMM" | "UNKNOWN";
-  safety: "BURNED" | "PROGRAM_CONTROLLED" | "LOCKED" | "UNLOCKED" | "UNKNOWN";
+  safety: "BURNED" | "PROGRAM_CONTROLLED" | "CUSTODIAL" | "LOCKED" | "UNLOCKED" | "UNKNOWN";
   safety_note: string;
+}
+
+/**
+ * Metadata about a platform that holds LP in a verified protocol-controlled wallet.
+ * Present on LiquidityLockStatus when lock_type === "CUSTODIAL".
+ */
+export interface CustodyInfo {
+  custodial_wallets: string[];
+  treasury_wallets: string[];
+  platform: string;
+  /** Human-readable label identifying the platform custody arrangement */
+  type_description: string;
+  /** Risk characterisation for this custody arrangement */
+  risk_implication: string;
 }
 
 export interface LiquidityLockStatus {
@@ -175,6 +191,11 @@ export interface LiquidityLockStatus {
   pools_safe: number;
   /** Per-pool safety breakdown */
   pool_safety_breakdown: PoolSafetyBreakdown[];
+  /**
+   * Populated when lock_type === "CUSTODIAL".
+   * Identifies the protocol wallet holding the LP and characterises the risk.
+   */
+  custody_info?: CustodyInfo | null;
 }
 
 export type WashTradingRisk = "NONE" | "LOW" | "ELEVATED" | "HIGH" | "EXTREME";
@@ -288,6 +309,42 @@ export interface ClusterGroup {
 // ---------------------------------------------------------------------------
 // Last Trade Types (deepDive.ts only)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Vesting Risk Types (deepDive.ts only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Vested token dump risk — detects when a top holder received tokens from a
+ * known vesting program (Streamflow, Valhalla, Unloc) and has since transferred
+ * them out. Signals potential coordinated dump by insiders.
+ *
+ * Only checked for the top real holder when supply_pct >= 5%.
+ * Outflow means the holder transferred the token to an address that is NOT
+ * a known DEX pool or protocol address.
+ */
+export interface VestingRisk {
+  /** Whether the vesting check was attempted for this token. */
+  checked: boolean;
+  /** Top real holder address that was checked; null if check was skipped. */
+  holder_address: string | null;
+  /** Supply % held by the checked holder; null if check was skipped. */
+  holder_supply_pct: number | null;
+  /** Name of the vesting platform that sent tokens to this holder; null if none found. */
+  vesting_platform: string | null;
+  /** Raw token units received from the vesting program. */
+  inflow_token_amount: number | null;
+  /** Inflow as a % of total supply; null when supply unknown. */
+  inflow_pct_of_supply: number | null;
+  /** Whether the holder has transferred tokens out to a non-DEX address. */
+  outflow_detected: boolean;
+  /** Raw token units transferred out; null if no outflow detected. */
+  outflow_token_amount: number | null;
+  /** Risk level: HIGH = vesting inflow + outflow detected; MEDIUM = inflow but no outflow; LOW = no vesting found; UNKNOWN = check skipped. */
+  risk: "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
+  /** Human-readable explanation of the risk level. */
+  risk_reason: string | null;
+}
 
 /**
  * Adversarial freshness signal — when did the token last trade?
