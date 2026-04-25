@@ -76,7 +76,13 @@ export interface WalletRiskResult {
     wallet_age_source: "birdeye_first_funded" | "rpc_full" | "rpc_partial" | "failed";
     total_trades: number;
     trade_count_source: "birdeye_pnl" | "helius_fetch";
-    active_days: number | null;
+    /** Active days within the analyzed transaction window (last ~100 Helius txs).
+     *  For high-volume wallets this may span only days, not 30d. */
+    active_days_last_30d: number | null;
+    /** Lifetime active days — null when only a partial tx window was analyzed. */
+    active_days_total: number | null;
+    /** Raw on-chain transaction count from RPC (capped at 1000 by pagination). */
+    total_onchain_txs_fetched: number;
     last_active_hours_ago: number | null;
   };
 
@@ -96,7 +102,8 @@ export interface WalletRiskResult {
   largest_single_loss_usdc: number | null;
   is_bot: boolean;
   whale_status: boolean;
-  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW";  // backwards compat
+  /** "UNKNOWN" when funder cannot be traced (funder_address is null). */
+  funding_wallet_risk: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";  // backwards compat
   funding_source: FundingSource;
 
   // ── Wallet activity type ──────────────────────────────────────────────────
@@ -1170,7 +1177,7 @@ function computeRiskScore(
   sniperScore: number,
   winRatePct: number | null,
   rugExitRatePct: number | null,
-  fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW",
+  fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN",
   isBot: boolean,
   whaleStatus: boolean
 ): number {
@@ -1198,7 +1205,7 @@ function buildWalletFactors(
   winRatePct: number | null,
   winRateStatus: WinRateStatus,
   rugExitRatePct: number | null,
-  fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW",
+  fundingWalletRisk: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN",
   isBot: boolean,
   whaleStatus: boolean
 ): ScoringFactor[] {
@@ -1878,7 +1885,7 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       wallet_age_source: walletAgeSource,
       total_trades: reconciledTradeCount,
       trade_count_source: tradeCountSource,
-      active_days: activeDays,
+      active_days_last_30d: activeDays,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
     },
@@ -1891,6 +1898,10 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
     risk_score: riskScore,
     is_bot: isBot,
     pnl_estimate_30d_usdc: pnl.realized_pnl_usdc,
+    pnl_realized_usdc: pnl.realized_pnl_usdc,
+    pnl_total_usdc: pnl.total_pnl_usdc,
+    copy_trading_worthiness: copy_trading.worthiness,
+    behavior_style: behaviorProfile.style,
   };
 
   const elapsed = Date.now() - fetchStart;
@@ -1914,7 +1925,9 @@ async function _fetchWalletRisk(address: string): Promise<WalletRiskResult> {
       wallet_age_source: walletAgeSource,
       total_trades: reconciledTradeCount,
       trade_count_source: tradeCountSource,
-      active_days: activeDays,
+      active_days_last_30d: activeDays,
+      active_days_total: null,   // lifetime count unavailable — only partial tx window analyzed
+      total_onchain_txs_fetched: sigCount,
       last_active_hours_ago:
         lastActiveHoursAgo !== null ? Math.round(lastActiveHoursAgo * 10) / 10 : null,
     },

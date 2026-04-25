@@ -285,7 +285,7 @@ describe("walletRisk", () => {
     expect(result.activity).toMatchObject({
       wallet_age_days: expect.toBeOneOf([expect.any(Number), null]),
       total_trades: expect.any(Number),
-      active_days: expect.any(Number),
+      active_days_last_30d: expect.toBeOneOf([expect.any(Number), null]),
       last_active_hours_ago: expect.toBeOneOf([expect.any(Number), null]),
     });
   });
@@ -434,7 +434,7 @@ describe("walletRisk", () => {
     expect(result.funding_source).toMatchObject({
       funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
       cluster_size: expect.any(Number),
-      risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|UNKNOWN)$/),
       risk_reason: expect.any(String),
       action_guidance: expect.any(String),
     });
@@ -519,12 +519,12 @@ describe("walletRisk", () => {
       classification: expect.stringMatching(/^(LOW_RISK|HIGH_RISK|UNKNOWN)$/),
       activity: expect.objectContaining({
         total_trades: expect.any(Number),
-        active_days: expect.any(Number),
+        active_days_last_30d: expect.toBeOneOf([expect.any(Number), null]),
       }),
       sniper_score: expect.any(Number),
       is_bot: expect.any(Boolean),
       whale_status: expect.any(Boolean),
-      funding_wallet_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+      funding_wallet_risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|UNKNOWN)$/),
       behavior: expect.objectContaining({
         style: expect.any(String),
         consistency: expect.stringMatching(/^(LOW|MEDIUM|HIGH)$/),
@@ -553,7 +553,7 @@ describe("walletRisk", () => {
       ),
       funding_source: expect.objectContaining({
         funder_type: expect.stringMatching(/^(CEX|MIXER|FRESH_WALLET|DEPLOYER|KNOWN_PROTOCOL|PEER_WALLET|UNKNOWN)$/),
-        risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW)$/),
+        risk: expect.stringMatching(/^(HIGH|MEDIUM|LOW|UNKNOWN)$/),
         shared_funder_wallets: expect.any(Array),
       }),
       dusting_analysis: expect.objectContaining({

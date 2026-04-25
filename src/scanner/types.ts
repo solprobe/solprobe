@@ -127,7 +127,8 @@ export interface FundingSource {
   funder_tx_count: number | null;
   shared_funder_wallets: string[];
   cluster_size: number;
-  risk: "HIGH" | "MEDIUM" | "LOW";
+  /** "UNKNOWN" when funder cannot be traced (funder_address is null). */
+  risk: "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
   risk_reason: string;
   action_guidance: string;
 }

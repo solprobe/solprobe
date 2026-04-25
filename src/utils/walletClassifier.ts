@@ -44,8 +44,9 @@ const _default: FundingSource = {
   funder_tx_count: null,
   shared_funder_wallets: [],
   cluster_size: 1,
-  risk: "MEDIUM",
-  risk_reason: "funder details unavailable",
+  // "UNKNOWN" not "MEDIUM": funder cannot be traced — no penalisation without evidence.
+  risk: "UNKNOWN",
+  risk_reason: "funder cannot be traced — oldest funding transaction unavailable",
   action_guidance: "verify funding source manually before high-value trades",
 };
 

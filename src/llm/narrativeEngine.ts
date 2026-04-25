@@ -280,7 +280,7 @@ export interface WalletRiskData {
     wallet_age_source?: "birdeye_first_funded" | "rpc_full" | "rpc_partial" | "failed";
     total_trades: number;
     trade_count_source?: "birdeye_pnl" | "helius_fetch";
-    active_days: number | null;
+    active_days_last_30d: number | null;
     last_active_hours_ago: number | null;
   };
   wallet_age_days: number | null;
@@ -292,6 +292,12 @@ export interface WalletRiskData {
   risk_score: number;
   is_bot: boolean;
   pnl_estimate_30d_usdc: number | null;
+  /** Realized PnL from Birdeye — passed explicitly so the LLM can reference it. */
+  pnl_realized_usdc?: number | null;
+  /** Total PnL (realized + unrealized) from Birdeye. */
+  pnl_total_usdc?: number | null;
+  copy_trading_worthiness?: string;
+  behavior_style?: string;
   factors?: ScoringFactor[];
 }
 
@@ -326,16 +332,31 @@ export async function generateWalletRiskSummary(data: WalletRiskData): Promise<s
     ? "Trading pattern: long-term holder — no sell transactions recorded, win rate not applicable."
     : `Win rate: ${data.win_rate_pct != null ? data.win_rate_pct.toFixed(0) + "%" : "unknown"}.`;
 
+  const pnlLine = data.pnl_realized_usdc != null
+    ? `Realized PnL: $${Math.round(data.pnl_realized_usdc).toLocaleString()}.`
+    : data.pnl_estimate_30d_usdc != null
+      ? `30d PnL estimate: $${Math.round(data.pnl_estimate_30d_usdc).toLocaleString()}.`
+      : "PnL: unknown.";
+  const totalPnlLine = data.pnl_total_usdc != null
+    ? `Total PnL (realized + unrealized): $${Math.round(data.pnl_total_usdc).toLocaleString()}.`
+    : "";
+  const copyTradeLine = data.copy_trading_worthiness
+    ? `Copy-trade worthiness: ${data.copy_trading_worthiness}.`
+    : "";
+
   const userMsg = [
     `Wallet age: ${data.wallet_age_days != null ? Math.round(data.wallet_age_days) + " days" : "unknown"}.`,
     `Trading style: ${data.trading_style}.`,
+    data.behavior_style ? `Behavior profile: ${data.behavior_style}.` : "",
     winRateLine,
     `Sniper score: ${data.sniper_score}/100.`,
     `Rug exit rate: ${data.rug_exit_rate_pct != null ? data.rug_exit_rate_pct.toFixed(0) + "%" : "not applicable (no exits)"}.`,
     `Funding risk: ${data.funding_wallet_risk}.`,
     `Risk score: ${data.risk_score}/100.`,
     `Is bot: ${data.is_bot}.`,
-    `30d PnL estimate: ${data.pnl_estimate_30d_usdc != null ? "$" + data.pnl_estimate_30d_usdc.toFixed(0) : "unknown"}.`,
+    pnlLine,
+    totalPnlLine,
+    copyTradeLine,
     factorLines,
   ].filter(Boolean).join(" ");
 
