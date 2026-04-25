@@ -12,14 +12,12 @@ All responses carry `schema_version: "2.0"`. Buyer agents gate on this field bef
 |---|---|---|---|
 | `sol_quick_scan` | $0.02 | < 5s | Structural safety gate — mint/freeze authority, holder distribution, LP status |
 | `sol_market_intel` | $0.20 | < 10s | Real-time trading signal — price, volume, buy/sell pressure, BULLISH/BEARISH/NEUTRAL |
-| `sol_wallet_risk` | $0.10 | < 20s | Counterparty intelligence + copy-trade opportunity — classification, MEV detection, pump.fun signals |
 | `sol_deep_dive` | $0.50 | < 30s | Adversarial risk engine — insider clustering, launch pattern, wash trading, structured recommendation |
 
 ### Service boundaries
 
 - **Quick Scan** — structural safety only. Does NOT evaluate liquidity, price, or market conditions.
 - **Market Intel** — trading signal only. Does NOT repeat structural safety signals.
-- **Wallet Risk** — two orthogonal dimensions: `classification` (counterparty risk) and `copy_trading` (copy-trade worthiness). Never merged.
 - **Deep Dive** — adversarial intelligence additive to Quick Scan. Does NOT repeat Quick Scan fields.
 
 ## Setup
@@ -62,7 +60,6 @@ npx tsx ../virtuals-acp/bin/acp.ts setup
 # Register each offering on the marketplace (run once per service)
 cd acp/offerings/sol_quick_scan  && npx tsx ../../../virtuals-acp/bin/acp.ts sell init
 cd acp/offerings/sol_deep_dive   && npx tsx ../../../virtuals-acp/bin/acp.ts sell init
-cd acp/offerings/sol_wallet_risk && npx tsx ../../../virtuals-acp/bin/acp.ts sell init
 cd acp/offerings/sol_market_intel && npx tsx ../../../virtuals-acp/bin/acp.ts sell init
 
 # Create listings on the marketplace
@@ -104,12 +101,11 @@ npx tsx scripts/risk_scorer_test.ts <token_address>
 ```
 POST /scan/quick    → sol_quick_scan
 POST /scan/deep     → sol_deep_dive
-POST /wallet/risk   → sol_wallet_risk
 POST /market/intel  → sol_market_intel
 GET  /health        → server status + circuit breaker state
 ```
 
-All POST endpoints accept `{ "token_address": "<base58>" }` (or `{ "wallet_address": "..." }` for `/wallet/risk`).
+All POST endpoints accept `{ "token_address": "<base58>" }`.
 
 ### Example
 
@@ -138,7 +134,7 @@ All sources are free with no API key required (Helius key optional):
 |---|---|
 | DexScreener | Price, liquidity, volume, buy/sell ratio, LP mint |
 | RugCheck | Rug history, bundled launch, holder concentration, rugcheck score |
-| Helius / public RPC | Mint authority, freeze authority, LP burn, dev wallet, MEV signals |
+| Helius / public RPC | Mint authority, freeze authority, LP burn, dev wallet |
 | Birdeye | ATH price, pct_from_ath, 5m/15m price changes (requires API key) |
 | Solscan | Fallback token metadata |
 | Jupiter Token List | Authority exemption for verified stablecoins and wrapped tokens |
@@ -151,7 +147,7 @@ wormhole, and wrapped tags do.
 
 - All sources fetched in parallel via `Promise.allSettled()` with per-source timeouts
 - Circuit breaker per source — opens after 5 consecutive failures, recovers after 60s
-- Cache TTLs: quick scan 30s, market intel 15s, wallet risk 300s, deep dive 60s
+- Cache TTLs: quick scan 30s, market intel 15s, deep dive 60s
 - In-flight deduplication prevents duplicate API calls for burst requests on the same address
 - Risk scorer is deterministic — no ML, penalty table with grade bands A/B/C/D/F
 - LLM narrative only for human-readable summaries — all structured fields are deterministic
