@@ -485,7 +485,11 @@ export async function generateDeepDiveReport(data: DeepDiveData): Promise<string
   const system =
     `You are a professional on-chain security analyst. Write a 3–5 sentence risk report for ${tokenLabel}. ` +
     `Always refer to the token as ${tokenLabel} — never as "this token" or "the token". ` +
-    "Use the scoring factors list as your primary evidence — explain which factors drove the score and how they combine. Connect related risks into patterns rather than listing fields independently. State the recommendation and the single strongest reason for it in the final sentence. Be specific, factual, and concise. Do not use bullet points.";
+    "Open with the single most consequential structural fact or dominant risk pattern — never open with a grade attribution (e.g. do not start with 'has been assigned grade' or 'carries a grade'). " +
+    "Group correlated signals into compound patterns: if multiple factors point to the same root cause (e.g. fresh funder + bundled launch = deliberate obfuscation), state them together with a connecting phrase such as 'because', 'which means', 'compounding this', or 'together these indicate'. " +
+    "Do not list factors as independent observations. " +
+    "State the recommendation and the single strongest reason for it in the final sentence. " +
+    "Be specific, factual, and concise. Do not use bullet points. Never use 'strong', 'safe', or 'excellent'.";
 
   const topFactors = [...(data.factors ?? [])]
     .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
